@@ -309,6 +309,6 @@ function clampNumber(value, fallback, min, max) {
   return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
 }
 function clampInt(value, fallback, min, max) { return Math.trunc(clampNumber(value, fallback, min, max)); }
-function identityMatrix() { return [1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1]; }
+function identityMatrix() { return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; }
 function badRequest(code, message) { const error = new Error(message); error.statusCode = 400; error.code = code; return error; }
 function notFound(code, message) { const error = new Error(message); error.statusCode = 404; error.code = code; return error; }
