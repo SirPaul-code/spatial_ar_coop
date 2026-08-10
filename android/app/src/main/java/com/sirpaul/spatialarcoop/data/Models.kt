@@ -51,6 +51,10 @@ data class MapDefinition(
     val id: String,
     val name: String,
     val serverUrl: String,
+    /** Stable public identity returned by /api/v1/info. Used to detect wrong-server invites. */
+    val serverId: String = "",
+    /** Secret credential scoped to this map only. Never serialized into map metadata payloads. */
+    val accessKey: String = "",
     val status: MapStatus = MapStatus.MAPPING,
     val rootAnchorId: String? = null,
     val groundY: Float? = null,
@@ -76,7 +80,12 @@ data class MapDefinition(
             .put("autoAnchor", autoAnchor))
 
     companion object {
-        fun fromServer(json: JSONObject, serverUrl: String): MapDefinition {
+        fun fromServer(
+            json: JSONObject,
+            serverUrl: String,
+            serverId: String = json.optString("serverId", ""),
+            accessKey: String = json.optString("accessKey", "")
+        ): MapDefinition {
             val id = json.getString("id")
             val settings = json.optJSONObject("settings") ?: JSONObject()
             val scan = json.optJSONObject("scan")
@@ -89,7 +98,9 @@ data class MapDefinition(
             return MapDefinition(
                 id = id,
                 name = json.optString("name", id),
-                serverUrl = serverUrl,
+                serverUrl = serverUrl.trimEnd('/'),
+                serverId = serverId,
+                accessKey = accessKey,
                 status = enumValueOr(json.optString("status"), MapStatus.MAPPING),
                 rootAnchorId = json.optString("rootAnchorId").takeIf { it.isNotBlank() && it != "null" },
                 groundY = if (json.has("groundY") && !json.isNull("groundY")) json.optDouble("groundY").toFloat() else null,
