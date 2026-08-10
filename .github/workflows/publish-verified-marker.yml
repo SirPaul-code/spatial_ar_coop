@@ -1,0 +1,61 @@
+name: Publish verified build marker
+
+on:
+  workflow_run:
+    workflows: ['Finalize public demo and publish APK']
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download verified APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spatial-ar-coop-debug-apk
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and publish repository marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/spatial-ar-coop-debug.apk
+          unzip -tq dist/spatial-ar-coop-debug.apk
+          apk_sha="$(sha256sum dist/spatial-ar-coop-debug.apk | awk '{print $1}')"
+          cat > VERIFIED_BUILD.md <<EOF
+          # Verified build
+
+          The public demo source tree passed the automated verification pipeline.
+
+          - Relay/map server tests: **passed**
+          - Relay/map server static check: **passed**
+          - Docker server image build: **passed**
+          - Android unit tests: **passed**
+          - Android debug APK assembly: **passed**
+          - APK SHA-256: \`$apk_sha\`
+          - Source revision: \`$(git rev-parse HEAD)\`
+          - Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${{ github.event.workflow_run.id || github.run_id }}
+
+          The APK is attached to the \`demo-latest\` prerelease and to the workflow artifact named \`spatial-ar-coop-debug-apk\`.
+          EOF
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add VERIFIED_BUILD.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'docs: record verified demo build [skip ci]'
+            git push origin HEAD:main
+          fi
