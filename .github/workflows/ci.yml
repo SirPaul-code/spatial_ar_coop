@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'server/**'
+      - 'scripts/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'server/**'
+      - 'scripts/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run check
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Unit tests and debug APK
+        working-directory: android
+        env:
+          ARCORE_API_KEY: ${{ secrets.ARCORE_API_KEY || 'UNCONFIGURED' }}
+          DEFAULT_SERVER_URL: ${{ vars.DEFAULT_SERVER_URL || 'http://192.168.1.10:8080' }}
+          DEFAULT_API_TOKEN: ${{ secrets.DEFAULT_API_TOKEN || '' }}
+        run: gradle testDebugUnitTest assembleDebug --stacktrace --no-daemon
+      - name: Upload debug APK and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spatial-ar-coop-debug-apk
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/reports/**
+            android/app/build/test-results/**
