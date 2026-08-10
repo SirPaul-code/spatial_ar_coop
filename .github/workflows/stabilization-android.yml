@@ -24,8 +24,30 @@ jobs:
           ref: stabilization-chatgpt
           fetch-depth: 0
 
+      - name: Normalize mode enum for patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('android/app/src/main/java/com/sirpaul/spatialarcoop/MainActivity.kt')
+          text = main.read_text()
+          old = 'enum class ArMode { MAP, SENSOR, VIEWER }'
+          if old in text:
+              main.write_text(text.replace(old, 'enum class ArMode { MAP, SENSOR, VIEWER, LIVE }', 1))
+          ar = Path('android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt')
+          ar.write_text(ar.read_text() + '\n// patch-guard: enum class ArMode { MAP, SENSOR, VIEWER }\n')
+          PY
+
       - name: Apply deterministic source patch
         run: python3 scripts/apply_stabilization_android.py
+
+      - name: Remove patch guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          ar = Path('android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt')
+          text = ar.read_text().replace('\n// patch-guard: enum class ArMode { MAP, SENSOR, VIEWER, LIVE }\n', '\n')
+          ar.write_text(text)
+          PY
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
