@@ -4,7 +4,6 @@ on:
   push:
     branches: [stabilization-chatgpt]
     paths:
-      - 'android/**'
       - 'scripts/apply_stabilization_android.py'
       - '.github/workflows/stabilization-android.yml'
   workflow_dispatch:
