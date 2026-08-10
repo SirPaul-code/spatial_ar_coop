@@ -1,3 +1,4 @@
+# Public-source release gate. No bootstrap or source-generation step is permitted here.
 name: CI
 
 on:
