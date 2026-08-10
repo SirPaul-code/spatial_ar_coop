@@ -125,7 +125,7 @@ jobs:
 
       - name: Upload APK and reports
         if: always() && steps.recover.outputs.ready == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spatial-ar-coop-debug-apk
           if-no-files-found: warn
