@@ -26,7 +26,7 @@ export function createSpatialServer(overrides = {}) {
       return address;
     },
     async stop() {
-      hub.close();
+      await hub.close();
       await new Promise((resolve) => server.close(() => resolve()));
       logger.info('server_stopped');
     }
@@ -61,6 +61,33 @@ async function handleHttp({ request, response, config, logger, store, hub }) {
       return streamLogs(request, response, logger);
     }
 
+    const chunkItem = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/scan-chunks\/([a-zA-Z0-9._-]+)$/);
+    if (chunkItem && request.method === 'GET') {
+      const [, mapId, chunkId] = chunkItem;
+      const { body, metadata } = store.getScanChunk(mapId, chunkId);
+      const etag = `"${metadata.sha256}"`;
+      if (String(request.headers['if-none-match'] ?? '') === etag) return sendEmpty(response, 304, { ETag: etag });
+      return sendBuffer(response, 200, body, {
+        'Content-Type': 'application/gzip',
+        'Content-Length': body.length,
+        'Cache-Control': 'private, max-age=31536000, immutable',
+        ETag: etag,
+        'X-Scan-Point-Count': String(metadata.pointCount)
+      });
+    }
+
+    const pointCloud = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/point-cloud$/);
+    if (pointCloud && request.method === 'GET') {
+      return sendJson(response, 200, store.pointCloudPreview(pointCloud[1], url.searchParams.get('maxPoints') ?? 20000));
+    }
+
+    const liveState = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/live-state$/);
+    if (liveState && request.method === 'GET') {
+      const map = store.getMap(liveState[1]);
+      if (!map) return sendError(response, 404, 'MAP_NOT_FOUND', `Map ${liveState[1]} was not found`);
+      return sendJson(response, 200, hub.snapshot(liveState[1]));
+    }
+
     const match = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)(?:\/(anchors|scan-chunks))?$/);
     if (match) {
       const [, mapId, child] = match;
@@ -71,6 +98,12 @@ async function handleHttp({ request, response, config, logger, store, hub }) {
       if (!child && request.method === 'PATCH') return sendJson(response, 200, store.patchMap(mapId, await readJson(request, config.maxJsonBytes)));
       if (!child && request.method === 'DELETE') return sendJson(response, 200, store.deleteMap(mapId));
       if (child === 'anchors' && request.method === 'POST') return sendJson(response, 200, store.upsertAnchor(mapId, await readJson(request, config.maxJsonBytes)));
+      if (child === 'scan-chunks' && request.method === 'GET') {
+        return sendJson(response, 200, store.listScanChunks(mapId, {
+          cursor: url.searchParams.get('cursor') ?? '0',
+          limit: url.searchParams.get('limit') ?? '50'
+        }));
+      }
       if (child === 'scan-chunks' && request.method === 'POST') {
         const chunkId = request.headers['x-chunk-id'];
         const deviceId = request.headers['x-device-id'];
@@ -141,11 +174,12 @@ function readBuffer(request, limit) {
 
 function setCommonHeaders(response) {
   response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-API-Token, X-Chunk-Id, X-Device-Id');
+  response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, If-None-Match, X-API-Token, X-Chunk-Id, X-Device-Id');
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   response.setHeader('X-Content-Type-Options', 'nosniff');
 }
 function sendJson(response, status, value) { const text = JSON.stringify(value); response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) }); response.end(text); }
 function sendError(response, status, code, message) { return sendJson(response, status, { error: { code, message } }); }
 function sendText(response, status, text, type) { response.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text) }); response.end(text); }
-function sendEmpty(response, status) { response.writeHead(status); response.end(); }
+function sendBuffer(response, status, body, headers = {}) { response.writeHead(status, headers); response.end(body); }
+function sendEmpty(response, status, headers = {}) { response.writeHead(status, headers); response.end(); }
