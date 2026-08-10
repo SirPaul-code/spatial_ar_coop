@@ -1,0 +1,80 @@
+name: Recover server v2
+
+on:
+  push:
+    branches: [stabilization-chatgpt]
+    paths:
+      - '.github/workflows/recover-server-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recover-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stabilization-chatgpt
+          fetch-depth: 0
+
+      - name: Decode and validate v2 archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t parts < <(find .bootstrap -maxdepth 1 -type f -name 'v2.part*' | sort -V)
+          test ${#parts[@]} -gt 0
+          cat "${parts[@]}" | tr -d '\r\n\t ' | base64 --decode > /tmp/spatial-v2.tar.xz
+          xz --test /tmp/spatial-v2.tar.xz
+          tar -tJf /tmp/spatial-v2.tar.xz > /tmp/v2-list.txt
+          grep -E '(^|/)server/package.json$' /tmp/v2-list.txt
+
+      - name: Recover normal server source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/spatial-v2 && mkdir -p /tmp/spatial-v2
+          tar -xJf /tmp/spatial-v2.tar.xz -C /tmp/spatial-v2
+          source_root=/tmp/spatial-v2
+          mapfile -t top < <(find /tmp/spatial-v2 -mindepth 1 -maxdepth 1 -print)
+          if (( ${#top[@]} == 1 )) && [[ -d "${top[0]}" ]]; then source_root="${top[0]}"; fi
+          test -f "$source_root/server/package.json"
+          rm -rf server
+          cp -a "$source_root/server" ./server
+          for f in docker-compose.yml docker-compose.yaml; do
+            if [[ -f "$source_root/$f" ]]; then cp "$source_root/$f" "$f"; fi
+          done
+          if [[ -d "$source_root/scripts" ]]; then
+            mkdir -p scripts
+            cp -a "$source_root/scripts/." scripts/
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Verify recovered server
+        working-directory: server
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          npm run check
+
+      - name: Verify server container
+        run: docker build -t spatial-ar-coop-server:recovered server
+
+      - name: Commit recovered server source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server docker-compose.yml docker-compose.yaml scripts 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: restore tracked server source'
+            git push origin HEAD:stabilization-chatgpt
+          fi
