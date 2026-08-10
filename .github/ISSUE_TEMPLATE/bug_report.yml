@@ -1,0 +1,36 @@
+name: Bug report
+description: Reproducible Android, server, mapping, or protocol issue
+title: "[bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options: [Android MAP, Android SENSOR, Android VIEWER, Cloud Anchor, Server REST, Server WebSocket, Build/CI]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Device, Android version, app commit/build, server commit/image, network topology.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove API keys, tokens, exact private coordinates, and personal data.

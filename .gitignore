@@ -1,0 +1,26 @@
+# Android / Gradle
+.gradle/
+**/build/
+android/local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+android/app/src/main/assets/efficientdet-lite0.tflite
+android/app/src/main/assets/efficientdet-lite0.tflite.download
+
+# Runtime state
+.env
+server/data/*
+!server/data/.gitkeep
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs / temporary files
+*.log
+*.tmp
+.tmp-*
