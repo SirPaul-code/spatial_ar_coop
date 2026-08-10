@@ -1,0 +1,115 @@
+name: Mirror demo build status
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/ci-status/**"
+  workflow_run:
+    workflows:
+      - "Reproducible server and Android build"
+      - "Self-recovering bootstrap build"
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-demo-build-status
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Determine whether a verified APK release exists
+        id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=failure
+          release=none
+          if gh release view demo-latest --json tagName >/dev/null 2>&1; then
+            state=success
+            release=demo-latest
+          elif gh release view demo-bootstrap-latest --json tagName >/dev/null 2>&1; then
+            state=success
+            release=demo-bootstrap-latest
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      - name: Generate deterministic status PDF and text
+        env:
+          STATE: ${{ steps.status.outputs.state }}
+          RELEASE: ${{ steps.status.outputs.release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/ci-status
+          rm -f docs/ci-status/success.pdf docs/ci-status/failure.pdf
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          state = os.environ['STATE']
+          release = os.environ['RELEASE']
+          if state == 'success':
+              title = 'SPATIAL AR COOP BUILD: SUCCESS'
+              detail = f'Verified APK release: {release}'
+              output = Path('docs/ci-status/success.pdf')
+          else:
+              title = 'SPATIAL AR COOP BUILD: NOT YET VERIFIED'
+              detail = 'No successful rolling APK release exists yet.'
+              output = Path('docs/ci-status/failure.pdf')
+
+          lines = [title, detail]
+          escaped = []
+          for line in lines:
+              escaped.append(line.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)'))
+          stream = 'BT /F1 18 Tf 72 720 Td (' + escaped[0] + ') Tj 0 -36 Td /F1 11 Tf (' + escaped[1] + ') Tj ET\n'
+          objects = [
+              '<< /Type /Catalog /Pages 2 0 R >>',
+              '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+              '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+              f'<< /Length {len(stream.encode())} >>\nstream\n{stream}endstream',
+              '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+          ]
+          buf = bytearray(b'%PDF-1.4\n')
+          offsets = [0]
+          for i, obj in enumerate(objects, start=1):
+              offsets.append(len(buf))
+              buf.extend(f'{i} 0 obj\n{obj}\nendobj\n'.encode())
+          xref = len(buf)
+          buf.extend(f'xref\n0 {len(objects)+1}\n'.encode())
+          buf.extend(b'0000000000 65535 f \n')
+          for off in offsets[1:]:
+              buf.extend(f'{off:010d} 00000 n \n'.encode())
+          buf.extend(f'trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode())
+          output.write_bytes(buf)
+          Path('docs/ci-status/latest.txt').write_text(
+              f'state={state}\nrelease={release}\n', encoding='utf-8'
+          )
+          PY
+
+      - name: Commit changed status only
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- docs/ci-status; then
+            echo "Status did not change."
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add docs/ci-status
+          git commit -m "ci: mirror demo build status [skip ci]"
+          git push origin HEAD:main
