@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.bootstrap/final-*'
+      - '.bootstrap/v2.part*'
       - '.github/workflows/bootstrap.yml'
   workflow_dispatch:
 
@@ -37,30 +37,30 @@ jobs:
             exit 0
           fi
 
-          part_count="$(find .bootstrap -maxdepth 1 -type f -name 'final-*' | wc -l | tr -d ' ')"
-          if [[ "$part_count" != '19' ]]; then
-            echo "Archive upload is not complete yet: found $part_count of 19 parts."
+          part_count="$(find .bootstrap -maxdepth 1 -type f -name 'v2.part*' | wc -l | tr -d ' ')"
+          if [[ "$part_count" != '14' ]]; then
+            echo "Archive upload is not complete yet: found $part_count of 14 parts."
             echo 'ready=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          find .bootstrap -maxdepth 1 -type f -name 'final-*' -print0 \
+          find .bootstrap -maxdepth 1 -type f -name 'v2.part*' -print0 \
             | sort -z \
             | xargs -0 cat > /tmp/spatial-source.b64
-          base64 --decode /tmp/spatial-source.b64 > /tmp/spatial-source.tar.gz
-          echo '0e4841d5e5f0af239c05bf745688ba9ffdc864b2f54657f6028a40cdd001a364  /tmp/spatial-source.tar.gz' \
+          base64 --decode /tmp/spatial-source.b64 > /tmp/spatial-source.tar.xz
+          echo 'ef9b81749ad51a74011fddfbbf2895dc317af352e0ffb932e461e63570456381  /tmp/spatial-source.tar.xz' \
             | sha256sum --check --strict
-          gzip --test /tmp/spatial-source.tar.gz
+          xz --test /tmp/spatial-source.tar.xz
 
           mkdir -p /tmp/spatial-source
-          tar -xzf /tmp/spatial-source.tar.gz -C /tmp/spatial-source
+          tar -xJf /tmp/spatial-source.tar.xz -C /tmp/spatial-source
           test -f /tmp/spatial-source/README.md
           test -f /tmp/spatial-source/server/package.json
           test -f /tmp/spatial-source/android/settings.gradle.kts
           test -f /tmp/spatial-source/android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
 
-          # Preserve the workflow directory: a repository GITHUB_TOKEN is intentionally
-          # not used to create or rewrite workflows. CI workflows are committed separately.
+          # Keep the workflow directory managed by explicit commits. Publish the entire
+          # verified project tree and remove all temporary bootstrap files.
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/workflows/' \
