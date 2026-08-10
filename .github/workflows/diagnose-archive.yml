@@ -73,3 +73,5 @@ jobs:
           head -40 /tmp/legacy.out || true
           echo 'legacy tar entries:'
           tar -tf /tmp/legacy.out 2>/dev/null | head -50 || true
+
+# Contents-API touch: intentionally keeps this workflow triggerable.
