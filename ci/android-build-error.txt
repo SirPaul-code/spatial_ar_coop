@@ -1,0 +1,10 @@
+Android stabilization failure
+build_head=2eb53bf4650f62f43fc8b3e7d15bb73981e69a49
+
+FAILURE: Build completed with 2 failures.
+* What went wrong:
+Execution failed for task ':app:mergeDebugResources'.
+org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:mergeDebugResources'.
+* What went wrong:
+Execution failed for task ':app:parseDebugLocalResources'.
+org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:parseDebugLocalResources'.
