@@ -1,0 +1,86 @@
+name: Bootstrap source tree
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.bootstrap/**'
+      - '.github/workflows/bootstrap.yml'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: bootstrap-source
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Reconstruct and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          part_count="$(find .bootstrap -maxdepth 1 -type f -name 'source.part*' | wc -l | tr -d ' ')"
+          test "$part_count" = "10" || { echo "Expected 10 archive parts, found $part_count"; exit 1; }
+          cat .bootstrap/source.part{00..09} > /tmp/spatial-source.b64
+          base64 --decode /tmp/spatial-source.b64 > /tmp/spatial-source.tar.xz
+          echo "21db62772f9052bff309030115041e8fdf4605f4dd750c112b9b3bb77697988c  /tmp/spatial-source.tar.xz" | sha256sum -c -
+          mkdir -p /tmp/spatial-source
+          tar -xJf /tmp/spatial-source.tar.xz -C /tmp/spatial-source
+
+      - name: Replace bootstrap tree with project source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -a --delete --exclude='.git/' /tmp/spatial-source/ ./
+          chmod +x android/gradlew scripts/*.sh
+
+      - name: Verify server before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd server
+          npm test
+          npm run check
+
+      - name: Commit and push project source
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: publish cooperative spatial AR demo'
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch CI and container build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 4
+          for workflow in ci.yml container.yml; do
+            curl --retry 4 --retry-all-errors --fail-with-body -L \
+              -X POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/dispatches" \
+              -d '{"ref":"main"}'
+          done
+          echo "Published ${{ steps.publish.outputs.sha }} and dispatched CI."
