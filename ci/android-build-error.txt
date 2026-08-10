@@ -1,10 +1,19 @@
 Android stabilization failure
-build_head=2eb53bf4650f62f43fc8b3e7d15bb73981e69a49
+build_head=fef706851f652b74759dfc6f187daaff9f4a58ea
 
-FAILURE: Build completed with 2 failures.
+FAILURE: Build failed with an exception.
 * What went wrong:
-Execution failed for task ':app:mergeDebugResources'.
-org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:mergeDebugResources'.
-* What went wrong:
-Execution failed for task ':app:parseDebugLocalResources'.
-org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:parseDebugLocalResources'.
+Execution failed for task ':app:processDebugResources'.
+     ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource mipmap/ic_launcher (aka com.sirpaul.spatialarcoop.debug:mipmap/ic_launcher) not found.
+     ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource string/app_name (aka com.sirpaul.spatialarcoop.debug:string/app_name) not found.
+     ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource xml/network_security_config (aka com.sirpaul.spatialarcoop.debug:xml/network_security_config) not found.
+     ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource mipmap/ic_launcher_round (aka com.sirpaul.spatialarcoop.debug:mipmap/ic_launcher_round) not found.
+     ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource style/Theme.SpatialArCoop (aka com.sirpaul.spatialarcoop.debug:style/Theme.SpatialArCoop) not found.
+     ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:42:13-44:54: AAPT: error: resource xml/file_paths (aka com.sirpaul.spatialarcoop.debug:xml/file_paths) not found.
+org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:processDebugResources'.
+ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource mipmap/ic_launcher (aka com.sirpaul.spatialarcoop.debug:mipmap/ic_launcher) not found.
+ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource string/app_name (aka com.sirpaul.spatialarcoop.debug:string/app_name) not found.
+ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource xml/network_security_config (aka com.sirpaul.spatialarcoop.debug:xml/network_security_config) not found.
+ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource mipmap/ic_launcher_round (aka com.sirpaul.spatialarcoop.debug:mipmap/ic_launcher_round) not found.
+ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:10:5-46:19: AAPT: error: resource style/Theme.SpatialArCoop (aka com.sirpaul.spatialarcoop.debug:style/Theme.SpatialArCoop) not found.
+ERROR: /home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/AndroidManifest.xml:42:13-44:54: AAPT: error: resource xml/file_paths (aka com.sirpaul.spatialarcoop.debug:xml/file_paths) not found.
