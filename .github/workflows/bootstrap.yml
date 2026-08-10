@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: bootstrap-source
@@ -31,8 +30,6 @@ jobs:
           cat .bootstrap/source.part{00..06} > /tmp/spatial-source.b64
           base64 --decode /tmp/spatial-source.b64 > /tmp/spatial-source.tar.xz
 
-          # The tail of the uploaded xz stream is damaged, but xz still emits a valid
-          # tar stream containing every complete entry before the damaged block.
           set +e
           xz --decompress --stdout /tmp/spatial-source.tar.xz > /tmp/spatial-source.tar
           xz_rc=$?
@@ -52,9 +49,6 @@ jobs:
           test -f /tmp/spatial-source/android/app/src/main/java/com/sirpaul/spatialarcoop/MainActivity.kt
           test -f /tmp/spatial-source/android/app/src/main/java/com/sirpaul/spatialarcoop/vision/ObjectDetectorEngine.kt
 
-          mkdir -p /tmp/spatial-source/.github/workflows
-          cp .github/workflows/recover-bootstrap.yml /tmp/spatial-source/.github/workflows/recover-bootstrap.yml
-          cp .github/workflows/diagnose-archive.yml /tmp/spatial-source/.github/workflows/diagnose-archive.yml
           cat > /tmp/spatial-source/RECOVERY_NOTES.md <<'EOF'
           # Source recovery note
 
@@ -68,7 +62,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rsync -a --delete --exclude='.git/' /tmp/spatial-source/ ./
+          # A repository GITHUB_TOKEN cannot create or modify workflow files. Preserve
+          # the current workflow directory and publish every other recovered file.
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/' \
+            /tmp/spatial-source/ ./
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
