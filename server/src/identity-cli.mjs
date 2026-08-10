@@ -11,6 +11,13 @@ const identity = new ServerIdentityStore({
   serverName: config.serverName
 });
 
+const command = process.argv[2] ?? 'show';
+if (command === 'rotate-admin') identity.rotateAdminToken();
+else if (command !== 'show') {
+  console.error('Usage: node src/identity-cli.mjs [show|rotate-admin]');
+  process.exit(2);
+}
+
 console.log(JSON.stringify({
   ...identity.publicInfo(),
   adminToken: identity.adminToken(),
