@@ -49,7 +49,6 @@ jobs:
           ar = Path('android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt')
           text = ar.read_text()
           text = text.replace('\n// patch-guard: enum class ArMode { MAP, SENSOR, VIEWER, LIVE }\n', '\n')
-          text = text.replace('if (!::backgroundRenderer.isInitialized) return"', 'if (!::backgroundRenderer.isInitialized) return')
           ar.write_text(text)
           PY
           fi
@@ -87,6 +86,9 @@ jobs:
             echo "build_head=$(git rev-parse HEAD)"
             echo
             grep -E '(^e: | error: |FAILURE:|What went wrong:|Execution failed for task|Compilation error|Unresolved reference|Type mismatch|No value passed|Cannot access|Expected|Could not resolve all files)' android-build.log | tail -n 220 || true
+            echo
+            echo "--- generated ArActivity.kt lines 420-445 ---"
+            nl -ba android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt | sed -n '420,445p'
           } > /tmp/android-build-error.txt
           git fetch origin stabilization-chatgpt
           git reset --hard origin/stabilization-chatgpt
