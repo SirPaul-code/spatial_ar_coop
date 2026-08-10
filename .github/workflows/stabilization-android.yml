@@ -47,7 +47,10 @@ jobs:
             python3 - <<'PY'
           from pathlib import Path
           ar = Path('android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt')
-          ar.write_text(ar.read_text().replace('\n// patch-guard: enum class ArMode { MAP, SENSOR, VIEWER, LIVE }\n', '\n'))
+          text = ar.read_text()
+          text = text.replace('\n// patch-guard: enum class ArMode { MAP, SENSOR, VIEWER, LIVE }\n', '\n')
+          text = text.replace('if (!::backgroundRenderer.isInitialized) return"', 'if (!::backgroundRenderer.isInitialized) return')
+          ar.write_text(text)
           PY
           fi
 
@@ -103,9 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f ci/android-build-error.txt
-          if [[ -f scripts/apply_stabilization_android.py ]]; then
-            rm -f scripts/apply_stabilization_android.py
-          fi
+          rm -f scripts/apply_stabilization_android.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
