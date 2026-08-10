@@ -1,0 +1,43 @@
+name: Apply dashboard acceptance
+
+on:
+  push:
+    branches: [stabilization-chatgpt]
+    paths:
+      - 'scripts/patch_dashboard_acceptance.py'
+      - '.github/workflows/apply-dashboard-acceptance.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stabilization-chatgpt
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Apply exact dashboard patch
+        run: python3 scripts/patch_dashboard_acceptance.py
+      - name: Verify server and embedded dashboard JavaScript
+        working-directory: server
+        run: |
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts; else npm install --ignore-scripts; fi
+          npm test
+          npm run check
+      - name: Commit verified dashboard patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f scripts/patch_dashboard_acceptance.py .github/workflows/apply-dashboard-acceptance.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: complete spatial debugger diagnostics'
+          git pull --rebase origin stabilization-chatgpt
+          git push origin HEAD:stabilization-chatgpt
