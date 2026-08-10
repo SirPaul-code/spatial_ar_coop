@@ -48,6 +48,24 @@ export class RealtimeHub {
     };
   }
 
+  /**
+   * Revoke all currently-open sessions for one map. New connections are still authorized by the
+   * caller's current map key, so rotating the key and then calling this makes revocation immediate.
+   */
+  disconnectMap(mapId, code = 4003, reason = 'map access revoked') {
+    const room = this.rooms.get(mapId);
+    if (!room?.size) return 0;
+    const sockets = [...room];
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        try { socket.close(code, reason); }
+        catch { socket.terminate(); }
+      }
+    }
+    this.logger.warn('ws_map_sessions_revoked', { mapId, clients: sockets.length, code, reason });
+    return sockets.length;
+  }
+
   async close() {
     clearInterval(this.timer);
     const sockets = [...this.wss.clients];
