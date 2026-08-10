@@ -58,6 +58,10 @@ data class MapDefinition(
     val minAnchorSpacingMeters: Float = 3f,
     val autoAnchor: Boolean = true,
     val anchors: List<AnchorDefinition> = emptyList(),
+    /** Server-side sparse geometry summary. Null means it has not been synchronized yet. */
+    val serverChunkCount: Int? = null,
+    val serverPointCount: Int? = null,
+    val serverScanBytes: Long? = null,
     val updatedAtMs: Long = System.currentTimeMillis(),
     val syncPending: Boolean = true
 ) {
@@ -75,6 +79,7 @@ data class MapDefinition(
         fun fromServer(json: JSONObject, serverUrl: String): MapDefinition {
             val id = json.getString("id")
             val settings = json.optJSONObject("settings") ?: JSONObject()
+            val scan = json.optJSONObject("scan")
             val anchorsJson = json.optJSONArray("anchors") ?: JSONArray()
             val anchors = buildList {
                 for (index in 0 until anchorsJson.length()) {
@@ -92,6 +97,9 @@ data class MapDefinition(
                 minAnchorSpacingMeters = settings.optDouble("minAnchorSpacingMeters", 3.0).toFloat(),
                 autoAnchor = settings.optBoolean("autoAnchor", true),
                 anchors = anchors,
+                serverChunkCount = scan?.optInt("chunkCount", 0)?.coerceAtLeast(0),
+                serverPointCount = scan?.optInt("pointCount", 0)?.coerceAtLeast(0),
+                serverScanBytes = scan?.optLong("bytes", 0L)?.coerceAtLeast(0L),
                 updatedAtMs = parseTime(json.opt("updatedAt")),
                 syncPending = false
             )
