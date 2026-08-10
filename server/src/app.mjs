@@ -1,28 +1,51 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { loadConfig } from './config.mjs';
 import { JsonLogger } from './logger.mjs';
 import { MapStore } from './persistence.mjs';
 import { RealtimeHub } from './websocket.mjs';
 import { adminPage } from './admin-page.mjs';
+import { ServerIdentityStore } from './identity.mjs';
 
 export function createSpatialServer(overrides = {}) {
   const config = loadConfig(overrides);
   const logger = overrides.logger ?? new JsonLogger({ dataDir: config.dataDir, level: config.logLevel, stdout: overrides.stdout ?? true });
   const store = overrides.store ?? new MapStore({ dataDir: config.dataDir, logger, maxScanChunkBytes: config.maxScanChunkBytes });
+  const identity = overrides.identity ?? new ServerIdentityStore({
+    dataDir: config.dataDir,
+    logger,
+    configuredAdminToken: config.adminToken,
+    configuredServerId: config.serverId,
+    serverName: config.serverName
+  });
+
   let hub;
-  const server = http.createServer((request, response) => handleHttp({ request, response, config, logger, store, hub }));
-  const authorize = (request, queryToken = '') => checkToken(config.apiToken, request, queryToken);
-  hub = new RealtimeHub({ server, logger, trackTtlMs: config.trackTtlMs, maxPayload: config.wsMaxPayloadBytes, authorize });
+  const server = http.createServer((request, response) => handleHttp({ request, response, config, logger, store, hub, identity }));
+  hub = new RealtimeHub({
+    server,
+    logger,
+    trackTtlMs: config.trackTtlMs,
+    maxPayload: config.wsMaxPayloadBytes,
+    authorize: (request, queryToken, mapId) => {
+      if (!store.getMap(mapId)) return false;
+      return identity.isMapAuthorized(mapId, requestToken(request, queryToken));
+    }
+  });
 
   return {
-    config, logger, store, hub, server,
+    config, logger, store, hub, identity, server,
     async start() {
       await new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(config.port, config.host, () => { server.off('error', reject); resolve(); });
       });
       const address = server.address();
-      logger.info('server_started', { host: config.host, port: typeof address === 'object' ? address.port : config.port, dataDir: config.dataDir });
+      logger.info('server_started', {
+        serverId: identity.publicInfo().serverId,
+        host: config.host,
+        port: typeof address === 'object' ? address.port : config.port,
+        dataDir: config.dataDir
+      });
       return address;
     },
     async stop() {
@@ -33,37 +56,71 @@ export function createSpatialServer(overrides = {}) {
   };
 }
 
-async function handleHttp({ request, response, config, logger, store, hub }) {
+async function handleHttp({ request, response, config, logger, store, hub, identity }) {
   const startedAt = Date.now();
   const url = new URL(request.url, 'http://localhost');
   setCommonHeaders(response);
   if (request.method === 'OPTIONS') return sendEmpty(response, 204);
+
   try {
     if (request.method === 'GET' && url.pathname === '/') return sendText(response, 200, adminPage(), 'text/html; charset=utf-8');
     if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { ok: true, now: new Date().toISOString() });
+    if (request.method === 'GET' && url.pathname === '/api/v1/info') {
+      return sendJson(response, 200, {
+        ...identity.publicInfo(),
+        version: process.env.npm_package_version ?? 'dev'
+      });
+    }
 
-    if (!checkToken(config.apiToken, request, url.searchParams.get('token') ?? '')) return sendError(response, 401, 'UNAUTHORIZED', 'A valid API token is required');
+    const adminToken = requestToken(request, url.searchParams.get('token') ?? '');
+    const isAdmin = identity.isAdmin(adminToken);
 
     if (request.method === 'GET' && url.pathname === '/api/v1/metrics') {
+      if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required');
       return sendJson(response, 200, { ...store.metrics(), ...hub.metrics(), uptimeSeconds: Math.floor(process.uptime()) });
     }
-    if (request.method === 'GET' && url.pathname === '/api/v1/maps') return sendJson(response, 200, { maps: store.listMaps() });
-    if (request.method === 'POST' && url.pathname === '/api/v1/maps') {
-      const payload = await readJson(request, config.maxJsonBytes);
-      return sendJson(response, 201, store.createMap(payload));
-    }
     if (request.method === 'GET' && url.pathname === '/api/v1/logs') {
-      if (!checkToken(config.adminToken, request, url.searchParams.get('token') ?? '')) return sendError(response, 401, 'ADMIN_UNAUTHORIZED', 'A valid admin token is required');
+      if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required');
       return sendJson(response, 200, { entries: logger.recent(Number(url.searchParams.get('limit') ?? 100)) });
     }
     if (request.method === 'GET' && url.pathname === '/api/v1/events') {
-      if (!checkToken(config.adminToken, request, url.searchParams.get('token') ?? '')) return sendError(response, 401, 'ADMIN_UNAUTHORIZED', 'A valid admin token is required');
+      if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required');
       return streamLogs(request, response, logger);
+    }
+
+    if (url.pathname === '/api/v1/maps') {
+      if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required');
+      if (request.method === 'GET') {
+        const maps = store.listMaps().map((map) => ({ ...map, accessKey: identity.mapKey(map.id) }));
+        return sendJson(response, 200, { server: identity.publicInfo(), maps });
+      }
+      if (request.method === 'POST') {
+        const payload = await readJson(request, config.maxJsonBytes);
+        if (!payload.id) payload.id = `map-${crypto.randomUUID()}`;
+        const map = store.createMap(payload);
+        const accessKey = identity.mapKey(map.id);
+        return sendJson(response, 201, {
+          ...map,
+          serverId: identity.publicInfo().serverId,
+          accessKey,
+          invite: identity.invite(map.id, config.publicBaseUrl)
+        });
+      }
+    }
+
+    const inviteMatch = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/invite$/);
+    if (inviteMatch && request.method === 'GET') {
+      const map = authorizeMap({ mapId: inviteMatch[1], request, url, store, identity });
+      return sendJson(response, 200, {
+        map: withServerId(map, identity),
+        invite: identity.invite(map.id, config.publicBaseUrl)
+      });
     }
 
     const chunkItem = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/scan-chunks\/([a-zA-Z0-9._-]+)$/);
     if (chunkItem && request.method === 'GET') {
       const [, mapId, chunkId] = chunkItem;
+      authorizeMap({ mapId, request, url, store, identity });
       const { body, metadata } = store.getScanChunk(mapId, chunkId);
       const etag = `"${metadata.sha256}"`;
       if (String(request.headers['if-none-match'] ?? '') === etag) return sendEmpty(response, 304, { ETag: etag });
@@ -78,25 +135,29 @@ async function handleHttp({ request, response, config, logger, store, hub }) {
 
     const pointCloud = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/point-cloud$/);
     if (pointCloud && request.method === 'GET') {
+      authorizeMap({ mapId: pointCloud[1], request, url, store, identity });
       return sendJson(response, 200, store.pointCloudPreview(pointCloud[1], url.searchParams.get('maxPoints') ?? 20000));
     }
 
     const liveState = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/live-state$/);
     if (liveState && request.method === 'GET') {
-      const map = store.getMap(liveState[1]);
-      if (!map) return sendError(response, 404, 'MAP_NOT_FOUND', `Map ${liveState[1]} was not found`);
-      return sendJson(response, 200, hub.snapshot(liveState[1]));
+      const map = authorizeMap({ mapId: liveState[1], request, url, store, identity });
+      return sendJson(response, 200, { ...hub.snapshot(map.id), serverId: identity.publicInfo().serverId });
     }
 
     const match = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)(?:\/(anchors|scan-chunks))?$/);
     if (match) {
       const [, mapId, child] = match;
-      if (!child && request.method === 'GET') {
-        const map = store.getMap(mapId);
-        return map ? sendJson(response, 200, map) : sendError(response, 404, 'MAP_NOT_FOUND', `Map ${mapId} was not found`);
+      if (!child && request.method === 'DELETE') {
+        if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required to delete a map');
+        const deleted = store.deleteMap(mapId);
+        identity.deleteMapKey(mapId);
+        return sendJson(response, 200, deleted);
       }
-      if (!child && request.method === 'PATCH') return sendJson(response, 200, store.patchMap(mapId, await readJson(request, config.maxJsonBytes)));
-      if (!child && request.method === 'DELETE') return sendJson(response, 200, store.deleteMap(mapId));
+
+      const map = authorizeMap({ mapId, request, url, store, identity });
+      if (!child && request.method === 'GET') return sendJson(response, 200, withServerId(map, identity));
+      if (!child && request.method === 'PATCH') return sendJson(response, 200, withServerId(store.patchMap(mapId, await readJson(request, config.maxJsonBytes)), identity));
       if (child === 'anchors' && request.method === 'POST') return sendJson(response, 200, store.upsertAnchor(mapId, await readJson(request, config.maxJsonBytes)));
       if (child === 'scan-chunks' && request.method === 'GET') {
         return sendJson(response, 200, store.listScanChunks(mapId, {
@@ -113,6 +174,7 @@ async function handleHttp({ request, response, config, logger, store, hub }) {
         return sendJson(response, result.duplicate ? 200 : 201, result);
       }
     }
+
     return sendError(response, 404, 'NOT_FOUND', 'Route not found');
   } catch (error) {
     const status = Number(error.statusCode) || 500;
@@ -123,9 +185,27 @@ async function handleHttp({ request, response, config, logger, store, hub }) {
   }
 }
 
+function authorizeMap({ mapId, request, url, store, identity }) {
+  const map = store.getMap(mapId);
+  const token = requestToken(request, url.searchParams.get('mapKey') ?? url.searchParams.get('token') ?? '');
+  if (!map || !identity.isMapAuthorized(mapId, token)) {
+    const error = new Error('Map is unavailable or the map key is invalid');
+    error.statusCode = 404;
+    error.code = 'MAP_UNAVAILABLE';
+    throw error;
+  }
+  return map;
+}
+
+function withServerId(map, identity) {
+  return { ...map, serverId: identity.publicInfo().serverId };
+}
+
 function streamLogs(request, response, logger) {
   response.writeHead(200, {
-    'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive',
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
     'X-Accel-Buffering': 'no-cache'
   });
   for (const entry of logger.recent(50)) response.write(`data: ${JSON.stringify(entry)}\n\n`);
@@ -133,26 +213,24 @@ function streamLogs(request, response, logger) {
   request.on('close', unsubscribe);
 }
 
-function checkToken(expected, request, queryToken = '') {
-  if (!expected) return true;
+function requestToken(request, queryToken = '') {
   const authorization = String(request.headers.authorization ?? '');
   const bearer = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-  const header = String(request.headers['x-api-token'] ?? '');
-  return timingSafeEqual(expected, bearer || header || queryToken);
-}
-
-function timingSafeEqual(expected, actual) {
-  if (!actual || expected.length !== actual.length) return false;
-  let difference = 0;
-  for (let index = 0; index < expected.length; index += 1) difference |= expected.charCodeAt(index) ^ actual.charCodeAt(index);
-  return difference === 0;
+  const adminHeader = String(request.headers['x-admin-token'] ?? '');
+  const mapHeader = String(request.headers['x-spatial-map-key'] ?? '');
+  return bearer || adminHeader || mapHeader || String(queryToken ?? '');
 }
 
 async function readJson(request, limit) {
   const body = await readBuffer(request, limit);
   if (!body.length) return {};
   try { return JSON.parse(body.toString('utf8')); }
-  catch { const error = new Error('Request body is not valid JSON'); error.statusCode = 400; error.code = 'INVALID_JSON'; throw error; }
+  catch {
+    const error = new Error('Request body is not valid JSON');
+    error.statusCode = 400;
+    error.code = 'INVALID_JSON';
+    throw error;
+  }
 }
 
 function readBuffer(request, limit) {
@@ -162,8 +240,12 @@ function readBuffer(request, limit) {
     request.on('data', (chunk) => {
       size += chunk.length;
       if (size > limit) {
-        const error = new Error(`Request body exceeds ${limit} bytes`); error.statusCode = 413; error.code = 'PAYLOAD_TOO_LARGE';
-        reject(error); request.destroy(); return;
+        const error = new Error(`Request body exceeds ${limit} bytes`);
+        error.statusCode = 413;
+        error.code = 'PAYLOAD_TOO_LARGE';
+        reject(error);
+        request.destroy();
+        return;
       }
       chunks.push(chunk);
     });
@@ -174,10 +256,14 @@ function readBuffer(request, limit) {
 
 function setCommonHeaders(response) {
   response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, If-None-Match, X-API-Token, X-Chunk-Id, X-Device-Id');
+  response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, If-None-Match, X-Admin-Token, X-Spatial-Map-Key, X-Chunk-Id, X-Device-Id');
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('Referrer-Policy', 'no-referrer');
+  response.setHeader('Cache-Control', 'no-store');
 }
+
+function unauthorized(response, code, message) { return sendError(response, 401, code, message); }
 function sendJson(response, status, value) { const text = JSON.stringify(value); response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) }); response.end(text); }
 function sendError(response, status, code, message) { return sendJson(response, status, { error: { code, message } }); }
 function sendText(response, status, text, type) { response.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text) }); response.end(text); }

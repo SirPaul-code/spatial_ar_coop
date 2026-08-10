@@ -65,15 +65,16 @@ export class RealtimeHub {
     try {
       const url = new URL(request.url, 'http://localhost');
       if (url.pathname !== '/ws') return socket.destroy();
-      if (!this.authorize(request, url.searchParams.get('token') ?? '')) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-        return socket.destroy();
-      }
       const identity = validateClientIdentity({
         mapId: url.searchParams.get('mapId'),
         clientId: url.searchParams.get('clientId'),
         role: url.searchParams.get('role')
       });
+      const queryToken = url.searchParams.get('mapKey') ?? url.searchParams.get('token') ?? '';
+      if (!this.authorize(request, queryToken, identity.mapId)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        return socket.destroy();
+      }
       this.wss.handleUpgrade(request, socket, head, (webSocket) => {
         this.wss.emit('connection', webSocket, request, identity);
       });
