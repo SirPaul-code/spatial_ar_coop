@@ -1,5 +1,5 @@
 Android stabilization failure
-build_head=e89f885f7b26e5dbf1f672faebedf9e86c687a66
+build_head=44e8ca10dec91320926f1e27535c889753a6c4de
 
 e: file:///home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt:431:55 Expecting '"'
 e: file:///home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt:433:1 Expecting an element
@@ -10,3 +10,31 @@ Execution failed for task ':app:compileDebugKotlin'.
    > Compilation error. See log for more details
 org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:compileDebugKotlin'.
 Caused by: org.jetbrains.kotlin.gradle.tasks.CompilationErrorException: Compilation error. See log for more details
+
+--- generated ArActivity.kt lines 420-445 ---
+   420	            is SecurityException -> "Camera access was rejected by Android. Check camera permission and retry."
+   421	            is IllegalStateException -> "ARCore rejected the current lifecycle state. Retry creates a clean session."
+   422	            else -> when (error.javaClass.simpleName) {
+   423	                "UnavailableArcoreNotInstalledException" -> "Google Play Services for AR is not installed."
+   424	                "UnavailableApkTooOldException" -> "Google Play Services for AR must be updated."
+   425	                "UnavailableSdkTooOldException" -> "This app build is too old for the installed ARCore service."
+   426	                "UnavailableDeviceNotCompatibleException" -> "ARCore reports that this device/configuration is unsupported."
+   427	                "UnavailableUserDeclinedInstallationException" -> "ARCore installation was declined."
+   428	                else -> "AR session could not start (${error.javaClass.simpleName})."
+   429	            }
+   430	        }
+   431	        arErrorText.text = "AR session could not start
+   432	
+   433	$category"
+   434	        arErrorPanel.visibility = View.VISIBLE
+   435	        stateText.text = "${currentMap()?.name ?: mapId} · AR unavailable"
+   436	        detailText.text = "Retry AR or share diagnostics for the complete error."
+   437	    }
+   438	
+   439	    private fun hideArFailure() {
+   440	        runOnUiThread { arErrorPanel.visibility = View.GONE }
+   441	    }
+   442	
+   443	    private fun closeSessionAsync(value: Session?) {
+   444	        if (value == null) return
+   445	        Thread({ runCatching { value.close() } }, "spatial-arcore-close").start()
