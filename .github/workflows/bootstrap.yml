@@ -1,76 +1,136 @@
-name: Bootstrap source tree
+name: Bootstrap, verify and build source
 
 on:
   push:
     branches: [main]
     paths:
-      - '.bootstrap/**'
+      - '.bootstrap/final-*'
       - '.github/workflows/bootstrap.yml'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
   group: bootstrap-source
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  publish:
+  publish-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Salvage complete files from the damaged source archive
+      - id: recover
+        name: Recover verified source tree
         shell: bash
         run: |
           set -euo pipefail
-          cat .bootstrap/source.part{00..06} > /tmp/spatial-source.b64
-          base64 --decode /tmp/spatial-source.b64 > /tmp/spatial-source.tar.xz
 
-          set +e
-          xz --decompress --stdout /tmp/spatial-source.tar.xz > /tmp/spatial-source.tar
-          xz_rc=$?
-          set -e
-          echo "xz recovery exit=$xz_rc, recovered_bytes=$(wc -c < /tmp/spatial-source.tar)"
-          file /tmp/spatial-source.tar
+          if [[ -f server/package.json && -f android/settings.gradle.kts ]]; then
+            echo 'The normal source tree already exists.'
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          part_count="$(find .bootstrap -maxdepth 1 -type f -name 'final-*' | wc -l | tr -d ' ')"
+          if [[ "$part_count" != '19' ]]; then
+            echo "Archive upload is not complete yet: found $part_count of 19 parts."
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          find .bootstrap -maxdepth 1 -type f -name 'final-*' -print0 \
+            | sort -z \
+            | xargs -0 cat > /tmp/spatial-source.b64
+          base64 --decode /tmp/spatial-source.b64 > /tmp/spatial-source.tar.gz
+          echo '0e4841d5e5f0af239c05bf745688ba9ffdc864b2f54657f6028a40cdd001a364  /tmp/spatial-source.tar.gz' \
+            | sha256sum --check --strict
+          gzip --test /tmp/spatial-source.tar.gz
 
           mkdir -p /tmp/spatial-source
-          set +e
-          tar --ignore-zeros -xf /tmp/spatial-source.tar -C /tmp/spatial-source
-          tar_rc=$?
-          set -e
-          echo "tar recovery exit=$tar_rc"
-
+          tar -xzf /tmp/spatial-source.tar.gz -C /tmp/spatial-source
           test -f /tmp/spatial-source/README.md
-          test -f /tmp/spatial-source/android/app/build.gradle.kts
-          test -f /tmp/spatial-source/android/app/src/main/java/com/sirpaul/spatialarcoop/MainActivity.kt
-          test -f /tmp/spatial-source/android/app/src/main/java/com/sirpaul/spatialarcoop/vision/ObjectDetectorEngine.kt
+          test -f /tmp/spatial-source/server/package.json
+          test -f /tmp/spatial-source/android/settings.gradle.kts
+          test -f /tmp/spatial-source/android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
 
-          cat > /tmp/spatial-source/RECOVERY_NOTES.md <<'EOF'
-          # Source recovery note
-
-          The original transfer archive was truncated after the Android application sources.
-          Complete files were recovered losslessly. Build configuration, remaining Android
-          resources, server code and documentation are regenerated in subsequent commits and
-          validated by GitHub Actions.
-          EOF
-
-      - name: Publish recovered source tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          # A repository GITHUB_TOKEN cannot create or modify workflow files. Preserve
-          # the current workflow directory and publish every other recovered file.
+          # Preserve the workflow directory: a repository GITHUB_TOKEN is intentionally
+          # not used to create or rewrite workflows. CI workflows are committed separately.
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/workflows/' \
             /tmp/spatial-source/ ./
+          chmod +x android/gradlew scripts/*.sh
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m 'feat: publish recovered cooperative AR application sources'
-          git push origin HEAD:main
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat: publish cooperative spatial AR demo'
+            git push origin HEAD:main
+          fi
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.recover.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - uses: actions/setup-java@v4
+        if: steps.recover.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+        if: steps.recover.outputs.ready == 'true'
+
+      - name: Install Android SDK packages
+        if: steps.recover.outputs.ready == 'true'
+        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.recover.outputs.ready == 'true'
+        with:
+          gradle-version: '8.13'
+
+      - name: Test relay and map server
+        if: steps.recover.outputs.ready == 'true'
+        working-directory: server
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          npm run check
+
+      - name: Build server container
+        if: steps.recover.outputs.ready == 'true'
+        run: docker build --tag spatial-ar-coop-server:ci server
+
+      - name: Test and assemble Android debug APK
+        if: steps.recover.outputs.ready == 'true'
+        working-directory: android
+        env:
+          ARCORE_API_KEY: ${{ secrets.ARCORE_API_KEY || 'UNCONFIGURED' }}
+          DEFAULT_SERVER_URL: ${{ vars.DEFAULT_SERVER_URL || 'http://192.168.1.10:8080' }}
+          DEFAULT_API_TOKEN: ${{ secrets.DEFAULT_API_TOKEN || '' }}
+        run: gradle testDebugUnitTest assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK and reports
+        if: always() && steps.recover.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spatial-ar-coop-debug-apk
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/reports/**
+            android/app/build/test-results/**
