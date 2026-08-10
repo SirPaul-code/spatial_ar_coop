@@ -1,12 +1,13 @@
 package com.sirpaul.spatialarcoop
 
 import android.content.Intent
-import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -15,13 +16,16 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import com.google.android.material.card.MaterialCardView
+import com.sirpaul.spatialarcoop.data.AnchorStatus
 import com.sirpaul.spatialarcoop.data.MapDefinition
+import com.sirpaul.spatialarcoop.data.MapStatus
 import com.sirpaul.spatialarcoop.net.MapApiClient
 import com.sirpaul.spatialarcoop.net.MapApiException
 import com.sirpaul.spatialarcoop.net.UploadScheduler
+import com.sirpaul.spatialarcoop.ui.FieldTheme
 import com.sirpaul.spatialarcoop.util.Diagnostics
 import java.io.File
+import java.text.NumberFormat
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -32,6 +36,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tokenInput: EditText
     private lateinit var mapsContainer: LinearLayout
     private lateinit var status: TextView
+    private lateinit var settingsBody: LinearLayout
+    private var settingsVisible = false
+    private var firstResume = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,6 +49,10 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         renderMaps()
+        if (firstResume) {
+            firstResume = false
+            refreshFromServer(silent = true)
+        }
     }
 
     override fun onDestroy() {
@@ -50,110 +61,132 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildUi(): ScrollView {
-        val root = ScrollView(this).apply { setBackgroundColor(Color.rgb(7, 17, 14)) }
+        val root = ScrollView(this).apply {
+            setBackgroundColor(FieldTheme.background)
+            isFillViewport = true
+        }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(22), dp(18), dp(32))
+            setPadding(dp(20), dp(26), dp(20), dp(36))
         }
         root.addView(content, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         content.addView(TextView(this).apply {
-            text = "SPATIAL AR COOP"
-            textSize = 28f
-            setTextColor(Color.WHITE)
+            text = "Spatial AR"
+            textSize = 30f
+            setTextColor(FieldTheme.textPrimary)
             typeface = Typeface.DEFAULT_BOLD
         })
         content.addView(TextView(this).apply {
-            text = "Cooperative perception demo: map a site, publish detections, and render shared tracks through occluders."
+            text = "Shared places and live cooperative AR"
             textSize = 14f
-            setTextColor(Color.rgb(178, 196, 188))
-            setPadding(0, dp(6), 0, dp(18))
+            setTextColor(FieldTheme.textSecondary)
+            setPadding(0, dp(4), 0, dp(24))
         })
 
-        val settings = card()
-        val settingsBody = vertical(dp(14))
-        settings.addView(settingsBody)
-        settingsBody.addView(sectionTitle("SERVER"))
+        val header = horizontal().apply { gravity = Gravity.CENTER_VERTICAL }
+        header.addView(TextView(this).apply {
+            text = "Shared places"
+            textSize = 19f
+            setTextColor(FieldTheme.textPrimary)
+            typeface = Typeface.DEFAULT_BOLD
+        }, weightParams())
+        header.addView(actionButton("Sync", primary = false) { refreshFromServer(silent = false) }, wrapParams())
+        header.addView(actionButton("New place", primary = true, action = ::showCreateMapDialog), wrapParams(left = 8))
+        content.addView(header)
+
+        status = TextView(this).apply {
+            text = "Scans are stored on this device first and synchronize when the server is available."
+            textSize = 12f
+            setTextColor(FieldTheme.textSecondary)
+            setPadding(0, dp(7), 0, dp(12))
+        }
+        content.addView(status)
+
+        mapsContainer = vertical(0)
+        content.addView(mapsContainer)
+
+        val settingsToggle = actionButton("Server & diagnostics", primary = false) {
+            settingsVisible = !settingsVisible
+            settingsBody.visibility = if (settingsVisible) View.VISIBLE else View.GONE
+        }
+        content.addView(settingsToggle, marginParams(top = 20))
+
+        settingsBody = vertical(dp(16)).apply {
+            visibility = View.GONE
+            background = solidBackground(FieldTheme.surface, radius = 6)
+        }
+        settingsBody.addView(TextView(this).apply {
+            text = "Connection"
+            textSize = 15f
+            setTextColor(FieldTheme.textPrimary)
+            typeface = Typeface.DEFAULT_BOLD
+        })
         serverInput = EditText(this).apply {
             setText(spatialApp.preferences.serverUrl)
-            hint = "http://192.168.1.10:8080"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            hint = "http://100.x.x.x:8080"
+            setTextColor(FieldTheme.textPrimary)
+            setHintTextColor(FieldTheme.textSecondary)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setSingleLine(true)
         }
         tokenInput = EditText(this).apply {
             setText(spatialApp.preferences.apiToken)
             hint = "API token (optional)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(FieldTheme.textPrimary)
+            setHintTextColor(FieldTheme.textSecondary)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setSingleLine(true)
         }
         settingsBody.addView(serverInput)
         settingsBody.addView(tokenInput)
-        val settingsActions = horizontal()
-        settingsActions.addView(actionButton("SAVE") { saveSettings() }, weightParams())
-        settingsActions.addView(actionButton("TEST + SYNC", ::refreshFromServer), weightParams())
-        settingsBody.addView(settingsActions)
+        val connectionActions = horizontal()
+        connectionActions.addView(actionButton("Save", primary = true) { saveSettings(showMessage = true) }, weightParams())
+        connectionActions.addView(actionButton("Test & sync", primary = false) { refreshFromServer(silent = false) }, weightParams(left = 8))
+        settingsBody.addView(connectionActions)
+
         settingsBody.addView(TextView(this).apply {
             text = if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) {
-                "Cloud Anchors: configured in this build"
+                "Cloud Anchor credentials are configured in this build."
             } else {
-                "Cloud Anchors: NOT configured. Set ARCORE_API_KEY and rebuild; local scanning still works."
+                "Cloud Anchors are disabled in this build. Manual shared-origin alignment remains available for development."
             }
             textSize = 12f
-            setTextColor(if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) Color.rgb(117, 231, 176) else Color.rgb(255, 184, 92))
+            setTextColor(if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) FieldTheme.statusBlue else FieldTheme.accent)
+            setPadding(0, dp(12), 0, dp(8))
+        })
+        val diagnosticsActions = horizontal()
+        diagnosticsActions.addView(actionButton("Operator dashboard", primary = false) {
+            saveSettings(showMessage = false)
+            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(spatialApp.preferences.serverUrl))) }
+                .onFailure { showStatus("Could not open dashboard: ${it.message}", true) }
+        }, weightParams())
+        diagnosticsActions.addView(actionButton("Share diagnostics", primary = false) {
+            Diagnostics.shareLogs(this, spatialApp.logger)
+        }, weightParams(left = 8))
+        settingsBody.addView(diagnosticsActions)
+        settingsBody.addView(TextView(this).apply {
+            text = "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · ${BuildConfig.BUILD_TYPE}"
+            setTextColor(FieldTheme.textSecondary)
+            textSize = 11f
             setPadding(0, dp(10), 0, 0)
         })
-        content.addView(settings, marginParams(bottom = 14))
+        content.addView(settingsBody, marginParams(top = 8))
 
-        val mapHeader = horizontal().apply { gravity = Gravity.CENTER_VERTICAL }
-        mapHeader.addView(sectionTitle("MAPS"), weightParams())
-        mapHeader.addView(actionButton("NEW MAP", ::showCreateMapDialog), wrapParams())
-        content.addView(mapHeader)
-        status = TextView(this).apply {
-            text = "Local-first: scans are saved before upload."
-            textSize = 12f
-            setTextColor(Color.rgb(156, 178, 168))
-            setPadding(0, dp(4), 0, dp(8))
-        }
-        content.addView(status)
-        mapsContainer = vertical(0)
-        content.addView(mapsContainer)
-
-        val tools = card()
-        val toolsBody = vertical(dp(14))
-        tools.addView(toolsBody)
-        toolsBody.addView(sectionTitle("DIAGNOSTICS"))
-        val toolButtons = horizontal()
-        toolButtons.addView(actionButton("SERVER PANEL") {
-            saveSettings()
-            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(spatialApp.preferences.serverUrl))) }
-                .onFailure { showStatus("Could not open server URL: ${it.message}", true) }
-        }, weightParams())
-        toolButtons.addView(actionButton("SHARE LOGS") { Diagnostics.shareLogs(this, spatialApp.logger) }, weightParams())
-        toolsBody.addView(toolButtons)
-        toolsBody.addView(TextView(this).apply {
-            text = "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) • ${BuildConfig.BUILD_TYPE}"
-            setTextColor(Color.GRAY)
-            textSize = 11f
-            setPadding(0, dp(8), 0, 0)
-        })
-        content.addView(tools, marginParams(top = 14))
         content.addView(TextView(this).apply {
-            text = "This application runs on Google Play Services for AR (ARCore), which is provided by Google LLC and governed by the Google Privacy Policy. Camera inference stays on device. Review the repository privacy and safety notes before distributing the app."
-            setTextColor(Color.rgb(127, 145, 137))
+            text = "Camera inference stays on device. The server receives map metadata, sparse diagnostic geometry, participant poses and compact object tracks — not camera video."
+            setTextColor(FieldTheme.textSecondary)
             textSize = 10f
-            setPadding(0, dp(14), 0, 0)
+            setPadding(0, dp(20), 0, 0)
         })
         return root
     }
 
-    private fun saveSettings(): Boolean {
+    private fun saveSettings(showMessage: Boolean): Boolean {
+        if (!::serverInput.isInitialized) return true
         val url = serverInput.text.toString().trim().trimEnd('/')
         if (!(url.startsWith("http://") || url.startsWith("https://"))) {
-            showStatus("Server URL must start with http:// or https://", true)
+            if (showMessage) showStatus("Server URL must start with http:// or https://", true)
             return false
         }
         spatialApp.preferences.serverUrl = url
@@ -161,42 +194,45 @@ class MainActivity : AppCompatActivity() {
         val reboundMaps = spatialApp.database.updateAllMapServerUrls(url)
         if (reboundMaps > 0) UploadScheduler.enqueue(this)
         spatialApp.logger.info("Server settings saved", mapOf("serverUrl" to url, "reboundMaps" to reboundMaps))
-        showStatus(
-            if (reboundMaps > 0) "Server saved • $reboundMaps local map(s) rebound for retry" else "Server settings saved",
-            false
-        )
+        if (showMessage) showStatus(if (reboundMaps > 0) "Connection saved · $reboundMaps local place(s) queued for sync" else "Connection saved", false)
         return true
     }
 
-    private fun refreshFromServer() {
-        if (!saveSettings()) return
-        val url = spatialApp.preferences.serverUrl
-        showStatus("Connecting to $url…", false)
+    private fun refreshFromServer(silent: Boolean) {
+        val url = if (::serverInput.isInitialized) serverInput.text.toString().trim().trimEnd('/') else spatialApp.preferences.serverUrl
+        if (!(url.startsWith("http://") || url.startsWith("https://"))) return
+        if (::serverInput.isInitialized && !saveSettings(showMessage = false)) return
+        if (!silent) showStatus("Synchronizing shared places…", false)
         executor.execute {
             runCatching {
                 val api = MapApiClient(url, spatialApp.preferences.apiToken, spatialApp.logger)
                 api.listMaps().also { maps -> maps.forEach(spatialApp.database::mergeServerMap) }
             }.onSuccess { maps ->
                 runOnUiThread {
-                    showStatus("Server online • ${maps.size} map(s) synchronized", false)
+                    showStatus("Server online · ${maps.size} shared place(s)", false)
                     renderMaps()
                 }
             }.onFailure { error ->
                 spatialApp.logger.warn("Map refresh failed", mapOf("error" to error.message, "serverUrl" to url))
-                runOnUiThread { showStatus("Server unavailable: ${error.message}. Local maps remain usable.", true) }
+                if (!silent) runOnUiThread { showStatus("Server unavailable: ${error.message}. Local data is preserved.", true) }
             }
         }
     }
 
     private fun showCreateMapDialog() {
-        if (!saveSettings()) return
+        if (!saveSettings(showMessage = false)) {
+            settingsVisible = true
+            settingsBody.visibility = View.VISIBLE
+            showStatus("Set a valid server URL before creating a place.", true)
+            return
+        }
         val input = EditText(this).apply {
-            hint = "Back yard / Airsoft field"
+            hint = "Back garden / Workshop"
             setSingleLine(true)
         }
         AlertDialog.Builder(this)
-            .setTitle("New spatial map")
-            .setMessage("The scan is saved in small atomic chunks. Successful anchors and uploaded chunks survive retries and app restarts.")
+            .setTitle("New shared place")
+            .setMessage("Map setup stores scan chunks locally first. Finished chunks and hosted anchors survive app restarts and network loss.")
             .setView(input)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Create") { _, _ -> createMap(input.text.toString()) }
@@ -204,7 +240,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun createMap(nameRaw: String) {
-        val name = nameRaw.trim().ifBlank { "Untitled map" }
+        val name = nameRaw.trim().ifBlank { "Untitled place" }
         val slug = name.lowercase(Locale.US)
             .replace(Regex("[^a-z0-9]+"), "-")
             .trim('-')
@@ -230,52 +266,126 @@ class MainActivity : AppCompatActivity() {
         val maps = spatialApp.database.listMaps()
         if (maps.isEmpty()) {
             mapsContainer.addView(TextView(this).apply {
-                text = "No maps yet. Create one, then walk the site while the app stores point-cloud chunks and hosts visual anchors."
-                setTextColor(Color.rgb(168, 185, 177))
+                text = "No shared places yet. Create one and complete Map setup before starting a live session."
+                setTextColor(FieldTheme.textSecondary)
                 textSize = 14f
-                setPadding(dp(8), dp(16), dp(8), dp(16))
+                setPadding(0, dp(18), 0, dp(18))
             })
             return
         }
-        maps.forEach { map -> mapsContainer.addView(mapCard(map), marginParams(bottom = 10)) }
+        maps.forEachIndexed { index, map ->
+            if (index > 0) mapsContainer.addView(divider())
+            mapsContainer.addView(mapRow(map))
+        }
     }
 
-    private fun mapCard(map: MapDefinition): MaterialCardView {
-        val card = card()
-        val body = vertical(dp(14))
-        card.addView(body)
-        body.addView(TextView(this).apply {
+    private fun mapRow(map: MapDefinition): View {
+        val body = vertical(0).apply { setPadding(0, dp(16), 0, dp(17)) }
+        val titleRow = horizontal().apply { gravity = Gravity.CENTER_VERTICAL }
+        titleRow.addView(TextView(this).apply {
             text = map.name
-            setTextColor(Color.WHITE)
-            textSize = 18f
+            setTextColor(FieldTheme.textPrimary)
+            textSize = 19f
             typeface = Typeface.DEFAULT_BOLD
-        })
-        val (chunks, points) = spatialApp.database.chunkCounts(map.id)
-        val hosted = map.anchors.count { it.status.name == "HOSTED" }
-        val needsRescan = map.anchors.count { it.status.name == "NEEDS_RESCAN" }
-        body.addView(TextView(this).apply {
-            text = "${map.status} • $points points in $chunks chunks • $hosted hosted anchors${if (needsRescan > 0) " • $needsRescan rescan" else ""}\n${map.id}"
-            setTextColor(Color.rgb(167, 190, 180))
+        }, weightParams())
+        titleRow.addView(TextView(this).apply {
+            text = when (map.status) {
+                MapStatus.READY -> "Ready"
+                MapStatus.MAPPING -> "Map setup"
+                MapStatus.ARCHIVED -> "Archived"
+            }
             textSize = 12f
-            setPadding(0, dp(4), 0, dp(10))
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(if (map.status == MapStatus.READY) FieldTheme.statusBlue else FieldTheme.accent)
         })
-        val firstRow = horizontal()
-        firstRow.addView(actionButton(if (map.anchors.isEmpty()) "MAP" else "RESUME MAP") { launchMap(map.id, ArMode.MAP) }, weightParams())
-        firstRow.addView(actionButton("SENSOR") { launchMap(map.id, ArMode.SENSOR) }, weightParams())
-        firstRow.addView(actionButton("VIEWER") { launchMap(map.id, ArMode.VIEWER) }, weightParams())
-        body.addView(firstRow)
-        val secondRow = horizontal()
-        secondRow.addView(actionButton("DELETE MAP") { showDeleteMapDialog(map) }, weightParams())
-        body.addView(secondRow)
-        return card
+        body.addView(titleRow)
+
+        val (localChunks, localPoints) = spatialApp.database.chunkCounts(map.id)
+        val serverChunks = map.serverChunkCount
+        val serverPoints = map.serverPointCount
+        val hosted = map.anchors.count { it.status == AnchorStatus.HOSTED }
+        val needsAttention = map.anchors.count { it.status == AnchorStatus.FAILED || it.status == AnchorStatus.NEEDS_RESCAN }
+        body.addView(TextView(this).apply {
+            text = geometrySummary(serverPoints, serverChunks, localPoints, localChunks)
+            setTextColor(FieldTheme.textSecondary)
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(3))
+        })
+        body.addView(TextView(this).apply {
+            text = buildString {
+                append("$hosted hosted anchor")
+                if (hosted != 1) append('s')
+                if (needsAttention > 0) append(" · $needsAttention need attention")
+                append(" · ${map.id}")
+            }
+            setTextColor(if (needsAttention > 0) FieldTheme.accent else FieldTheme.textSecondary)
+            textSize = 11f
+            setPadding(0, 0, 0, dp(12))
+        })
+
+        val readyForLive = map.status == MapStatus.READY && hosted > 0
+        val actions = horizontal()
+        val live = actionButton("Live AR session", primary = true) { launchMap(map.id, ArMode.LIVE) }.apply {
+            isEnabled = readyForLive
+            alpha = if (readyForLive) 1f else 0.45f
+        }
+        actions.addView(live, weightParams())
+        actions.addView(actionButton("Manage map", primary = false) { showManageMapDialog(map) }, weightParams(left = 10))
+        body.addView(actions)
+        if (!readyForLive) {
+            body.addView(TextView(this).apply {
+                text = when {
+                    map.status != MapStatus.READY -> "Complete Map setup before starting Live AR."
+                    hosted == 0 -> "This place has no hosted Cloud Anchor yet. Open Manage map to add one."
+                    else -> "Map setup is incomplete."
+                }
+                setTextColor(FieldTheme.accent)
+                textSize = 11f
+                setPadding(0, dp(8), 0, 0)
+            })
+        }
+        return body
+    }
+
+    private fun geometrySummary(serverPoints: Int?, serverChunks: Int?, localPoints: Int, localChunks: Int): String {
+        val nf = NumberFormat.getIntegerInstance()
+        if (serverPoints == null || serverChunks == null) {
+            return if (localChunks > 0) {
+                "${nf.format(localPoints)} local points · $localChunks local scan chunks · server count not synchronized"
+            } else {
+                "Server geometry not synchronized · no local scan cache"
+            }
+        }
+        if (localChunks == 0 && serverChunks > 0) {
+            return "${nf.format(serverPoints)} points on server · $serverChunks scan chunks · not cached on this device"
+        }
+        if (localChunks > 0) {
+            return "${nf.format(serverPoints)} server points · $serverChunks server chunks · ${nf.format(localPoints)} local points in $localChunks chunks"
+        }
+        return "${nf.format(serverPoints)} points on server · $serverChunks scan chunks"
+    }
+
+    private fun showManageMapDialog(map: MapDefinition) {
+        val items = arrayOf("Continue Map setup", "Delete map…")
+        AlertDialog.Builder(this)
+            .setTitle(map.name)
+            .setMessage("Map setup is the advanced owner workflow for scanning, anchors, ground calibration and recovery.")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> launchMap(map.id, ArMode.MAP)
+                    1 -> showDeleteMapDialog(map)
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
     }
 
     private fun showDeleteMapDialog(map: MapDefinition) {
         AlertDialog.Builder(this)
             .setTitle("Delete ${map.name}?")
             .setMessage(
-                "This removes local scan chunks, anchor metadata, and pending uploads. " +
-                    "Deleting from the server also disconnects active clients on this map. This cannot be undone."
+                "Local deletion removes this device's scan chunks, anchor metadata and pending uploads. " +
+                    "Server + local also deletes the shared server copy. This cannot be undone."
             )
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Local only") { _, _ -> deleteLocalMap(map) }
@@ -296,13 +406,8 @@ class MainActivity : AppCompatActivity() {
             }.onSuccess {
                 runOnUiThread { deleteLocalMap(map, serverDeleted = true) }
             }.onFailure { error ->
-                spatialApp.logger.warn(
-                    "Server map deletion failed",
-                    mapOf("mapId" to map.id, "serverUrl" to map.serverUrl, "error" to error.message)
-                )
-                runOnUiThread {
-                    showStatus("Server deletion failed: ${error.message}. Local data was preserved.", true)
-                }
+                spatialApp.logger.warn("Server map deletion failed", mapOf("mapId" to map.id, "serverUrl" to map.serverUrl, "error" to error.message))
+                runOnUiThread { showStatus("Server deletion failed: ${error.message}. Local data was preserved.", true) }
             }
         }
     }
@@ -311,25 +416,12 @@ class MainActivity : AppCompatActivity() {
         val directory = File(filesDir, "maps/${map.id}")
         val filesDeleted = !directory.exists() || directory.deleteRecursively()
         if (!filesDeleted) {
-            showStatus(
-                if (serverDeleted) {
-                    "Server map was deleted, but some local files could not be removed."
-                } else {
-                    "Could not remove all local map files; the database entry was preserved."
-                },
-                true
-            )
+            showStatus(if (serverDeleted) "Server copy was deleted, but some local scan files remain." else "Could not remove all local scan files; database entry was preserved.", true)
             return
         }
         spatialApp.database.deleteMap(map.id)
-        spatialApp.logger.warn(
-            "Map deleted locally",
-            mapOf("mapId" to map.id, "serverDeleted" to serverDeleted)
-        )
-        showStatus(
-            if (serverDeleted) "Map deleted from server and device" else "Local map deleted; server copy was preserved",
-            false
-        )
+        spatialApp.logger.warn("Map deleted locally", mapOf("mapId" to map.id, "serverDeleted" to serverDeleted))
+        showStatus(if (serverDeleted) "Place deleted from server and this device" else "Local copy deleted; server copy was preserved", false)
         renderMaps()
     }
 
@@ -342,14 +434,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun showStatus(message: String, error: Boolean) {
         status.text = message
-        status.setTextColor(if (error) Color.rgb(255, 142, 126) else Color.rgb(117, 231, 176))
+        status.setTextColor(if (error) FieldTheme.error else FieldTheme.statusBlue)
     }
 
-    private fun card(): MaterialCardView = MaterialCardView(this).apply {
-        radius = dp(12).toFloat()
-        setCardBackgroundColor(Color.rgb(16, 31, 27))
-        strokeColor = Color.rgb(38, 66, 57)
-        strokeWidth = dp(1)
+    private fun actionButton(label: String, primary: Boolean, action: () -> Unit): Button = Button(this).apply {
+        text = label
+        textSize = 12f
+        isAllCaps = false
+        setTextColor(if (primary) FieldTheme.background else FieldTheme.textPrimary)
+        background = solidBackground(if (primary) FieldTheme.accent else FieldTheme.surfaceRaised, radius = 5)
+        minHeight = dp(48)
+        setPadding(dp(14), dp(9), dp(14), dp(9))
+        setOnClickListener { action() }
+    }
+
+    private fun divider(): View = View(this).apply {
+        setBackgroundColor(FieldTheme.divider)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+    }
+
+    private fun solidBackground(color: Int, radius: Int): GradientDrawable = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radius).toFloat()
     }
 
     private fun vertical(padding: Int): LinearLayout = LinearLayout(this).apply {
@@ -358,30 +464,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun horizontal(): LinearLayout = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-
-    private fun sectionTitle(value: String): TextView = TextView(this).apply {
-        text = value
-        textSize = 12f
-        letterSpacing = 0.12f
-        typeface = Typeface.DEFAULT_BOLD
-        setTextColor(Color.rgb(117, 231, 176))
-        setPadding(0, 0, 0, dp(6))
-    }
-
-    private fun actionButton(label: String, action: () -> Unit): Button = Button(this).apply {
-        text = label
-        textSize = 11f
-        isAllCaps = false
-        setOnClickListener { action() }
-        setTextColor(Color.WHITE)
-    }
-
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-    private fun weightParams() = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-    private fun wrapParams() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    private fun weightParams(left: Int = 0) = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(left), 0, 0, 0) }
+    private fun wrapParams(left: Int = 0) = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(dp(left), 0, 0, 0) }
     private fun marginParams(top: Int = 0, bottom: Int = 0) = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
     ).apply { setMargins(0, dp(top), 0, dp(bottom)) }
 }
 
-enum class ArMode { MAP, SENSOR, VIEWER }
+enum class ArMode { MAP, SENSOR, VIEWER, LIVE }
