@@ -9,6 +9,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 import androidx.work.WorkManager
+import com.sirpaul.spatialarcoop.data.MapDefinition
 import com.sirpaul.spatialarcoop.spatialApp
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -21,16 +22,26 @@ class UploadWorker(context: Context, params: WorkerParameters) : Worker(context,
         val database = app.database
         val logger = app.logger
         val clients = mutableMapOf<String, MapApiClient>()
-        fun api(serverUrl: String): MapApiClient = clients.getOrPut(serverUrl.trimEnd('/')) {
-            MapApiClient(serverUrl, preferences.apiToken, logger)
+
+        fun credentialFor(map: MapDefinition): String = map.accessKey.ifBlank {
+            // Migration path for pre-v3 local databases owned by this device. A subsequent owner
+            // refresh obtains and persists the per-map key; new/joined maps never use this fallback.
+            preferences.apiToken
         }
+
+        fun api(map: MapDefinition): MapApiClient {
+            val credential = credentialFor(map)
+            check(credential.isNotBlank()) { "Map ${map.id} has no access credential; refresh it as owner or re-join its invite" }
+            val key = "${map.serverUrl.trimEnd('/')}|${credential.hashCode()}"
+            return clients.getOrPut(key) { MapApiClient(map.serverUrl, credential, logger) }
+        }
+
         var hadFailure = false
 
         database.pendingMaps().forEach { map ->
             runCatching {
-                val client = api(map.serverUrl)
-                client.ensureMap(map, preferences.deviceId)
-                client.patchMap(map)
+                val remote = api(map).patchMap(map)
+                database.mergeServerMap(remote.copy(accessKey = map.accessKey.ifBlank { credentialFor(map) }))
                 database.markMapSynced(map.id)
             }.onFailure {
                 hadFailure = true
@@ -41,9 +52,7 @@ class UploadWorker(context: Context, params: WorkerParameters) : Worker(context,
         database.pendingAnchors().forEach { anchor ->
             runCatching {
                 val map = database.getMap(anchor.mapId) ?: error("Map ${anchor.mapId} is missing")
-                val client = api(map.serverUrl)
-                client.ensureMap(map, preferences.deviceId)
-                client.upsertAnchor(anchor)
+                api(map).upsertAnchor(anchor)
                 database.markAnchorSynced(anchor.mapId, anchor.id)
             }.onFailure {
                 hadFailure = true
@@ -69,9 +78,7 @@ class UploadWorker(context: Context, params: WorkerParameters) : Worker(context,
                 }
                 runCatching {
                     val map = database.getMap(chunk.mapId) ?: error("Map ${chunk.mapId} is missing")
-                    val client = api(map.serverUrl)
-                    client.ensureMap(map, preferences.deviceId)
-                    client.uploadScanChunk(chunk.mapId, chunk.id, preferences.deviceId, file)
+                    api(map).uploadScanChunk(chunk.mapId, chunk.id, preferences.deviceId, file)
                     database.markChunkUploaded(chunk.mapId, chunk.id)
                 }.onFailure {
                     hadFailure = true
@@ -112,8 +119,6 @@ object UploadScheduler {
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS)
             .build()
-        // KEEP avoids repeatedly cancelling an in-flight upload while mapping creates a new chunk
-        // every few seconds. The worker drains multiple batches before completing.
         WorkManager.getInstance(context).enqueueUniqueWork(UNIQUE_WORK, ExistingWorkPolicy.KEEP, request)
     }
 }
