@@ -15,7 +15,7 @@ async function createMap(base, token, id) {
   return response.json();
 }
 
-test('server identity is stable and map keys isolate map access', async () => {
+test('server identity is stable and map keys isolate and revoke map access', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spatial-security-'));
   const adminToken = 'admin-secret-for-tests';
   let firstServerId;
@@ -67,6 +67,26 @@ test('server identity is stable and map keys isolate map access', async () => {
       deniedSocket.addEventListener('close', () => { clearTimeout(timer); resolve(true); }, { once: true });
     });
     assert.equal(rejected, true);
+
+    const rotatedResponse = await fetch(`${base}/api/v1/maps/alpha/rotate-key`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    assert.equal(rotatedResponse.status, 200);
+    const rotated = await rotatedResponse.json();
+    const newAlphaKey = rotated.invite.mapKey;
+    assert.match(newAlphaKey, /^sar_map_/);
+    assert.notEqual(newAlphaKey, alpha.accessKey);
+
+    const oldKeyRead = await fetch(`${base}/api/v1/maps/alpha`, {
+      headers: { Authorization: `Bearer ${alpha.accessKey}` }
+    });
+    assert.equal(oldKeyRead.status, 404);
+
+    const newKeyRead = await fetch(`${base}/api/v1/maps/alpha`, {
+      headers: { Authorization: `Bearer ${newAlphaKey}` }
+    });
+    assert.equal(newKeyRead.status, 200);
   } finally {
     await app.stop();
   }
