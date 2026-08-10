@@ -5,6 +5,7 @@ on:
     branches: [stabilization-chatgpt]
     paths:
       - 'scripts/apply_stabilization_android.py'
+      - 'scripts/fix_generated_android.py'
       - '.github/workflows/stabilization-android.yml'
   workflow_dispatch:
 
@@ -27,7 +28,7 @@ jobs:
           ref: stabilization-chatgpt
           fetch-depth: 0
 
-      - name: Apply staged Android stabilization patch once
+      - name: Generate final stabilized Android source
         shell: bash
         run: |
           set -euo pipefail
@@ -51,6 +52,7 @@ jobs:
           ar.write_text(text)
           PY
           fi
+          python3 scripts/fix_generated_android.py
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -84,10 +86,7 @@ jobs:
             echo "Android stabilization failure"
             echo "build_head=$(git rev-parse HEAD)"
             echo
-            grep -E '(^e: | error: |FAILURE:|What went wrong:|Execution failed for task|Compilation error|Unresolved reference|Type mismatch|No value passed|Cannot access|Expected|Could not resolve all files)' android-build.log | tail -n 220 || true
-            echo
-            echo "--- generated ArActivity.kt lines 420-445 ---"
-            nl -ba android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt | sed -n '420,445p'
+            grep -E '(^e: | error: |FAILURE:|What went wrong:|Execution failed for task|Compilation error|Unresolved reference|Type mismatch|No value passed|Cannot access|Expected|Could not resolve all files)' android-build.log | tail -n 260 || true
           } > /tmp/android-build-error.txt
           git fetch origin stabilization-chatgpt
           git reset --hard origin/stabilization-chatgpt
@@ -107,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f ci/android-build-error.txt
-          rm -f scripts/apply_stabilization_android.py
+          rm -f scripts/apply_stabilization_android.py scripts/fix_generated_android.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
