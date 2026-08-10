@@ -79,19 +79,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p ci
           {
             echo "Android stabilization failure"
-            echo "head=$(git rev-parse HEAD)"
+            echo "build_head=$(git rev-parse HEAD)"
             echo
-            grep -E '(^e: | error: |FAILURE:|What went wrong:|Execution failed for task|Compilation error|Unresolved reference|Type mismatch|No value passed|Cannot access|Expected|Could not resolve all files)' android-build.log | tail -n 180 || true
-          } > ci/android-build-error.txt
+            grep -E '(^e: | error: |FAILURE:|What went wrong:|Execution failed for task|Compilation error|Unresolved reference|Type mismatch|No value passed|Cannot access|Expected|Could not resolve all files)' android-build.log | tail -n 220 || true
+          } > /tmp/android-build-error.txt
+          git fetch origin stabilization-chatgpt
+          git reset --hard origin/stabilization-chatgpt
+          mkdir -p ci
+          cp /tmp/android-build-error.txt ci/android-build-error.txt
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add ci/android-build-error.txt
           if ! git diff --cached --quiet; then
             git commit -m 'ci: capture Android stabilization failure'
-            git pull --rebase origin stabilization-chatgpt
             git push origin HEAD:stabilization-chatgpt
           fi
 
