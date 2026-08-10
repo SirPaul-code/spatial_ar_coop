@@ -2,7 +2,6 @@ package com.sirpaul.spatialarcoop.net
 
 import com.sirpaul.spatialarcoop.data.AnchorDefinition
 import com.sirpaul.spatialarcoop.data.MapDefinition
-import com.sirpaul.spatialarcoop.data.MapStatus
 import com.sirpaul.spatialarcoop.util.FileLogger
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -20,33 +19,84 @@ class MapApiException(
     message: String
 ) : IOException(message)
 
+data class ServerInfo(
+    val serverId: String,
+    val serverName: String,
+    val protocolVersion: Int
+)
+
+data class MapInvite(
+    val serverId: String,
+    val serverName: String,
+    val serverUrl: String,
+    val mapId: String,
+    val mapKey: String,
+    val deepLink: String
+)
+
 class MapApiClient(
     private val serverUrl: String,
-    private val apiToken: String,
+    /** May be an owner admin token or a single-map access key. */
+    private val credential: String,
     private val logger: FileLogger,
     private val client: OkHttpClient = sharedClient
 ) {
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
     private val binaryMediaType = "application/octet-stream".toMediaType()
+    private val normalizedServerUrl = serverUrl.trimEnd('/')
 
+    fun getServerInfo(): ServerInfo {
+        val json = executeJson(Request.Builder().url(url("/api/v1/info")).get())
+        return ServerInfo(
+            serverId = json.getString("serverId"),
+            serverName = json.optString("serverName", "Spatial AR Server"),
+            protocolVersion = json.optInt("protocolVersion", 1)
+        )
+    }
+
+    /** Owner-only server listing. Participant credentials deliberately cannot call this. */
     fun listMaps(): List<MapDefinition> {
         val json = executeJson(Request.Builder().url(url("/api/v1/maps")).get())
+        val serverId = json.optJSONObject("server")?.optString("serverId").orEmpty()
         val array = json.optJSONArray("maps") ?: return emptyList()
         return buildList {
             for (index in 0 until array.length()) {
-                array.optJSONObject(index)?.let { add(MapDefinition.fromServer(it, serverUrl)) }
+                array.optJSONObject(index)?.let { item ->
+                    add(
+                        MapDefinition.fromServer(
+                            item,
+                            normalizedServerUrl,
+                            serverId = item.optString("serverId", serverId),
+                            accessKey = item.optString("accessKey", "")
+                        )
+                    )
+                }
             }
         }
     }
 
-    fun getMap(mapId: String): MapDefinition =
-        MapDefinition.fromServer(executeJson(Request.Builder().url(url("/api/v1/maps/$mapId")).get()), serverUrl)
+    fun getMap(mapId: String): MapDefinition {
+        val json = executeJson(Request.Builder().url(url("/api/v1/maps/$mapId")).get())
+        return MapDefinition.fromServer(
+            json,
+            normalizedServerUrl,
+            serverId = json.optString("serverId", ""),
+            accessKey = json.optString("accessKey", participantCredential())
+        )
+    }
 
+    /** Owner-only creation. The returned map contains its newly generated per-map access key. */
     fun createMap(map: MapDefinition, deviceId: String): MapDefinition {
         val request = Request.Builder()
             .url(url("/api/v1/maps"))
             .post(map.toCreateJson(deviceId).toString().toRequestBody(jsonMediaType))
-        return MapDefinition.fromServer(executeJson(request), serverUrl)
+        val json = executeJson(request)
+        return MapDefinition.fromServer(
+            json,
+            normalizedServerUrl,
+            serverId = json.optString("serverId", ""),
+            accessKey = json.optString("accessKey", "")
+        )
     }
 
     fun patchMap(map: MapDefinition): MapDefinition {
@@ -62,11 +112,30 @@ class MapApiClient(
         val request = Request.Builder()
             .url(url("/api/v1/maps/${map.id}"))
             .patch(payload.toString().toRequestBody(jsonMediaType))
-        return MapDefinition.fromServer(executeJson(request), serverUrl)
+        val json = executeJson(request)
+        return MapDefinition.fromServer(
+            json,
+            normalizedServerUrl,
+            serverId = json.optString("serverId", map.serverId),
+            accessKey = map.accessKey
+        )
     }
 
     fun deleteMap(mapId: String) {
         execute(Request.Builder().url(url("/api/v1/maps/$mapId")).delete()).close()
+    }
+
+    fun getInvite(mapId: String): MapInvite {
+        val json = executeJson(Request.Builder().url(url("/api/v1/maps/$mapId/invite")).get())
+        return parseInvite(json.getJSONObject("invite"))
+    }
+
+    /** Owner-only revocation. The returned invite contains the replacement key. */
+    fun rotateMapKey(mapId: String): MapInvite {
+        val request = Request.Builder()
+            .url(url("/api/v1/maps/$mapId/rotate-key"))
+            .post(ByteArray(0).toRequestBody(null))
+        return parseInvite(executeJson(request).getJSONObject("invite"))
     }
 
     fun upsertAnchor(anchor: AnchorDefinition) {
@@ -85,19 +154,17 @@ class MapApiClient(
         execute(request).close()
     }
 
-    fun ensureMap(map: MapDefinition, deviceId: String): MapDefinition {
-        return try {
-            getMap(map.id)
-        } catch (error: MapApiException) {
-            if (error.statusCode != 404) throw error
-            try {
-                createMap(map, deviceId)
-            } catch (createError: MapApiException) {
-                if (createError.statusCode == 409 || createError.apiCode == "MAP_EXISTS") getMap(map.id)
-                else throw createError
-            }
-        }
-    }
+    private fun parseInvite(json: JSONObject): MapInvite = MapInvite(
+        serverId = json.getString("serverId"),
+        serverName = json.optString("serverName", "Spatial AR Server"),
+        serverUrl = json.optString("serverUrl", normalizedServerUrl).ifBlank { normalizedServerUrl }.trimEnd('/'),
+        mapId = json.getString("mapId"),
+        mapKey = json.getString("mapKey"),
+        deepLink = json.optString("deepLink")
+    )
+
+    private fun participantCredential(): String =
+        credential.takeIf { it.startsWith("sar_map_") }.orEmpty()
 
     private fun executeJson(builder: Request.Builder): JSONObject = execute(builder).use { response ->
         val text = response.body?.string().orEmpty()
@@ -105,25 +172,29 @@ class MapApiClient(
     }
 
     private fun execute(builder: Request.Builder): okhttp3.Response {
-        if (apiToken.isNotBlank()) builder.header("Authorization", "Bearer $apiToken")
-        val request = builder.header("User-Agent", "SpatialArCoop-Android/0.1").build()
+        if (credential.isNotBlank()) builder.header("Authorization", "Bearer $credential")
+        val request = builder.header("User-Agent", "SpatialArCoop-Android/1.0").build()
         val response = client.newCall(request).execute()
         if (!response.isSuccessful) {
+            val status = response.code
             val body = response.body?.string().orEmpty()
             val parsed = runCatching { JSONObject(body) }.getOrNull()
             val error = parsed?.optJSONObject("error")
             val nested = error?.optJSONObject("error") ?: error
             val code = nested?.optString("code")?.takeIf(String::isNotBlank)
             val message = nested?.optString("message")?.takeIf(String::isNotBlank)
-                ?: "HTTP ${response.code} ${response.message}"
+                ?: "HTTP $status ${response.message}"
             response.close()
-            logger.warn("Map API request failed", mapOf("url" to request.url.toString(), "status" to response.code, "code" to code, "message" to message))
-            throw MapApiException(response.code, code, message)
+            logger.warn(
+                "Map API request failed",
+                mapOf("url" to request.url.toString(), "status" to status, "code" to code, "message" to message)
+            )
+            throw MapApiException(status, code, message)
         }
         return response
     }
 
-    private fun url(path: String): String = serverUrl.trimEnd('/') + path
+    private fun url(path: String): String = normalizedServerUrl + path
 
     companion object {
         val sharedClient: OkHttpClient = OkHttpClient.Builder()
