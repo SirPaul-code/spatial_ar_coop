@@ -6,7 +6,9 @@ import android.graphics.Color
 import android.graphics.RectF
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
+import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -15,6 +17,7 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -25,7 +28,11 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
+import com.google.ar.core.exceptions.FatalException
 import com.google.ar.core.exceptions.NotYetAvailableException
+import com.google.ar.core.exceptions.SessionPausedException
+import com.sirpaul.spatialarcoop.ar.ArSessionState
+import com.sirpaul.spatialarcoop.ar.ArSessionStateMachine
 import com.sirpaul.spatialarcoop.ar.CameraBackgroundRenderer
 import com.sirpaul.spatialarcoop.ar.CloudAnchorCoordinator
 import com.sirpaul.spatialarcoop.ar.DisplayRotationHelper
@@ -41,6 +48,7 @@ import com.sirpaul.spatialarcoop.data.SpatialTrack
 import com.sirpaul.spatialarcoop.net.RealtimeClient
 import com.sirpaul.spatialarcoop.net.RealtimeListener
 import com.sirpaul.spatialarcoop.net.UploadScheduler
+import com.sirpaul.spatialarcoop.ui.FieldTheme
 import com.sirpaul.spatialarcoop.ui.ProjectedBox
 import com.sirpaul.spatialarcoop.ui.ProjectedTrack
 import com.sirpaul.spatialarcoop.ui.ScanOverlayState
@@ -69,8 +77,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private lateinit var networkText: TextView
     private lateinit var displayRotation: DisplayRotationHelper
     private lateinit var backgroundRenderer: CameraBackgroundRenderer
+    private lateinit var arErrorPanel: LinearLayout
+    private lateinit var arErrorText: TextView
+    private var reportButton: Button? = null
 
-    private var session: Session? = null
+    @Volatile private var session: Session? = null
+    private val arState = ArSessionStateMachine()
+    private val closing = AtomicBoolean(false)
+    @Volatile private var glResumed = false
     private var installRequested = false
     private var textureBound = false
     private var viewportWidth = 1
@@ -96,6 +110,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private val remoteTracks = RemoteTrackStore()
     private lateinit var localTracker: DetectionTracker
     private var detector: ObjectDetectorEngine? = null
+    @Volatile private var reporting = false
     private var realtime: RealtimeClient? = null
     private var cloudAnchors: CloudAnchorCoordinator? = null
     private var pointRecorder: PointCloudRecorder? = null
@@ -139,28 +154,32 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         displayRotation = DisplayRotationHelper(this)
         setContentView(buildUi())
         configureModeComponents()
+        onBackPressedDispatcher.addCallback(this) { finishSafely() }
         spatialApp.logger.info("AR mode opened", mapOf("mapId" to mapId, "mode" to mode.name))
     }
 
     private fun configureModeComponents() {
         val map = currentMap() ?: return
+        val wireRole = when (mode) {
+            ArMode.MAP -> "mapper"
+            ArMode.SENSOR -> "sensor"
+            ArMode.VIEWER -> "viewer"
+            // Keep the proven wire protocol compatible: LIVE observes like every client and is
+            // allowed to publish the same track messages as the legacy SENSOR role.
+            ArMode.LIVE -> "sensor"
+        }
         realtime = RealtimeClient(
             serverUrl = map.serverUrl,
-            apiToken = spatialApp.preferences.apiToken,
+            apiToken = map.accessKey.ifBlank { spatialApp.preferences.apiToken },
             mapId = map.id,
             clientId = spatialApp.preferences.deviceId,
-            role = mode.name.lowercase().replace("map", "mapper"),
+            role = wireRole,
             logger = spatialApp.logger,
             listener = this
         )
         if (mode == ArMode.SENSOR) {
-            detector = ObjectDetectorEngine(
-                context = this,
-                threshold = spatialApp.preferences.detectorThreshold,
-                logger = spatialApp.logger,
-                onResult = { values, inferenceMs -> pendingDetection.set(PendingDetection(values, inferenceMs)) },
-                onError = { message -> showDetail("Detector error: $message") }
-            )
+            reporting = true
+            ensureDetector()
         }
         if (mode == ArMode.MAP) {
             val (chunks, points) = spatialApp.database.chunkCounts(mapId)
@@ -169,7 +188,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     }
 
     private fun buildUi(): FrameLayout {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val root = FrameLayout(this).apply { setBackgroundColor(FieldTheme.background) }
         glSurface = GLSurfaceView(this).apply {
             setEGLContextClientVersion(3)
             preserveEGLContextOnPause = true
@@ -182,23 +201,23 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(10))
-            setBackgroundColor(Color.argb(196, 4, 10, 9))
+            setPadding(dp(16), dp(14), dp(16), dp(12))
+            setBackgroundColor(Color.argb(210, 23, 24, 26))
         }
         stateText = TextView(this).apply {
-            text = "${mode.name} • $mapId"
-            setTextColor(Color.WHITE)
-            textSize = 15f
+            text = "${currentMap()?.name ?: mapId} · Starting AR"
+            setTextColor(FieldTheme.textPrimary)
+            textSize = 16f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
         detailText = TextView(this).apply {
-            text = "Initializing ARCore…"
-            setTextColor(Color.rgb(183, 204, 195))
+            text = "Preparing camera and localization…"
+            setTextColor(FieldTheme.textSecondary)
             textSize = 12f
         }
         networkText = TextView(this).apply {
-            text = "Server: disconnected"
-            setTextColor(Color.rgb(255, 184, 92))
+            text = "Server disconnected"
+            setTextColor(FieldTheme.accent)
             textSize = 11f
         }
         top.addView(stateText)
@@ -210,31 +229,63 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), dp(6), dp(8), dp(8))
-            setBackgroundColor(Color.argb(205, 4, 10, 9))
+            setBackgroundColor(Color.argb(218, 23, 24, 26))
         }
-        actions.addView(action("BACK") { finish() })
+        actions.addView(action("Back") { finishSafely() })
         when (mode) {
             ArMode.MAP -> {
-                actions.addView(action("ALIGN ORIGIN") { requestManualAlign.set(true) })
-                actions.addView(action("ADD ANCHOR") { requestHost.set(true) })
-                actions.addView(action("RETRY NEARBY") { requestRetryAnchor.set(true) })
-                actions.addView(action("SET GROUND") { requestGround.set(true) })
-                actions.addView(action("FINISH MAP") { requestFinish.set(true) })
+                actions.addView(action("Align origin") { requestManualAlign.set(true) })
+                actions.addView(action("Add anchor") { requestHost.set(true) })
+                actions.addView(action("Retry nearby") { requestRetryAnchor.set(true) })
+                actions.addView(action("Set ground") { requestGround.set(true) })
+                actions.addView(action("Finish map") { requestFinish.set(true) })
+            }
+            ArMode.LIVE -> {
+                reportButton = action("Start reporting") { setReporting(!reporting) }.also(actions::addView)
+                actions.addView(action("Re-localize") { requestRelocalize.set(true) })
+                if (!BuildConfig.CLOUD_ANCHORS_CONFIGURED) {
+                    actions.addView(action("Align fallback") { requestManualAlign.set(true) })
+                }
             }
             ArMode.SENSOR, ArMode.VIEWER -> {
-                actions.addView(action("ALIGN HERE") { requestManualAlign.set(true) })
-                actions.addView(action("RELOCALIZE") { requestRelocalize.set(true) })
+                actions.addView(action("Align fallback") { requestManualAlign.set(true) })
+                actions.addView(action("Re-localize") { requestRelocalize.set(true) })
             }
         }
-        actions.addView(action("MARK") { requestMarker.set(true) })
-        actions.addView(action("LOGS") { Diagnostics.shareLogs(this, spatialApp.logger) })
+        actions.addView(action("Mark") { requestMarker.set(true) })
+        actions.addView(action("Diagnostics") { Diagnostics.shareLogs(this, spatialApp.logger) })
         scroll.addView(actions)
         root.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+
+        arErrorPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(20), dp(18), dp(20), dp(18))
+            setBackgroundColor(FieldTheme.surfaceRaised)
+            visibility = View.GONE
+        }
+        arErrorText = TextView(this).apply {
+            setTextColor(FieldTheme.textPrimary)
+            textSize = 14f
+            gravity = Gravity.CENTER
+        }
+        arErrorPanel.addView(arErrorText, LinearLayout.LayoutParams(dp(300), ViewGroup.LayoutParams.WRAP_CONTENT))
+        val errorActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, 0)
+        }
+        errorActions.addView(action("Retry AR") { retryArSession() })
+        errorActions.addView(action("Back") { finishSafely() })
+        errorActions.addView(action("Diagnostics") { Diagnostics.shareLogs(this, spatialApp.logger) })
+        arErrorPanel.addView(errorActions)
+        root.addView(arErrorPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
         return root
     }
 
     override fun onStart() {
         super.onStart()
+        if (closing.get()) return
         UploadScheduler.enqueue(this)
         realtime?.connect()
     }
@@ -246,12 +297,40 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     override fun onResume() {
         super.onResume()
+        if (closing.get()) return
         displayRotation.onResume()
         resumeArSession()
-        glSurface.onResume()
+    }
+
+    private fun createConfiguredSession(): Session {
+        val created = Session(this)
+        try {
+            val config = Config(created).apply {
+                updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+                focusMode = Config.FocusMode.AUTO
+                cloudAnchorMode = if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) Config.CloudAnchorMode.ENABLED else Config.CloudAnchorMode.DISABLED
+                depthMode = if (created.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
+            }
+            created.configure(config)
+            cloudAnchors = CloudAnchorCoordinator(
+                session = created,
+                mapId = mapId,
+                database = spatialApp.database,
+                logger = spatialApp.logger,
+                scheduleUpload = { UploadScheduler.enqueue(this) },
+                onState = ::showDetail
+            )
+            session = created
+            return created
+        } catch (error: Throwable) {
+            runCatching { created.close() }
+            throw error
+        }
     }
 
     private fun resumeArSession() {
+        if (closing.get()) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
             return
@@ -260,58 +339,154 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
                 ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
                     installRequested = true
-                    showDetail("Install or update Google Play Services for AR")
+                    showDetail("Finish Google Play Services for AR installation, then return here")
                     return
                 }
                 ArCoreApk.InstallStatus.INSTALLED -> Unit
                 null -> error("ARCore installation check returned no status")
             }
-            val active = session ?: Session(this).also { created ->
-                val config = Config(created).apply {
-                    updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                    planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                    focusMode = Config.FocusMode.AUTO
-                    cloudAnchorMode = if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) Config.CloudAnchorMode.ENABLED else Config.CloudAnchorMode.DISABLED
-                    depthMode = if (created.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
-                }
-                created.configure(config)
-                session = created
-                cloudAnchors = CloudAnchorCoordinator(
-                    session = created,
-                    mapId = mapId,
-                    database = spatialApp.database,
-                    logger = spatialApp.logger,
-                    scheduleUpload = { UploadScheduler.enqueue(this) },
-                    onState = ::showDetail
-                )
-            }
+            if (!arState.beginStart()) return
+            val active = session ?: createConfiguredSession()
             active.resume()
             textureBound = false
-            showDetail("AR session running")
-        } catch (error: Exception) {
-            spatialApp.logger.error("ARCore session failed", error)
-            showDetail("ARCore error: ${error.message}")
+            if (!arState.markRunning()) {
+                runCatching { active.pause() }
+                return
+            }
+            hideArFailure()
+            resumeGlIfNeeded()
+            showDetail("AR session running · looking for shared anchor")
+        } catch (error: Throwable) {
+            failArSession(error, "resume")
         }
+    }
+
+    private fun retryArSession() {
+        if (closing.get() || arState.current() != ArSessionState.FAILED) return
+        hideArFailure()
+        resumeArSession()
+    }
+
+    private fun resumeGlIfNeeded() {
+        if (glResumed || closing.get() || !arState.canRender()) return
+        glSurface.onResume()
+        glResumed = true
+    }
+
+    private fun pauseGlIfNeeded() {
+        if (!glResumed) return
+        glResumed = false
+        glSurface.onPause()
+    }
+
+    private fun failArSession(error: Throwable, phase: String) {
+        if (!arState.fail()) return
+        textureBound = false
+        val failedSession = session
+        session = null
+        val failedCoordinator = cloudAnchors
+        cloudAnchors = null
+        val availability = runCatching { ArCoreApk.getInstance().checkAvailability(this).name }.getOrDefault("unknown")
+        val arcoreVersion = runCatching { packageManager.getPackageInfo("com.google.ar.core", 0).versionName }.getOrNull()
+        spatialApp.logger.error(
+            "ARCore session failed",
+            error,
+            mapOf(
+                "phase" to phase,
+                "exception" to error.javaClass.name,
+                "message" to error.message,
+                "arState" to arState.current().name,
+                "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+                "android" to "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
+                "arcoreAvailability" to availability,
+                "arcoreVersion" to arcoreVersion,
+                "cloudAnchorsConfigured" to BuildConfig.CLOUD_ANCHORS_CONFIGURED
+            )
+        )
+        runOnUiThread {
+            pauseGlIfNeeded()
+            failedCoordinator?.close()
+            runCatching { failedSession?.pause() }
+            closeSessionAsync(failedSession)
+            showArFailure(error)
+        }
+    }
+
+    private fun showArFailure(error: Throwable) {
+        val category = when (error) {
+            is FatalException -> "Google Play Services for AR returned an internal session error. A fresh session is required."
+            is CameraNotAvailableException -> "The camera is unavailable to ARCore. Close other camera users and retry."
+            is SessionPausedException -> "The AR session became paused unexpectedly. A fresh session will be created."
+            is SecurityException -> "Camera access was rejected by Android. Check camera permission and retry."
+            is IllegalStateException -> "ARCore rejected the current lifecycle state. Retry creates a clean session."
+            else -> when (error.javaClass.simpleName) {
+                "UnavailableArcoreNotInstalledException" -> "Google Play Services for AR is not installed."
+                "UnavailableApkTooOldException" -> "Google Play Services for AR must be updated."
+                "UnavailableSdkTooOldException" -> "This app build is too old for the installed ARCore service."
+                "UnavailableDeviceNotCompatibleException" -> "ARCore reports that this device/configuration is unsupported."
+                "UnavailableUserDeclinedInstallationException" -> "ARCore installation was declined."
+                else -> "AR session could not start (${error.javaClass.simpleName})."
+            }
+        }
+        arErrorText.text = "AR session could not start\n\n$category"
+        arErrorPanel.visibility = View.VISIBLE
+        stateText.text = "${currentMap()?.name ?: mapId} · AR unavailable"
+        detailText.text = "Retry AR or share diagnostics for the complete error."
+    }
+
+    private fun hideArFailure() {
+        runOnUiThread { arErrorPanel.visibility = View.GONE }
+    }
+
+    private fun closeSessionAsync(value: Session?) {
+        if (value == null) return
+        Thread({ runCatching { value.close() } }, "spatial-arcore-close").start()
     }
 
     override fun onPause() {
-        displayRotation.onPause()
-        pointRecorder?.flush()
-        glSurface.onPause()
-        session?.pause()
+        if (!closing.get()) {
+            arState.beginPause()
+            pauseGlIfNeeded()
+            displayRotation.onPause()
+            pointRecorder?.flush()
+            runCatching { session?.pause() }
+            arState.markPaused()
+        }
         super.onPause()
     }
 
-    override fun onDestroy() {
+    private fun finishSafely() {
+        teardown(finishActivity = true)
+    }
+
+    private fun teardown(finishActivity: Boolean) {
+        if (!closing.compareAndSet(false, true)) {
+            if (finishActivity && !isFinishing) finish()
+            return
+        }
+        arState.beginClosing()
+        spatialApp.logger.info("AR teardown begin", mapOf("mapId" to mapId, "mode" to mode.name))
+        pauseGlIfNeeded()
+        runCatching { displayRotation.onPause() }
+        pointRecorder?.flush()
         pointRecorder?.stop()
-        detector?.close()
+        pointRecorder = null
+        stopDetector()
         realtime?.close()
+        realtime = null
         cloudAnchors?.close()
+        cloudAnchors = null
         val closingSession = session
         session = null
-        if (closingSession != null) {
-            Thread({ runCatching { closingSession.close() } }, "spatial-arcore-close").start()
-        }
+        runCatching { closingSession?.pause() }
+        closeSessionAsync(closingSession)
+        arState.markClosed()
+        spatialApp.logger.info("AR teardown complete", mapOf("mapId" to mapId, "mode" to mode.name))
+        if (finishActivity && !isFinishing) finish()
+    }
+
+    override fun onDestroy() {
+        teardown(finishActivity = false)
         super.onDestroy()
     }
 
@@ -330,6 +505,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     override fun onDrawFrame(gl: GL10?) {
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+        if (!arState.canRender()) return
         val active = session ?: return
         if (!::backgroundRenderer.isInitialized) return
         try {
@@ -338,16 +514,19 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 textureBound = true
             }
             displayRotation.updateSessionIfNeeded(active)
+            if (!arState.canRender()) return
             val frame = active.update()
             backgroundRenderer.updateDisplayGeometry(frame)
             backgroundRenderer.draw()
             renderArFrame(frame)
+        } catch (error: SessionPausedException) {
+            failArSession(error, "frame-update-paused")
         } catch (error: CameraNotAvailableException) {
-            spatialApp.logger.error("Camera unavailable", error)
-            showDetail("Camera unavailable; reopen the AR screen")
+            failArSession(error, "frame-camera")
+        } catch (error: FatalException) {
+            failArSession(error, "frame-fatal")
         } catch (error: Throwable) {
-            spatialApp.logger.error("AR frame failed", error)
-            showDetail("AR frame error: ${error.message}")
+            failArSession(error, "frame")
         }
     }
 
@@ -416,6 +595,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         when (mode) {
             ArMode.MAP -> updateMapping(frame, worldFromSite, map)
             ArMode.SENSOR -> updateSensor(frame, worldFromSite, map)
+            ArMode.LIVE -> if (reporting) updateSensor(frame, worldFromSite, map) else overlay.updateLocalBoxes(emptyList())
             ArMode.VIEWER -> overlay.updateLocalBoxes(emptyList())
         }
         updateProjectedTracks(cameraSite, worldFromSite)
@@ -497,6 +677,35 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 }
             }
         }
+    }
+
+    private fun ensureDetector() {
+        if (detector != null) return
+        detector = ObjectDetectorEngine(
+            context = this,
+            threshold = spatialApp.preferences.detectorThreshold,
+            logger = spatialApp.logger,
+            onResult = { values, inferenceMs -> pendingDetection.set(PendingDetection(values, inferenceMs)) },
+            onError = { message -> showDetail("Detector error: $message") }
+        )
+    }
+
+    private fun stopDetector() {
+        pendingDetection.set(null)
+        detector?.close()
+        detector = null
+        latestLocalTrackCount = 0
+        latestInferenceMs = 0
+        if (::overlay.isInitialized) overlay.updateLocalBoxes(emptyList())
+    }
+
+    private fun setReporting(enabled: Boolean) {
+        if (mode != ArMode.LIVE) return
+        reporting = enabled
+        if (enabled) ensureDetector() else stopDetector()
+        reportButton?.text = if (enabled) "Stop reporting" else "Start reporting"
+        realtime?.sendStatus(if (enabled) "reporting" else "observing", if (enabled) "object detection enabled" else "object detection disabled")
+        showDetail(if (enabled) "Reporting enabled · detections are shared with this place" else "Observing · reporting is off")
     }
 
     private fun projectDetectionBoxes(frame: Frame, detections: List<Detection2D>): List<ProjectedBox> {
@@ -598,12 +807,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             else -> "NOT LOCALIZED"
         }
         runOnUiThread {
-            stateText.text = "${mode.name} • $localization • ${frame.camera.trackingState}"
+            stateText.text = "${currentMap()?.name ?: mapId} · ${localization.lowercase().replaceFirstChar { it.uppercase() }} · ${frame.camera.trackingState.name.lowercase()}"
             overrideDetail?.let { detailText.text = it } ?: run {
                 detailText.text = when (mode) {
-                    ArMode.MAP -> "${featureQuality.name} features • $hosted anchors • $pending pending/rescan"
-                    ArMode.SENSOR -> "$latestLocalTrackCount tracks • ${latestInferenceMs} ms inference • person / car / bird / dog / cat"
-                    ArMode.VIEWER -> "Rendering cooperative tracks through occluders"
+                    ArMode.MAP -> "${featureQuality.name.lowercase()} features · $hosted anchors · $pending pending/rescan"
+                    ArMode.SENSOR -> "$latestLocalTrackCount tracks · ${latestInferenceMs} ms inference"
+                    ArMode.LIVE -> if (reporting) "$latestLocalTrackCount live tracks · reporting" else "Observing shared tracks · reporting off"
+                    ArMode.VIEWER -> "Observing shared tracks"
                 }
             }
         }
@@ -632,8 +842,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     override fun onConnectionState(connected: Boolean, detail: String) {
         runOnUiThread {
-            networkText.text = if (connected) "Server: connected" else "Server: $detail"
-            networkText.setTextColor(if (connected) Color.rgb(117, 231, 176) else Color.rgb(255, 184, 92))
+            networkText.text = if (connected) "Server connected" else "Server: $detail"
+            networkText.setTextColor(if (connected) FieldTheme.statusBlue else FieldTheme.accent)
+            if (connected && mode == ArMode.LIVE) realtime?.sendStatus(if (reporting) "reporting" else "observing")
         }
     }
 
@@ -655,7 +866,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         text = label
         textSize = 11f
         isAllCaps = false
-        setTextColor(Color.WHITE)
+        setTextColor(FieldTheme.textPrimary)
         setOnClickListener { block() }
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
     }
@@ -675,3 +886,4 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val RESOLVE_RETRY_MS = 15_000L
     }
 }
+
