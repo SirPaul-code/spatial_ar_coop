@@ -1,0 +1,66 @@
+name: Android stabilization
+
+on:
+  push:
+    branches: [stabilization-chatgpt]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CI: "true"
+  ARCORE_API_KEY: UNCONFIGURED
+  DEFAULT_SERVER_URL: http://10.0.2.2:8080
+
+jobs:
+  stabilize-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout stabilization branch
+        uses: actions/checkout@v4
+        with:
+          ref: stabilization-chatgpt
+          fetch-depth: 0
+
+      - name: Apply deterministic source patch
+        run: python3 scripts/apply_stabilization_android.py
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Test and build Android
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
+
+      - name: Commit verified stabilization
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f scripts/apply_stabilization_android.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: stabilize ARCore lifecycle and live session'
+            git push origin HEAD:stabilization-chatgpt
+          fi
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: stabilization-android-debug-apk
+          retention-days: 14
+          path: android/app/build/outputs/apk/debug/*.apk
