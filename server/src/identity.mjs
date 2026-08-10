@@ -43,6 +43,13 @@ export class ServerIdentityStore {
     return secureEqual(this.state.adminToken, String(candidate ?? ''));
   }
 
+  rotateAdminToken() {
+    this.state.adminToken = randomSecret('sar_admin_');
+    this.#persist();
+    this.logger?.warn?.('admin_token_rotated', { serverId: this.state.serverId });
+    return this.state.adminToken;
+  }
+
   mapKey(mapId) {
     const id = safeId(mapId, 'mapId');
     let key = this.state.mapKeys[id];
@@ -52,6 +59,15 @@ export class ServerIdentityStore {
       this.#persist();
       this.logger?.info?.('map_key_created', { mapId: id });
     }
+    return key;
+  }
+
+  rotateMapKey(mapId) {
+    const id = safeId(mapId, 'mapId');
+    const key = randomSecret('sar_map_');
+    this.state.mapKeys[id] = key;
+    this.#persist();
+    this.logger?.warn?.('map_key_rotated', { mapId: id });
     return key;
   }
 
