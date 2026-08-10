@@ -1,5 +1,5 @@
 Android stabilization failure
-build_head=9a7d8ba3034e81d6eb8cd471a5f765fe16478875
+build_head=e89f885f7b26e5dbf1f672faebedf9e86c687a66
 
 e: file:///home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt:431:55 Expecting '"'
 e: file:///home/runner/work/spatial_ar_coop/spatial_ar_coop/android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt:433:1 Expecting an element
