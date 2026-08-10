@@ -17,6 +17,16 @@ fun secret(name: String, fallback: String): String =
 val arcoreApiKey = secret("ARCORE_API_KEY", "UNCONFIGURED")
 val defaultServerUrl = secret("DEFAULT_SERVER_URL", "http://192.168.1.10:8080")
 val defaultApiToken = secret("DEFAULT_API_TOKEN", "")
+val releaseStoreFile = secret("RELEASE_STORE_FILE", "")
+val releaseStorePassword = secret("RELEASE_STORE_PASSWORD", "")
+val releaseKeyAlias = secret("RELEASE_KEY_ALIAS", "")
+val releaseKeyPassword = secret("RELEASE_KEY_PASSWORD", "")
+val releaseSigningConfigured = listOf(
+    releaseStoreFile,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword
+).all(String::isNotBlank)
 
 android {
     namespace = "com.sirpaul.spatialarcoop"
@@ -27,7 +37,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${defaultServerUrl.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
@@ -47,6 +57,17 @@ android {
         jvmTarget = "17"
     }
 
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
@@ -54,6 +75,7 @@ android {
         }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
