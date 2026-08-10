@@ -64,28 +64,57 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Test and build Android
+        id: android_build
+        shell: bash
         working-directory: android
         run: |
+          set +e
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug 2>&1 | tee ../android-build.log
+          code=${PIPESTATUS[0]}
+          exit $code
 
-      - name: Commit verified generated source
+      - name: Persist concise failure diagnostics
+        if: failure() && steps.android_build.outcome == 'failure'
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p ci
+          {
+            echo "Android stabilization failure"
+            echo "head=$(git rev-parse HEAD)"
+            echo
+            grep -E '(^e: | error: |FAILURE:|What went wrong:|Execution failed for task|Compilation error|Unresolved reference|Type mismatch|No value passed|Cannot access|Expected|Could not resolve all files)' android-build.log | tail -n 180 || true
+          } > ci/android-build-error.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ci/android-build-error.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'ci: capture Android stabilization failure'
+            git pull --rebase origin stabilization-chatgpt
+            git push origin HEAD:stabilization-chatgpt
+          fi
+
+      - name: Commit verified generated source
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f ci/android-build-error.txt
           if [[ -f scripts/apply_stabilization_android.py ]]; then
             rm -f scripts/apply_stabilization_android.py
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -A
-            if ! git diff --cached --quiet; then
-              git commit -m 'fix: stabilize ARCore lifecycle and live session'
-              git pull --rebase origin stabilization-chatgpt
-              git push origin HEAD:stabilization-chatgpt
-            fi
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: stabilize ARCore lifecycle and live session'
+            git pull --rebase origin stabilization-chatgpt
+            git push origin HEAD:stabilization-chatgpt
           fi
 
       - name: Upload debug APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: stabilization-android-debug-apk
