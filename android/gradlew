@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+set -eu
+GRADLE_VERSION=8.6
+CACHE_ROOT="${GRADLE_USER_HOME:-$HOME/.gradle}/spatial-wrapper"
+DIST_DIR="$CACHE_ROOT/gradle-$GRADLE_VERSION"
+ZIP_FILE="$CACHE_ROOT/gradle-$GRADLE_VERSION-bin.zip"
+if [ ! -x "$DIST_DIR/bin/gradle" ]; then
+  mkdir -p "$CACHE_ROOT"
+  if [ ! -f "$ZIP_FILE" ]; then
+    URL="https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip"
+    if command -v curl >/dev/null 2>&1; then curl -fL --retry 4 -o "$ZIP_FILE.tmp" "$URL"
+    elif command -v wget >/dev/null 2>&1; then wget -O "$ZIP_FILE.tmp" "$URL"
+    else echo "curl or wget is required to download Gradle" >&2; exit 1; fi
+    mv "$ZIP_FILE.tmp" "$ZIP_FILE"
+  fi
+  rm -rf "$DIST_DIR" "$CACHE_ROOT/gradle-$GRADLE_VERSION.tmp"
+  mkdir -p "$CACHE_ROOT/gradle-$GRADLE_VERSION.tmp"
+  unzip -q "$ZIP_FILE" -d "$CACHE_ROOT/gradle-$GRADLE_VERSION.tmp"
+  mv "$CACHE_ROOT/gradle-$GRADLE_VERSION.tmp/gradle-$GRADLE_VERSION" "$DIST_DIR"
+  rm -rf "$CACHE_ROOT/gradle-$GRADLE_VERSION.tmp"
+fi
+exec "$DIST_DIR/bin/gradle" "$@"

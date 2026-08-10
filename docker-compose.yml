@@ -1,0 +1,22 @@
+services:
+  spatial-server:
+    build:
+      context: ./server
+    image: ghcr.io/sirpaul-code/spatial_ar_coop-server:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATA_DIR: /data
+      DEMO_API_TOKEN: ${DEMO_API_TOKEN:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TRACK_TTL_MS: ${TRACK_TTL_MS:-1800}
+      MAX_SCAN_CHUNK_BYTES: ${MAX_SCAN_CHUNK_BYTES:-8388608}
+    volumes:
+      - spatial-data:/data
+
+volumes:
+  spatial-data:
