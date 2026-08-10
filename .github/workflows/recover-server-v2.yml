@@ -31,7 +31,7 @@ jobs:
           tar -tJf /tmp/spatial-v2.tar.xz > /tmp/v2-list.txt
           grep -E '(^|/)server/package.json$' /tmp/v2-list.txt
 
-      - name: Recover normal server source
+      - name: Recover normal source infrastructure
         shell: bash
         run: |
           set -euo pipefail
@@ -40,15 +40,43 @@ jobs:
           source_root=/tmp/spatial-v2
           mapfile -t top < <(find /tmp/spatial-v2 -mindepth 1 -maxdepth 1 -print)
           if (( ${#top[@]} == 1 )) && [[ -d "${top[0]}" ]]; then source_root="${top[0]}"; fi
+
           test -f "$source_root/server/package.json"
           rm -rf server
           cp -a "$source_root/server" ./server
+
           for f in docker-compose.yml docker-compose.yaml; do
             if [[ -f "$source_root/$f" ]]; then cp "$source_root/$f" "$f"; fi
           done
           if [[ -d "$source_root/scripts" ]]; then
             mkdir -p scripts
             cp -a "$source_root/scripts/." scripts/
+          fi
+
+          # The damaged published tree lost the Gradle wrapper. Restore build infrastructure
+          # only; never overwrite current Android application source with the archive copy.
+          if [[ ! -f android/gradlew && -f "$source_root/android/gradlew" ]]; then
+            cp "$source_root/android/gradlew" android/gradlew
+            chmod +x android/gradlew
+          fi
+          if [[ ! -d android/gradle/wrapper && -d "$source_root/android/gradle/wrapper" ]]; then
+            mkdir -p android/gradle
+            cp -a "$source_root/android/gradle/wrapper" android/gradle/
+          fi
+
+      - name: Publish recovered source to stabilization branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add server scripts android/gradlew android/gradle/wrapper 2>/dev/null || true
+          [[ -f docker-compose.yml ]] && git add docker-compose.yml || true
+          [[ -f docker-compose.yaml ]] && git add docker-compose.yaml || true
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: restore tracked server and build infrastructure'
+            git pull --rebase origin stabilization-chatgpt
+            git push origin HEAD:stabilization-chatgpt
           fi
 
       - uses: actions/setup-node@v4
@@ -66,18 +94,3 @@ jobs:
 
       - name: Verify server container
         run: docker build -t spatial-ar-coop-server:recovered server
-
-      - name: Commit recovered server source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add server scripts 2>/dev/null || true
-          [[ -f docker-compose.yml ]] && git add docker-compose.yml || true
-          [[ -f docker-compose.yaml ]] && git add docker-compose.yaml || true
-          if ! git diff --cached --quiet; then
-            git commit -m 'fix: restore tracked server source'
-            git pull --rebase origin stabilization-chatgpt
-            git push origin HEAD:stabilization-chatgpt
-          fi
