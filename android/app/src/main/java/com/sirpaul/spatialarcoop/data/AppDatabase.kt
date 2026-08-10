@@ -13,6 +13,8 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
               server_url TEXT NOT NULL,
+              server_id TEXT NOT NULL DEFAULT '',
+              access_key TEXT NOT NULL DEFAULT '',
               status TEXT NOT NULL,
               root_anchor_id TEXT,
               ground_y REAL,
@@ -66,7 +68,7 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
 
     /**
      * Migrations are deliberately additive. Local maps/chunks are the recovery source of truth and
-     * must never be reset merely because the presentation model gained server-side metadata.
+     * must never be reset merely because the presentation or authorization model gained metadata.
      */
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         var version = oldVersion
@@ -75,6 +77,11 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             db.execSQL("ALTER TABLE maps ADD COLUMN server_point_count INTEGER NOT NULL DEFAULT -1")
             db.execSQL("ALTER TABLE maps ADD COLUMN server_scan_bytes INTEGER NOT NULL DEFAULT -1")
             version = 2
+        }
+        if (version < 3) {
+            db.execSQL("ALTER TABLE maps ADD COLUMN server_id TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE maps ADD COLUMN access_key TEXT NOT NULL DEFAULT ''")
+            version = 3
         }
         check(version == newVersion) {
             "Missing non-destructive database migration from schema $version to $newVersion"
@@ -91,7 +98,7 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
         map.anchors.forEach(::upsertAnchor)
     }
 
-    /** Merge a server snapshot while preserving newer unsynchronized local edits and child rows. */
+    /** Merge a server snapshot while preserving newer unsynchronized local edits and credentials. */
     @Synchronized
     fun mergeServerMap(remote: MapDefinition) {
         val local = getMap(remote.id)
@@ -99,12 +106,16 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             local == null -> remote
             local.syncPending -> local.copy(
                 serverUrl = remote.serverUrl,
+                serverId = remote.serverId.ifBlank { local.serverId },
+                accessKey = remote.accessKey.ifBlank { local.accessKey },
                 serverChunkCount = remote.serverChunkCount,
                 serverPointCount = remote.serverPointCount,
                 serverScanBytes = remote.serverScanBytes,
                 anchors = emptyList()
             )
             else -> remote.copy(
+                serverId = remote.serverId.ifBlank { local.serverId },
+                accessKey = remote.accessKey.ifBlank { local.accessKey },
                 rootAnchorId = remote.rootAnchorId ?: local.rootAnchorId,
                 groundY = remote.groundY ?: local.groundY,
                 syncPending = local.syncPending,
@@ -120,7 +131,9 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
         val values = ContentValues().apply {
             put("id", map.id)
             put("name", map.name)
-            put("server_url", map.serverUrl)
+            put("server_url", map.serverUrl.trimEnd('/'))
+            put("server_id", map.serverId)
+            put("access_key", map.accessKey)
             put("status", map.status.name)
             put("root_anchor_id", map.rootAnchorId)
             if (map.groundY == null) putNull("ground_y") else put("ground_y", map.groundY)
@@ -195,6 +208,8 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             id = mapId,
             name = cursor.string("name"),
             serverUrl = cursor.string("server_url"),
+            serverId = cursor.string("server_id"),
+            accessKey = cursor.string("access_key"),
             status = enumValueOr(cursor.string("status"), MapStatus.MAPPING),
             rootAnchorId = cursor.nullableString("root_anchor_id"),
             groundY = cursor.nullableFloat("ground_y"),
@@ -245,22 +260,6 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             put("sync_pending", 1)
         }
         writableDatabase.update("maps", values, "id=?", arrayOf(mapId))
-    }
-
-    /** Rebinds all local maps to the currently selected relay without discarding their outboxes. */
-    @Synchronized
-    fun updateAllMapServerUrls(serverUrl: String): Int {
-        val normalized = serverUrl.trimEnd('/')
-        return writableDatabase.update(
-            "maps",
-            ContentValues().apply {
-                put("server_url", normalized)
-                put("updated_at", System.currentTimeMillis())
-                put("sync_pending", 1)
-            },
-            "server_url!=?",
-            arrayOf(normalized)
-        )
     }
 
     @Synchronized
@@ -421,7 +420,7 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
     private fun identityMatrix(): FloatArray = FloatArray(16).also { for (index in 0 until 16 step 5) it[index] = 1f }
 
     companion object {
-        private const val SCHEMA_VERSION = 2
+        private const val SCHEMA_VERSION = 3
         private const val UNKNOWN_SERVER_COUNT = -1
     }
 }
