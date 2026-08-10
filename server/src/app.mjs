@@ -108,6 +108,18 @@ async function handleHttp({ request, response, config, logger, store, hub, ident
       }
     }
 
+    const rotateMatch = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/rotate-key$/);
+    if (rotateMatch && request.method === 'POST') {
+      if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required to rotate a map key');
+      const map = store.getMap(rotateMatch[1]);
+      if (!map) return sendError(response, 404, 'MAP_NOT_FOUND', 'Map not found');
+      identity.rotateMapKey(map.id);
+      return sendJson(response, 200, {
+        map: withServerId(map, identity),
+        invite: identity.invite(map.id, config.publicBaseUrl)
+      });
+    }
+
     const inviteMatch = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/invite$/);
     if (inviteMatch && request.method === 'GET') {
       const map = authorizeMap({ mapId: inviteMatch[1], request, url, store, identity });
