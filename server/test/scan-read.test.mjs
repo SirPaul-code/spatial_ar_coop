@@ -40,7 +40,9 @@ test('scan chunks are authenticated, cacheable and previewed with bounded determ
       assert.equal(upload.status, 201);
     }
 
-    assert.equal((await fetch(`${base}/api/v1/maps/scan-map/scan-chunks`)).status, 401);
+    // Map-specific routes intentionally return 404 without a valid map credential so callers
+    // cannot distinguish a private map from a nonexistent one.
+    assert.equal((await fetch(`${base}/api/v1/maps/scan-map/scan-chunks`)).status, 404);
     const page1Response = await fetch(`${base}/api/v1/maps/scan-map/scan-chunks?limit=1`, { headers: auth });
     assert.equal(page1Response.status, 200);
     const page1 = await page1Response.json();
