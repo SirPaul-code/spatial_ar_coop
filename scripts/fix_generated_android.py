@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
+# One-shot sanitizer for the final recovery-generated lifecycle source.
 path = Path('android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt')
 text = path.read_text(encoding='utf-8')
 
@@ -22,7 +23,6 @@ text = text.replace(
     1
 )
 
-# Fail the gate if known recovery artifacts survived.
 assert broken_error not in text
 assert 'return"' not in text
 assert 'apiToken = spatialApp.preferences.apiToken,' not in text
