@@ -1,8 +1,6 @@
 name: Android stabilization
 
 on:
-  push:
-    branches: [stabilization-chatgpt]
   workflow_dispatch:
 
 permissions:
@@ -77,6 +75,7 @@ jobs:
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m 'fix: stabilize ARCore lifecycle and live session'
+            git pull --rebase origin stabilization-chatgpt
             git push origin HEAD:stabilization-chatgpt
           fi
 
