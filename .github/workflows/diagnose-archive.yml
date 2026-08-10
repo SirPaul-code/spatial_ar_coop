@@ -1,0 +1,75 @@
+name: Diagnose bootstrap archives
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-archive.yml'
+      - '.bootstrap/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect all archive candidates
+        shell: bash
+        run: |
+          set -u
+          echo '=== bootstrap files ==='
+          find .bootstrap -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+          inspect_xz() {
+            name="$1"; shift
+            b64="/tmp/${name}.b64"
+            bin="/tmp/${name}.tar.xz"
+            out="/tmp/${name}.tar"
+            cat "$@" > "$b64"
+            echo "=== $name ==="
+            echo "base64 bytes: $(wc -c < "$b64")"
+            if ! base64 --decode "$b64" > "$bin"; then
+              echo 'BASE64_DECODE=FAIL'
+              return
+            fi
+            file "$bin" || true
+            sha256sum "$bin" || true
+            xz --robot --list "$bin" || true
+            if xz --test "$bin"; then echo 'XZ_TEST=OK'; else echo 'XZ_TEST=FAIL'; fi
+            set +e
+            xz --decompress --stdout "$bin" > "$out"
+            rc=$?
+            set -e
+            echo "XZ_DECOMPRESS_RC=$rc TAR_BYTES=$(wc -c < "$out")"
+            file "$out" || true
+            echo 'tar entries (first 30):'
+            tar -tf "$out" 2>/dev/null | head -30 || true
+            echo 'tar entries (last 20 available):'
+            tar -tf "$out" 2>/dev/null | tail -20 || true
+          }
+
+          set -e
+          inspect_xz source_00_06 .bootstrap/source.part{00..06}
+          inspect_xz source_07_09 .bootstrap/source.part{07..09}
+          inspect_xz source_00_09 .bootstrap/source.part{00..09}
+
+          echo '=== legacy part-00 ==='
+          base64 --decode .bootstrap/part-00 > /tmp/legacy.bin || true
+          file /tmp/legacy.bin || true
+          sha256sum /tmp/legacy.bin || true
+          if gzip --test /tmp/legacy.bin; then echo 'GZIP_TEST=OK'; else echo 'GZIP_TEST=FAIL'; fi
+          set +e
+          gzip --decompress --stdout /tmp/legacy.bin > /tmp/legacy.out
+          rc=$?
+          set -e
+          echo "GZIP_DECOMPRESS_RC=$rc OUT_BYTES=$(wc -c < /tmp/legacy.out)"
+          file /tmp/legacy.out || true
+          echo 'legacy output head:'
+          head -40 /tmp/legacy.out || true
+          echo 'legacy tar entries:'
+          tar -tf /tmp/legacy.out 2>/dev/null | head -50 || true
