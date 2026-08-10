@@ -6,7 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 
-class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop.db", null, 1) {
+class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop.db", null, SCHEMA_VERSION) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""
             CREATE TABLE maps (
@@ -19,6 +19,9 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
               anchor_ttl_days INTEGER NOT NULL,
               min_anchor_spacing REAL NOT NULL,
               auto_anchor INTEGER NOT NULL,
+              server_chunk_count INTEGER NOT NULL DEFAULT -1,
+              server_point_count INTEGER NOT NULL DEFAULT -1,
+              server_scan_bytes INTEGER NOT NULL DEFAULT -1,
               updated_at INTEGER NOT NULL,
               sync_pending INTEGER NOT NULL
             )
@@ -61,7 +64,22 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
         db.enableWriteAheadLogging()
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    /**
+     * Migrations are deliberately additive. Local maps/chunks are the recovery source of truth and
+     * must never be reset merely because the presentation model gained server-side metadata.
+     */
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        var version = oldVersion
+        if (version < 2) {
+            db.execSQL("ALTER TABLE maps ADD COLUMN server_chunk_count INTEGER NOT NULL DEFAULT -1")
+            db.execSQL("ALTER TABLE maps ADD COLUMN server_point_count INTEGER NOT NULL DEFAULT -1")
+            db.execSQL("ALTER TABLE maps ADD COLUMN server_scan_bytes INTEGER NOT NULL DEFAULT -1")
+            version = 2
+        }
+        check(version == newVersion) {
+            "Missing non-destructive database migration from schema $version to $newVersion"
+        }
+    }
 
     /**
      * Inserts or updates a local map without SQLite REPLACE semantics. REPLACE deletes the old row
@@ -81,6 +99,9 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             local == null -> remote
             local.syncPending -> local.copy(
                 serverUrl = remote.serverUrl,
+                serverChunkCount = remote.serverChunkCount,
+                serverPointCount = remote.serverPointCount,
+                serverScanBytes = remote.serverScanBytes,
                 anchors = emptyList()
             )
             else -> remote.copy(
@@ -106,6 +127,9 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             put("anchor_ttl_days", map.anchorTtlDays)
             put("min_anchor_spacing", map.minAnchorSpacingMeters)
             put("auto_anchor", if (map.autoAnchor) 1 else 0)
+            put("server_chunk_count", map.serverChunkCount ?: UNKNOWN_SERVER_COUNT)
+            put("server_point_count", map.serverPointCount ?: UNKNOWN_SERVER_COUNT)
+            put("server_scan_bytes", map.serverScanBytes ?: UNKNOWN_SERVER_COUNT.toLong())
             put("updated_at", map.updatedAtMs)
             put("sync_pending", if (map.syncPending) 1 else 0)
         }
@@ -178,6 +202,9 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
             minAnchorSpacingMeters = cursor.float("min_anchor_spacing"),
             autoAnchor = cursor.int("auto_anchor") != 0,
             anchors = getAnchors(mapId),
+            serverChunkCount = cursor.nullableServerCount("server_chunk_count")?.toInt(),
+            serverPointCount = cursor.nullableServerCount("server_point_count")?.toInt(),
+            serverScanBytes = cursor.nullableServerCount("server_scan_bytes"),
             updatedAtMs = cursor.long("updated_at"),
             syncPending = cursor.int("sync_pending") != 0
         )
@@ -357,7 +384,6 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
         )
     }
 
-
     @Synchronized
     fun recoverInterruptedAnchors(mapId: String) {
         val values = ContentValues().apply {
@@ -390,6 +416,12 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "spatial-ar-coop
     private fun Cursor.long(name: String): Long = getLong(column(name))
     private fun Cursor.float(name: String): Float = getFloat(column(name))
     private fun Cursor.nullableFloat(name: String): Float? = column(name).let { if (isNull(it)) null else getFloat(it) }
+    private fun Cursor.nullableServerCount(name: String): Long? = long(name).takeIf { it >= 0L }
 
     private fun identityMatrix(): FloatArray = FloatArray(16).also { for (index in 0 until 16 step 5) it[index] = 1f }
+
+    companion object {
+        private const val SCHEMA_VERSION = 2
+        private const val UNKNOWN_SERVER_COUNT = -1
+    }
 }
