@@ -9,6 +9,7 @@ export class RealtimeHub {
     this.rooms = new Map();
     this.tracks = new Map();
     this.poses = new Map();
+    this.statuses = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload });
     server.on('upgrade', (request, socket, head) => this.#upgrade(request, socket, head));
     this.wss.on('connection', (socket, request, identity) => this.#connected(socket, request, identity));
@@ -25,10 +26,39 @@ export class RealtimeHub {
     };
   }
 
-  close() {
+  snapshot(mapId) {
+    const room = this.rooms.get(mapId) ?? new Set();
+    const clients = [...room].map((socket) => {
+      const identity = socket.identity;
+      const key = `${identity.mapId}:${identity.clientId}`;
+      return {
+        ...identity,
+        connected: socket.readyState === WebSocket.OPEN,
+        connectedAtMs: socket.connectedAtMs,
+        lastMessageAtMs: socket.lastMessageAtMs,
+        pose: this.poses.get(key) ?? null,
+        status: this.statuses.get(key) ?? null
+      };
+    });
+    return {
+      mapId,
+      serverTimeMs: Date.now(),
+      clients,
+      tracks: [...(this.tracks.get(mapId)?.values() ?? [])]
+    };
+  }
+
+  async close() {
     clearInterval(this.timer);
-    for (const room of this.rooms.values()) for (const client of room) client.close(1001, 'server shutdown');
-    this.wss.close();
+    const sockets = [...this.wss.clients];
+    for (const socket of sockets) socket.terminate();
+    await new Promise((resolve) => {
+      if (this.wss._state === 2) return resolve();
+      this.wss.close(() => resolve());
+    });
+    this.rooms.clear();
+    this.poses.clear();
+    this.statuses.clear();
   }
 
   #upgrade(request, socket, head) {
@@ -57,6 +87,8 @@ export class RealtimeHub {
   #connected(socket, request, identity) {
     socket.identity = identity;
     socket.isAlive = true;
+    socket.connectedAtMs = Date.now();
+    socket.lastMessageAtMs = socket.connectedAtMs;
     const room = this.rooms.get(identity.mapId) ?? new Set();
     room.add(socket);
     this.rooms.set(identity.mapId, room);
@@ -77,6 +109,7 @@ export class RealtimeHub {
   }
 
   #message(socket, payload, isBinary) {
+    socket.lastMessageAtMs = Date.now();
     if (isBinary) return this.#error(socket, 'BINARY_NOT_SUPPORTED', 'Binary WebSocket messages are not supported');
     let message;
     try {
@@ -117,9 +150,13 @@ export class RealtimeHub {
       case 'manual_marker':
         this.#broadcast(identity.mapId, { type: 'manual_marker', sourceId: identity.clientId, marker: message.marker });
         break;
-      case 'status':
-        this.#broadcast(identity.mapId, { type: 'status', sourceId: identity.clientId, role: identity.role, state: message.state, detail: message.detail });
+      case 'status': {
+        const key = `${identity.mapId}:${identity.clientId}`;
+        const status = { state: message.state, detail: message.detail, serverReceivedAtMs: Date.now() };
+        this.statuses.set(key, status);
+        this.#broadcast(identity.mapId, { type: 'status', sourceId: identity.clientId, role: identity.role, ...status });
         break;
+      }
       case 'ping':
         this.#send(socket, { type: 'pong', sentAtMs: message.sentAtMs, serverTimeMs: Date.now() });
         break;
@@ -149,10 +186,12 @@ export class RealtimeHub {
 
   #disconnected(socket, code, reason) {
     const identity = socket.identity;
+    if (!identity) return;
     const room = this.rooms.get(identity.mapId);
     room?.delete(socket);
     if (room?.size === 0) this.rooms.delete(identity.mapId);
     this.poses.delete(`${identity.mapId}:${identity.clientId}`);
+    this.statuses.delete(`${identity.mapId}:${identity.clientId}`);
     this.#broadcast(identity.mapId, { type: 'presence', action: 'left', ...identity });
     this.logger.info('ws_disconnected', { ...identity, code, reason: reason.toString() });
   }
