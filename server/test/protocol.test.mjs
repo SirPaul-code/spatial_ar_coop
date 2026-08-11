@@ -14,14 +14,23 @@ test('validates client identity including unified participant role', () => {
   assert.throws(() => validateClientIdentity({ mapId: '../etc', clientId: 'x', role: 'viewer' }), ProtocolError);
 });
 
-test('normalizes track batches', () => {
+test('normalizes track batches and preserves complete-source semantics', () => {
   const message = parseClientMessage(JSON.stringify({
-    type: 'track_batch', sequence: 7, tracks: [{ id: 't1', label: 'Person', confidence: 2, position: [1, 2, 3] }]
+    type: 'track_batch',
+    sequence: 7,
+    replaceSource: true,
+    tracks: [{ id: 't1', label: 'Bird', confidence: 2, position: [1, 2, 3] }]
   }));
   assert.equal(message.sequence, 7);
-  assert.equal(message.tracks[0].label, 'person');
+  assert.equal(message.replaceSource, true);
+  assert.equal(message.tracks[0].label, 'bird');
   assert.equal(message.tracks[0].confidence, 1);
   assert.deepEqual(message.tracks[0].velocity, [0, 0, 0]);
+
+  const legacy = parseClientMessage(JSON.stringify({
+    type: 'track_batch', tracks: [{ id: 't1', label: 'bird', position: [0, 0, 0] }]
+  }));
+  assert.equal(legacy.replaceSource, false);
 });
 
 test('preserves normalized client pose type', () => {
