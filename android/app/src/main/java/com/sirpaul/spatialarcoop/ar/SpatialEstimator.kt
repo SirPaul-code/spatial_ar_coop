@@ -7,7 +7,6 @@ import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import com.sirpaul.spatialarcoop.vision.CaptureGeometry
 import com.sirpaul.spatialarcoop.vision.Detection2D
-import kotlin.math.abs
 
 
 data class EstimatedPosition(
@@ -24,6 +23,9 @@ object SpatialEstimator {
         groundY: Float?
     ): EstimatedPosition? {
         if (frame.camera.trackingState != TrackingState.TRACKING) return null
+        // The local UI may show a first-frame candidate immediately, but a networked 3D object is
+        // only allowed after the temporal detector has seen a consistent image-space identity.
+        if (!detection.temporallyConfirmed) return null
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
         val geometry = detection.captureGeometry ?: currentGeometry(frame)
 
