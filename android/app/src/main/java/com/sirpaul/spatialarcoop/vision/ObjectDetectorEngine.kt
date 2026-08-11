@@ -153,11 +153,20 @@ class ObjectDetectorEngine(
         val kept = mutableListOf<DetectionCandidate2D>()
         values.sortedByDescending { it.confidence }.forEach { candidate ->
             val duplicate = kept.any { existing ->
-                existing.label == candidate.label && intersectionOverUnion(existing, candidate) >= NMS_IOU_THRESHOLD
+                existing.label == candidate.label &&
+                    intersectionOverUnion(existing, candidate) >= nmsThreshold(candidate.label)
             }
             if (!duplicate) kept += candidate
         }
         return kept
+    }
+
+    private fun nmsThreshold(label: String): Float = when (label) {
+        // Large person/car boxes produced the most visible stacked duplicates in field footage.
+        // Birds stay looser because several real chickens commonly occupy adjacent image regions.
+        "person", "car" -> 0.35f
+        "bird" -> 0.55f
+        else -> 0.45f
     }
 
     private fun intersectionOverUnion(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
@@ -185,7 +194,6 @@ class ObjectDetectorEngine(
     companion object {
         private val ALLOWED_LABELS = setOf("person", "car", "bird", "dog", "cat")
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
-        private const val NMS_IOU_THRESHOLD = 0.55f
         private const val BOTTOM_CENTER_INSET = 0.04f
         private const val MAX_RESULTS = 48
     }
