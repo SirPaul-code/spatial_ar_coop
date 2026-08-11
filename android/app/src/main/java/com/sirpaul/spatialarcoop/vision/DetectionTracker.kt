@@ -1,5 +1,6 @@
 package com.sirpaul.spatialarcoop.vision
 
+import com.sirpaul.spatialarcoop.data.PoseJoint
 import com.sirpaul.spatialarcoop.data.SpatialTrack
 import com.sirpaul.spatialarcoop.data.defaultTrackExtent
 import kotlin.math.PI
@@ -16,7 +17,8 @@ data class SpatialObservation(
     val associationKey: String? = null,
     val extentMeters: FloatArray = defaultTrackExtent(label),
     val yawRadians: Float = 0f,
-    val requiredHits: Int = 2
+    val requiredHits: Int = 2,
+    val poseJoints: List<PoseJoint> = emptyList()
 )
 
 class DetectionTracker(private val sourceId: String) {
@@ -33,7 +35,9 @@ class DetectionTracker(private val sourceId: String) {
         var requiredHits: Int,
         var lastSeenAtMs: Long,
         var hitCount: Int,
-        var rejectedMeasurements: Int
+        var rejectedMeasurements: Int,
+        var poseJoints: List<PoseJoint>,
+        var poseLastSeenAtMs: Long?
     )
 
     private val states = linkedMapOf<String, State>()
@@ -66,7 +70,9 @@ class DetectionTracker(private val sourceId: String) {
                     requiredHits = observation.requiredHits.coerceIn(2, 6),
                     lastSeenAtMs = observation.observedAtMs,
                     hitCount = 1,
-                    rejectedMeasurements = 0
+                    rejectedMeasurements = 0,
+                    poseJoints = copyPose(observation.poseJoints),
+                    poseLastSeenAtMs = observation.observedAtMs.takeIf { observation.poseJoints.isNotEmpty() }
                 )
             } else {
                 unmatched.remove(reacquired)
@@ -163,12 +169,35 @@ class DetectionTracker(private val sourceId: String) {
             -atan2(velocity[0], velocity[2])
         } else null
         state.yawRadians = blendAngle(state.yawRadians, motionYaw ?: observation.yawRadians, 0.16f)
+        if (observation.poseJoints.isNotEmpty()) {
+            state.poseJoints = blendPose(state.poseJoints, observation.poseJoints)
+            state.poseLastSeenAtMs = observation.observedAtMs
+        }
         // A later high-quality ground/plane measurement may reduce the confirmation requirement of
         // a track that initially started from the conservative monocular fallback.
         state.requiredHits = min(state.requiredHits, observation.requiredHits.coerceIn(2, 6))
         state.lastSeenAtMs = observation.observedAtMs
         state.hitCount += 1
     }
+
+    private fun blendPose(current: List<PoseJoint>, incoming: List<PoseJoint>): List<PoseJoint> {
+        if (current.isEmpty()) return copyPose(incoming)
+        val old = current.associateBy { it.index }
+        return incoming.map { fresh ->
+            val previous = old[fresh.index] ?: return@map PoseJoint(fresh.index, fresh.offsetMeters.copyOf(), fresh.confidence)
+            PoseJoint(
+                index = fresh.index,
+                offsetMeters = FloatArray(3) { index ->
+                    previous.offsetMeters.getOrElse(index) { fresh.offsetMeters[index] } * (1f - POSE_JOINT_ALPHA) +
+                        fresh.offsetMeters[index] * POSE_JOINT_ALPHA
+                },
+                confidence = previous.confidence * 0.35f + fresh.confidence * 0.65f
+            )
+        }
+    }
+
+    private fun copyPose(values: List<PoseJoint>): List<PoseJoint> =
+        values.map { PoseJoint(it.index, it.offsetMeters.copyOf(), it.confidence) }
 
     private fun positionAlpha(residualDistance: Float, apparentSpeed: Float, uncertaintyMeters: Float): Float {
         if (residualDistance < POSITION_DEADBAND_METERS) return 0.06f
@@ -271,6 +300,7 @@ class DetectionTracker(private val sourceId: String) {
     private fun toPublicTrack(state: State, nowMs: Long): SpatialTrack {
         val ageMs = (nowMs - state.lastSeenAtMs).coerceAtLeast(0L)
         val confidenceDecay = (1f - (ageMs.toFloat() / TRACK_TIMEOUT_MS) * 0.58f).coerceIn(0.30f, 1f)
+        val poseAgeMs = state.poseLastSeenAtMs?.let { (nowMs - it).coerceAtLeast(0L) } ?: Long.MAX_VALUE
         return SpatialTrack(
             key = "$sourceId:${state.id}",
             id = state.id,
@@ -282,7 +312,8 @@ class DetectionTracker(private val sourceId: String) {
             uncertaintyMeters = state.uncertaintyMeters + (ageMs / 1000f) * 0.10f,
             observedAtMs = nowMs,
             extentMeters = state.extentMeters.copyOf(),
-            yawRadians = state.yawRadians
+            yawRadians = state.yawRadians,
+            poseJoints = if (state.label == "person" && poseAgeMs <= POSE_HOLD_MS) copyPose(state.poseJoints) else emptyList()
         )
     }
 
@@ -296,5 +327,7 @@ class DetectionTracker(private val sourceId: String) {
         private const val TRACK_TIMEOUT_MS = 1_500L
         private const val REACQUIRE_RATIO = 0.70f
         private const val REACQUIRE_MARGIN_METERS = 0.20f
+        private const val POSE_JOINT_ALPHA = 0.44f
+        private const val POSE_HOLD_MS = 700L
     }
 }
