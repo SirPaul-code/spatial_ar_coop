@@ -21,8 +21,6 @@ function openWebSocket(url, timeoutMs = 3000) {
       socket.removeEventListener('message', onMessage);
       socket.removeEventListener('error', onError);
     };
-    // Register the message listener immediately: the server sends welcome as soon as the
-    // connection is accepted, potentially before a later 'open' callback can attach one.
     socket.addEventListener('message', onMessage);
     socket.addEventListener('error', onError, { once: true });
   });
@@ -41,7 +39,7 @@ function nextMessage(socket, predicate = () => true, timeoutMs = 3000) {
   });
 }
 
-test('REST map API and WebSocket track relay work end to end', async () => {
+test('REST map API and WebSocket multi-track snapshots relay end to end', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spatial-integration-'));
   const app = createSpatialServer({ host: '127.0.0.1', port: 0, dataDir, apiToken: 'test-token', adminToken: 'test-token', stdout: false, trackTtlMs: 500 });
   let sensor;
@@ -56,16 +54,42 @@ test('REST map API and WebSocket track relay work end to end', async () => {
     assert.equal((await list.json()).maps.length, 1);
 
     const wsBase = `ws://127.0.0.1:${address.port}/ws?token=test-token&mapId=demo`;
-    ({ socket: sensor } = await openWebSocket(`${wsBase}&clientId=sensor&role=sensor`));
-    ({ socket: viewer } = await openWebSocket(`${wsBase}&clientId=viewer&role=viewer`));
+    ({ socket: sensor } = await openWebSocket(`${wsBase}&clientId=sensor&role=participant`));
+    ({ socket: viewer } = await openWebSocket(`${wsBase}&clientId=viewer&role=participant`));
 
-    const received = nextMessage(viewer, (value) => value.type === 'track_batch');
-    sensor.send(JSON.stringify({ type: 'track_batch', sequence: 1, tracks: [{ id: 't1', label: 'person', confidence: .9, position: [1, 0, 2], velocity: [0, 0, 0], observedAtMs: Date.now() }] }));
-    const batch = await received;
-    assert.equal(batch.tracks[0].key, 'sensor:t1');
-    assert.equal(batch.tracks[0].sourceId, 'sensor');
+    const firstBatchPromise = nextMessage(viewer, (value) => value.type === 'track_batch' && value.sequence === 1);
+    sensor.send(JSON.stringify({
+      type: 'track_batch',
+      sequence: 1,
+      replaceSource: true,
+      tracks: [
+        { id: 'bird-1', label: 'bird', confidence: .87, position: [1, 0, 2], velocity: [.1, 0, 0], observedAtMs: Date.now() },
+        { id: 'bird-2', label: 'bird', confidence: .81, position: [2, 0, 3], velocity: [0, 0, 0], observedAtMs: Date.now() }
+      ]
+    }));
+    const firstBatch = await firstBatchPromise;
+    assert.equal(firstBatch.replaceSource, true);
+    assert.equal(firstBatch.tracks.length, 2);
+    assert.deepEqual(firstBatch.tracks.map((track) => track.key).sort(), ['sensor:bird-1', 'sensor:bird-2']);
+    assert.ok(firstBatch.tracks.every((track) => track.sourceId === 'sensor'));
 
-    sensor.send(JSON.stringify({ type: 'client_pose', pose: { position: [1, 1.5, 2], rotation: [0, 0, 0, 1], trackingState: 'TRACKING' } }));
+    // The next complete snapshot contains only bird-1. bird-2 must disappear immediately from
+    // every viewer and from the server live snapshot instead of lingering until TRACK_TTL_MS.
+    const expiredPromise = nextMessage(viewer, (value) => value.type === 'tracks_expired');
+    const secondBatchPromise = nextMessage(viewer, (value) => value.type === 'track_batch' && value.sequence === 2);
+    sensor.send(JSON.stringify({
+      type: 'track_batch',
+      sequence: 2,
+      replaceSource: true,
+      tracks: [{ id: 'bird-1', label: 'bird', confidence: .9, position: [1.1, 0, 2], velocity: [.1, 0, 0], observedAtMs: Date.now() }]
+    }));
+    const expired = await expiredPromise;
+    assert.deepEqual(expired.trackKeys, ['sensor:bird-2']);
+    const secondBatch = await secondBatchPromise;
+    assert.equal(secondBatch.tracks.length, 1);
+    assert.equal(secondBatch.tracks[0].key, 'sensor:bird-1');
+
+    sensor.send(JSON.stringify({ type: 'client_pose', pose: { position: [1, 1.5, 2], rotation: [0, 0, 0, 1], tracking: 'TRACKING' } }));
     sensor.send(JSON.stringify({ type: 'status', state: 'reporting', detail: 'object detection enabled' }));
     await new Promise((resolve) => setTimeout(resolve, 20));
     const live = await fetch(`${base}/api/v1/maps/demo/live-state`, { headers });
@@ -73,6 +97,7 @@ test('REST map API and WebSocket track relay work end to end', async () => {
     const state = await live.json();
     assert.equal(state.clients.length, 2);
     assert.equal(state.tracks.length, 1);
+    assert.equal(state.tracks[0].key, 'sensor:bird-1');
     assert.equal(state.clients.find((client) => client.clientId === 'sensor')?.status?.state, 'reporting');
   } finally {
     sensor?.close();
