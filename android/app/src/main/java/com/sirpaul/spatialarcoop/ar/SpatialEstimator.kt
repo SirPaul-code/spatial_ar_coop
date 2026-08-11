@@ -7,7 +7,6 @@ import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import com.sirpaul.spatialarcoop.vision.CaptureGeometry
 import com.sirpaul.spatialarcoop.vision.Detection2D
-import com.sirpaul.spatialarcoop.vision.SpatialAssociationHints
 
 
 data class EstimatedPosition(
@@ -24,31 +23,28 @@ object SpatialEstimator {
         groundY: Float?
     ): EstimatedPosition? {
         if (frame.camera.trackingState != TrackingState.TRACKING) return null
-        // The local UI may show a first-frame candidate immediately, but a networked 3D object is
-        // only allowed after the temporal detector has seen a consistent image-space identity.
         if (!detection.temporallyConfirmed) return null
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
         val geometry = detection.captureGeometry ?: currentGeometry(frame)
 
-        // Every class currently shared by this app represents a ground/contact target in the field
-        // workflow. Prefer the ray through the detector's feet/wheels at the detector capture pose.
-        // Depth hits on a moving object/background are useful evidence, but they are not a stable
-        // definition of the object's shared site position and were the main source of 3D jumps.
+        // Every currently shared field class is represented by its ground/contact point. Prefer the
+        // ray through feet/wheels at the detector capture pose. Depth on a moving target/background
+        // is evidence, not a stable definition of the shared site position.
         if (groundY != null && detection.label in GROUND_CONTACT_LABELS) {
             val ground = intersectGround(detection.rawBottomCenter, geometry, siteFromWorld, groundY)
             if (ground != null) {
                 if (!hasPlausibleApparentScale(detection, ground, worldFromSite, geometry)) return null
                 return EstimatedPosition(
-                    sitePosition = SpatialAssociationHints.attach(ground, detection.temporalId),
+                    sitePosition = ground,
                     uncertaintyMeters = if (detection.captureGeometry != null) 0.28f else 0.40f,
                     method = if (detection.captureGeometry != null) "ground-capture" else "ground-current"
                 )
             }
         }
 
-        // Fallback for maps that do not yet have a saved floor. Prefer a real upward-facing plane
-        // over a DepthPoint because the shared position is the contact point, not an arbitrary
-        // surface point on the target or background.
+        // Maps without a saved floor use real AR geometry only. Prefer an upward horizontal plane
+        // to a DepthPoint because the networked representation is the contact point, not an
+        // arbitrary surface point on the object/background.
         val image = detection.rawBottomCenter
         val view = FloatArray(2)
         frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
@@ -72,11 +68,7 @@ object SpatialEstimator {
             is DepthPoint -> 0.68f to "depth-fallback"
             else -> 0.80f to "hit-fallback"
         }
-        return EstimatedPosition(
-            SpatialAssociationHints.attach(site, detection.temporalId),
-            uncertainty,
-            method
-        )
+        return EstimatedPosition(site, uncertainty, method)
     }
 
     fun centerGroundPoint(frame: Frame, worldFromSite: FloatArray, groundY: Float?): FloatArray? {
@@ -131,8 +123,8 @@ object SpatialEstimator {
         )
         val worldDirection = PoseMath.transformDirection(geometry.worldFromCamera, cameraDirection)
         val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromWorld, worldDirection))
-        // Near-horizon rays amplify a few pixels of detector noise into many meters of position
-        // error. Refuse them instead of publishing a wildly unstable shared track.
+        // Near-horizon rays amplify a few detector pixels into metres of position error. Refuse the
+        // sample rather than publishing a wildly unstable shared object.
         if (siteDirection[1] > -MIN_DOWNWARD_RAY_COMPONENT) return null
         val worldOrigin = PoseMath.translationOf(geometry.worldFromCamera)
         val siteOrigin = PoseMath.transformPoint(siteFromWorld, worldOrigin)
