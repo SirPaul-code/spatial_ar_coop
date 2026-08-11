@@ -1,6 +1,7 @@
 export const PROTOCOL_VERSION = 2;
 const ALLOWED_ROLES = new Set(['mapper', 'participant', 'sensor', 'viewer', 'observer']);
 const ALLOWED_LABEL = /^[a-zA-Z0-9_.:-]{1,48}$/;
+const MAX_POSE_JOINTS = 24;
 
 export class ProtocolError extends Error {
   constructor(code, message) {
@@ -75,8 +76,33 @@ function normalizeTrack(track, index) {
     uncertaintyMeters: finiteNumber(track.uncertaintyMeters, 0.5, 0.01, 50),
     observedAtMs: finiteInt(track.observedAtMs, Date.now()),
     extentMeters: physicalVector(track.extentMeters ?? defaultExtent(label), 3, `track[${index}].extentMeters`),
-    yawRadians: finiteNumber(track.yawRadians, 0, -Math.PI, Math.PI)
+    yawRadians: finiteNumber(track.yawRadians, 0, -Math.PI, Math.PI),
+    poseJoints: label === 'person' ? normalizePoseJoints(track.poseJoints, index) : []
   };
+}
+
+function normalizePoseJoints(value, trackIndex) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new ProtocolError('INVALID_POSE_JOINTS', `track[${trackIndex}].poseJoints must be an array`);
+  if (value.length > MAX_POSE_JOINTS) throw new ProtocolError('TOO_MANY_POSE_JOINTS', `track[${trackIndex}] has too many pose joints`);
+  const seen = new Set();
+  return value.map((joint, jointIndex) => {
+    if (!Array.isArray(joint) || joint.length !== 5) {
+      throw new ProtocolError('INVALID_POSE_JOINT', `track[${trackIndex}].poseJoints[${jointIndex}] must be [index,x,y,z,confidence]`);
+    }
+    const index = finiteInt(joint[0], -1);
+    if (index < 0 || index > 32 || seen.has(index)) {
+      throw new ProtocolError('INVALID_POSE_JOINT', `track[${trackIndex}].poseJoints[${jointIndex}] has invalid/duplicate landmark index`);
+    }
+    seen.add(index);
+    return [
+      index,
+      finiteNumber(joint[1], 0, -4, 4, `poseJoint[${jointIndex}].x`),
+      finiteNumber(joint[2], 0, -4, 4, `poseJoint[${jointIndex}].y`),
+      finiteNumber(joint[3], 0, -4, 4, `poseJoint[${jointIndex}].z`),
+      finiteNumber(joint[4], 0, 0, 1, `poseJoint[${jointIndex}].confidence`)
+    ];
+  });
 }
 
 function defaultExtent(label) {
