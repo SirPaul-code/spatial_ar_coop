@@ -21,6 +21,7 @@ interface RealtimeListener {
     fun onTracksExpired(trackKeys: List<String>)
     fun onManualMarker(id: String, label: String, position: FloatArray, expiresAtMs: Long)
     fun onPresence(clientId: String, action: String, role: String)
+    fun onTrackAck(sequence: Long, accepted: Int, expired: Int, serverTimeMs: Long) = Unit
 }
 
 class RealtimeClient(
@@ -127,6 +128,12 @@ class RealtimeClient(
                 val source = json.optString("sourceId", "unknown")
                 listener.onTracks(parseTracks(json.optJSONArray("tracks"), source))
             }
+            "track_ack" -> listener.onTrackAck(
+                sequence = json.optLong("sequence", -1L),
+                accepted = json.optInt("accepted", 0).coerceAtLeast(0),
+                expired = json.optInt("expired", 0).coerceAtLeast(0),
+                serverTimeMs = json.optLong("serverTimeMs", System.currentTimeMillis())
+            )
             "tracks_expired" -> {
                 val array = json.optJSONArray("trackKeys") ?: JSONArray()
                 listener.onTracksExpired(buildList {
@@ -154,11 +161,6 @@ class RealtimeClient(
         }
     }
 
-    /**
-     * Publish the complete set of currently-active tracks for this source phone. The explicit
-     * replaceSource flag lets new servers immediately expire IDs that disappeared from the local
-     * tracker while remaining backward compatible with older servers/clients.
-     */
     fun sendTracks(sequence: Long, tracks: Collection<SpatialTrack>): Boolean {
         val payload = JSONObject()
             .put("type", "track_batch")
