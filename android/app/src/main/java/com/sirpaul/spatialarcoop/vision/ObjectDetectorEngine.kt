@@ -53,7 +53,12 @@ class ObjectDetectorEngine(
                 val detections = result.detections().mapNotNull { detection ->
                     val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
                     val label = category.categoryName().lowercase()
-                    if (label !in ALLOWED_LABELS || category.score() < threshold) return@mapNotNull null
+                    if (label !in ALLOWED_LABELS) return@mapNotNull null
+                    // Chickens are represented by EfficientDet/COCO as "bird". Small birds are
+                    // substantially harder than people/cars, so keep the user's normal threshold
+                    // for other classes while allowing a modestly lower bird floor for recall.
+                    val effectiveThreshold = if (label == "bird") minOf(threshold, BIRD_SCORE_THRESHOLD) else threshold
+                    if (category.score() < effectiveThreshold) return@mapNotNull null
                     val box = detection.boundingBox()
                     val bottomCenterRotated = floatArrayOf(box.centerX(), box.bottom - box.height() * 0.04f)
                     val rawBottomCenter = YuvFrameConverter.rotatedToRaw(
@@ -93,19 +98,28 @@ class ObjectDetectorEngine(
 
     private fun detector(): ObjectDetector {
         detector?.let { return it }
+        val modelThreshold = minOf(threshold, BIRD_SCORE_THRESHOLD)
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath("efficientdet-lite0.tflite")
             .setDelegate(Delegate.CPU)
             .build()
         val options = ObjectDetector.ObjectDetectorOptions.builder()
             .setBaseOptions(baseOptions)
-            .setScoreThreshold(threshold)
-            .setMaxResults(8)
+            .setScoreThreshold(modelThreshold)
+            .setMaxResults(MAX_RESULTS)
             .setRunningMode(RunningMode.IMAGE)
             .build()
         return ObjectDetector.createFromOptions(appContext, options).also {
             detector = it
-            logger.info("Object detector initialized", mapOf("threshold" to threshold, "labels" to ALLOWED_LABELS.joinToString()))
+            logger.info(
+                "Object detector initialized",
+                mapOf(
+                    "threshold" to threshold,
+                    "birdThreshold" to minOf(threshold, BIRD_SCORE_THRESHOLD),
+                    "maxResults" to MAX_RESULTS,
+                    "labels" to ALLOWED_LABELS.joinToString()
+                )
+            )
         }
     }
 
@@ -121,5 +135,7 @@ class ObjectDetectorEngine(
 
     companion object {
         private val ALLOWED_LABELS = setOf("person", "car", "bird", "dog", "cat")
+        private const val BIRD_SCORE_THRESHOLD = 0.30f
+        private const val MAX_RESULTS = 32
     }
 }
