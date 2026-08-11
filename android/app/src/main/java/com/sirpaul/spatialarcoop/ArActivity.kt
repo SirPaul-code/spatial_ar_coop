@@ -56,6 +56,7 @@ import com.sirpaul.spatialarcoop.ui.ProjectedTrack
 import com.sirpaul.spatialarcoop.ui.ScanOverlayState
 import com.sirpaul.spatialarcoop.ui.SpatialOverlayView
 import com.sirpaul.spatialarcoop.util.Diagnostics
+import com.sirpaul.spatialarcoop.vision.CaptureGeometry
 import com.sirpaul.spatialarcoop.vision.Detection2D
 import com.sirpaul.spatialarcoop.vision.DetectionTracker
 import com.sirpaul.spatialarcoop.vision.ObjectDetectorEngine
@@ -837,7 +838,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         confidence = detection.confidence,
                         position = estimate.sitePosition,
                         observedAtMs = detection.capturedAtMs,
-                        uncertaintyMeters = estimate.uncertaintyMeters
+                        uncertaintyMeters = estimate.uncertaintyMeters,
+                        associationKey = detection.temporalId
                     )
                 }
             }
@@ -887,7 +889,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             } else {
                 runCatching { displayRotation.cameraSensorToDisplayRotation(cameraId) }.getOrDefault(0)
             }
-            if (detector?.submit(yuv, rotation, now) == true) lastDetectionCaptureAtMs = now
+            val intrinsics = frame.camera.imageIntrinsics
+            val captureGeometry = CaptureGeometry(
+                worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose),
+                focalLength = intrinsics.focalLength.copyOf(),
+                principalPoint = intrinsics.principalPoint.copyOf()
+            )
+            if (detector?.submit(yuv, rotation, now, captureGeometry) == true) lastDetectionCaptureAtMs = now
         } finally {
             image.close()
         }
@@ -1297,4 +1305,3 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val MIN_SETUP_POINTS = 1_000
     }
 }
-
