@@ -221,7 +221,13 @@ class RealtimeClient(
         if (array == null) return emptyList()
         return buildList {
             for (index in 0 until array.length()) {
-                array.optJSONObject(index)?.let { add(SpatialTrack.fromJson(it, source)) }
+                array.optJSONObject(index)?.let { json ->
+                    val track = SpatialTrack.fromJson(json, source)
+                    // The server intentionally broadcasts complete room state, including the
+                    // sender's own batch. The source phone already renders its precise detector
+                    // bbox, so suppress its network echo to avoid a duplicate amber spatial box.
+                    if (track.sourceId != clientId) add(track)
+                }
             }
         }
     }
