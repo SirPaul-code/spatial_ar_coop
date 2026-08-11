@@ -35,10 +35,9 @@ data class TrackedDetection2D(
 /**
  * Lightweight ByteTrack-style front-end for detector output.
  *
- * New objects need a class-specific high-confidence observation. Once an object exists, lower
- * confidence observations are allowed to maintain the same image-space identity. This is useful
- * for chickens behind wire mesh and for partial occlusion, while preventing isolated low-score
- * detections from becoming networked 3D tracks.
+ * Person/car/other classes require a strong observation before an identity exists. `bird` gets an
+ * extra tentative path for wire-mesh/partial-occlusion cases: a weak candidate may exist internally,
+ * but it needs several geometrically consistent frames before it becomes visible or spatial.
  */
 class TemporalDetectionTracker(private val userThreshold: Float) {
     private data class State(
@@ -50,7 +49,8 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         var right: Float,
         var bottom: Float,
         var lastSeenAtMs: Long,
-        var hitCount: Int
+        var hitCount: Int,
+        var strongHitCount: Int
     ) {
         fun box() = DetectionCandidate2D(label, confidence, left, top, right, bottom)
     }
@@ -80,7 +80,9 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
                 updateState(match, candidate, capturedAtMs)
                 match
             } else {
-                if (candidate.confidence < spawnThreshold(candidate.label)) return@forEach
+                val strong = candidate.confidence >= spawnThreshold(candidate.label)
+                val weakBird = candidate.label == "bird" && candidate.confidence >= BIRD_TENTATIVE_THRESHOLD
+                if (!strong && !weakBird) return@forEach
                 State(
                     id = "d${nextId++}",
                     label = candidate.label,
@@ -90,7 +92,8 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
                     right = candidate.right,
                     bottom = candidate.bottom,
                     lastSeenAtMs = capturedAtMs,
-                    hitCount = 1
+                    hitCount = 1,
+                    strongHitCount = if (strong) 1 else 0
                 ).also { states[it.id] = it }
             }
 
@@ -121,6 +124,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         state.confidence = state.confidence * 0.35f + candidate.confidence * 0.65f
         state.lastSeenAtMs = capturedAtMs
         state.hitCount += 1
+        if (candidate.confidence >= spawnThreshold(candidate.label)) state.strongHitCount += 1
     }
 
     private fun State.toOutput() = TrackedDetection2D(
@@ -131,9 +135,17 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         top = top,
         right = right,
         bottom = bottom,
-        confirmed = hitCount >= confirmationHits(label),
+        confirmed = isConfirmed(this),
         hitCount = hitCount
     )
+
+    private fun isConfirmed(state: State): Boolean = when (state.label) {
+        "bird" -> {
+            (state.strongHitCount >= 1 && state.hitCount >= NORMAL_CONFIRMATION_HITS) ||
+                state.hitCount >= WEAK_BIRD_CONFIRMATION_HITS
+        }
+        else -> state.strongHitCount >= 1 && state.hitCount >= NORMAL_CONFIRMATION_HITS
+    }
 
     private fun associationCost(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
         val areaRatio = max(a.area, b.area) / min(a.area, b.area).coerceAtLeast(1f)
@@ -172,8 +184,6 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     }
 
     private fun spawnThreshold(label: String): Float = when (label) {
-        // COCO "bird" is deliberately permissive: temporal confirmation, not a single low score,
-        // is what promotes a chicken into the spatial pipeline.
         "bird" -> minOf(userThreshold, BIRD_SPAWN_THRESHOLD)
         "person", "car" -> maxOf(userThreshold, PERSON_CAR_SPAWN_THRESHOLD)
         else -> maxOf(userThreshold, OTHER_SPAWN_THRESHOLD)
@@ -185,11 +195,6 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         else -> OTHER_MAINTAIN_THRESHOLD
     }
 
-    private fun confirmationHits(label: String): Int = when (label) {
-        "bird" -> 2
-        else -> 2
-    }
-
     private fun expire(nowMs: Long) {
         states.entries.removeIf { nowMs - it.value.lastSeenAtMs > STATE_RETENTION_MS }
     }
@@ -197,17 +202,20 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     private fun lerp(a: Float, b: Float, alpha: Float): Float = a + (b - a) * alpha
 
     companion object {
+        private const val BIRD_TENTATIVE_THRESHOLD = 0.10f
         private const val BIRD_SPAWN_THRESHOLD = 0.18f
         private const val PERSON_CAR_SPAWN_THRESHOLD = 0.56f
         private const val OTHER_SPAWN_THRESHOLD = 0.48f
-        private const val BIRD_MAINTAIN_THRESHOLD = 0.10f
+        private const val BIRD_MAINTAIN_THRESHOLD = 0.08f
         private const val PERSON_CAR_MAINTAIN_THRESHOLD = 0.30f
         private const val OTHER_MAINTAIN_THRESHOLD = 0.24f
+        private const val NORMAL_CONFIRMATION_HITS = 2
+        private const val WEAK_BIRD_CONFIRMATION_HITS = 4
         private const val MIN_ASSOCIATION_IOU = 0.06f
         private const val GENERAL_CENTER_LIMIT = 1.25f
         private const val BIRD_CENTER_LIMIT = 1.75f
         private const val MAX_AREA_RATIO = 4.5f
         private const val MIN_NORMALIZATION_PIXELS = 24f
-        private const val STATE_RETENTION_MS = 850L
+        private const val STATE_RETENTION_MS = 1_400L
     }
 }

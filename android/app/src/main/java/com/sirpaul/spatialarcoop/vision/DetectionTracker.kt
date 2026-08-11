@@ -1,28 +1,7 @@
 package com.sirpaul.spatialarcoop.vision
 
 import com.sirpaul.spatialarcoop.data.SpatialTrack
-import java.util.Collections
-import java.util.WeakHashMap
 import kotlin.math.sqrt
-
-/**
- * Compatibility bridge between SpatialEstimator and SpatialObservation.
- *
- * ArActivity currently constructs SpatialObservation from an EstimatedPosition without explicitly
- * copying Detection2D.temporalId. The estimator returns a unique FloatArray instance for every
- * accepted measurement, so an identity-keyed weak map can carry that hint across the immediately
- * following constructor call without changing the wire protocol or retaining positions long-term.
- */
-internal object SpatialAssociationHints {
-    private val hints = Collections.synchronizedMap(WeakHashMap<FloatArray, String>())
-
-    fun attach(position: FloatArray, key: String?): FloatArray {
-        if (!key.isNullOrBlank()) hints[position] = key
-        return position
-    }
-
-    fun consume(position: FloatArray): String? = hints.remove(position)
-}
 
 data class SpatialObservation(
     val label: String,
@@ -30,7 +9,7 @@ data class SpatialObservation(
     val position: FloatArray,
     val observedAtMs: Long,
     val uncertaintyMeters: Float = 0.35f,
-    val associationKey: String? = SpatialAssociationHints.consume(position)
+    val associationKey: String? = null
 )
 
 /**
