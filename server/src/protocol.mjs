@@ -80,7 +80,7 @@ function normalizeClientPose(value) {
   const pose = value.pose;
   if (!pose || typeof pose !== 'object') throw new ProtocolError('INVALID_POSE', 'pose is required');
   return {
-    type,
+    type: 'client_pose',
     pose: {
       position: vector(pose.position, 3, 'pose.position'),
       rotation: vector(pose.rotation, 4, 'pose.rotation'),
