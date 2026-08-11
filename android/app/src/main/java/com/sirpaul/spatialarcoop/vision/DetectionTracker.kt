@@ -70,6 +70,11 @@ class DetectionTracker(private val sourceId: String) {
         return states.values.map { toPublicTrack(it, nowMs) }
     }
 
+    @Synchronized
+    fun clear() {
+        states.clear()
+    }
+
     private fun applyObservation(state: State, observation: SpatialObservation) {
         val dt = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f).coerceAtMost(1.5f)
         val predicted = predictedPosition(state, observation.observedAtMs)
@@ -122,7 +127,6 @@ class DetectionTracker(private val sourceId: String) {
             position = predictedPosition(state, nowMs),
             velocity = state.velocity.copyOf(),
             uncertaintyMeters = state.uncertaintyMeters + (ageMs / 1000f) * 0.12f,
-            // The published position is predicted to nowMs. lastSeen remains an internal expiry gate.
             observedAtMs = nowMs
         )
     }
