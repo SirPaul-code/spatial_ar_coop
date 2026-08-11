@@ -815,7 +815,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 }
             }
             val tracks = localTracker.update(observations)
-            remoteTracks.update(tracks)
+            // The reporting phone renders the exact same stable spatial tracker state it publishes.
+            // Replace only this source so locally-expired birds disappear immediately while remote
+            // participants remain untouched until their own batch/expiry events arrive.
+            remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
             realtime?.sendTracks(sequence++, tracks)
             latestInferenceMs = pending.inferenceMs
             latestLocalTrackCount = tracks.size
