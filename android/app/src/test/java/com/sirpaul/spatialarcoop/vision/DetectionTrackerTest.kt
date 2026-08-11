@@ -1,6 +1,7 @@
 package com.sirpaul.spatialarcoop.vision
 
 import kotlin.math.sqrt
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -29,6 +30,30 @@ class DetectionTrackerTest {
         val t0 = 5_000L
         assertTrue(tracker.update(listOf(bird(0f, 2f, t0)), t0).isEmpty())
         assertTrue(tracker.current(t0 + 100).isEmpty())
+    }
+
+    @Test fun highUncertaintyFallbackNeedsFourHitsAndCarriesPhysicalGeometry() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 7_000L
+        fun fallback(at: Long, x: Float) = SpatialObservation(
+            label = "car",
+            confidence = 0.86f,
+            position = floatArrayOf(x, 0f, 8f),
+            observedAtMs = at,
+            uncertaintyMeters = 1.10f,
+            associationKey = "d-car",
+            extentMeters = floatArrayOf(1.9f, 1.55f, 4.5f),
+            yawRadians = 0.35f,
+            requiredHits = 4
+        )
+
+        assertTrue(tracker.update(listOf(fallback(t0, 0f)), t0).isEmpty())
+        assertTrue(tracker.update(listOf(fallback(t0 + 120, 0.03f)), t0 + 120).isEmpty())
+        assertTrue(tracker.update(listOf(fallback(t0 + 240, 0.04f)), t0 + 240).isEmpty())
+        val published = tracker.update(listOf(fallback(t0 + 360, 0.05f)), t0 + 360).single()
+        assertEquals("car", published.label)
+        assertArrayEquals(floatArrayOf(1.9f, 1.55f, 4.5f), published.extentMeters, 0.08f)
+        assertEquals(0.35f, published.yawRadians, 0.08f)
     }
 
     @Test fun keepsDistinctStableIdsForMultipleNearbyBirds() {

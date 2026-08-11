@@ -36,8 +36,8 @@ android {
         applicationId = "com.sirpaul.spatialarcoop"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.0.5"
+        versionCode = 7
+        versionName = "1.0.6"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${defaultServerUrl.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
@@ -89,10 +89,10 @@ android {
     }
 }
 
-val modelFile = layout.projectDirectory.file("src/main/assets/efficientdet-lite0.tflite").asFile
-val modelUrl = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite"
-val expectedModelBytes = 4_602_795L
-val expectedModelSha256 = "0720bf247bd76e6594ea28fa9c6f7c5242be774818997dbbeffc4da460c723bb"
+val modelFile = layout.projectDirectory.file("src/main/assets/efficientdet-lite2.tflite").asFile
+val modelUrl = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite"
+val expectedModelBytes = 7_515_971L
+val expectedModelSha256 = "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896"
 
 fun sha256(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
@@ -119,10 +119,11 @@ tasks.register("downloadObjectDetectorModel") {
         val temporary = modelFile.resolveSibling("${modelFile.name}.download")
         temporary.delete()
         URL(modelUrl).openStream().use { input -> temporary.outputStream().use { input.copyTo(it) } }
-        check(temporary.length() == expectedModelBytes) {
-            "Downloaded model size ${temporary.length()} did not match expected $expectedModelBytes"
-        }
+        val actualBytes = temporary.length()
         val actualSha256 = sha256(temporary)
+        check(actualBytes == expectedModelBytes) {
+            "Downloaded model size $actualBytes did not match expected $expectedModelBytes"
+        }
         check(actualSha256 == expectedModelSha256) {
             "Downloaded model checksum mismatch: expected $expectedModelSha256, got $actualSha256"
         }

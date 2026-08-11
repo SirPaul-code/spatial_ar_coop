@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 const ALLOWED_ROLES = new Set(['mapper', 'participant', 'sensor', 'viewer', 'observer']);
 const ALLOWED_LABEL = /^[a-zA-Z0-9_.:-]{1,48}$/;
 
@@ -56,8 +56,6 @@ function normalizeTrackBatch(value) {
     type: 'track_batch',
     sequence: finiteInt(value.sequence, 0),
     sentAtMs: finiteInt(value.sentAtMs, Date.now()),
-    // New clients declare that this batch is the full currently-active snapshot for this source.
-    // Old clients omit the flag and retain the original TTL/upsert behavior.
     replaceSource: value.replaceSource === true,
     tracks: value.tracks.map((track, index) => normalizeTrack(track, index))
   };
@@ -75,8 +73,21 @@ function normalizeTrack(track, index) {
     position: vector(track.position, 3, `track[${index}].position`),
     velocity: vector(track.velocity ?? [0, 0, 0], 3, `track[${index}].velocity`),
     uncertaintyMeters: finiteNumber(track.uncertaintyMeters, 0.5, 0.01, 50),
-    observedAtMs: finiteInt(track.observedAtMs, Date.now())
+    observedAtMs: finiteInt(track.observedAtMs, Date.now()),
+    extentMeters: physicalVector(track.extentMeters ?? defaultExtent(label), 3, `track[${index}].extentMeters`),
+    yawRadians: finiteNumber(track.yawRadians, 0, -Math.PI, Math.PI)
   };
+}
+
+function defaultExtent(label) {
+  switch (label) {
+    case 'person': return [0.60, 1.72, 0.45];
+    case 'car': return [1.85, 1.50, 4.40];
+    case 'bird': return [0.45, 0.45, 0.55];
+    case 'dog': return [0.55, 0.70, 1.00];
+    case 'cat': return [0.35, 0.42, 0.65];
+    default: return [0.65, 0.65, 0.65];
+  }
 }
 
 function normalizeClientPose(value) {
@@ -116,6 +127,11 @@ export function safeId(value, field = 'id') {
 function vector(value, size, field) {
   if (!Array.isArray(value) || value.length !== size) throw new ProtocolError('INVALID_VECTOR', `${field} must have ${size} numbers`);
   return value.map((entry, index) => finiteNumber(entry, 0, -100000, 100000, `${field}[${index}]`));
+}
+
+function physicalVector(value, size, field) {
+  if (!Array.isArray(value) || value.length !== size) throw new ProtocolError('INVALID_VECTOR', `${field} must have ${size} numbers`);
+  return value.map((entry, index) => finiteNumber(entry, 0.5, 0.03, 15, `${field}[${index}]`));
 }
 
 function finiteNumber(value, fallback, min, max, field = 'number') {

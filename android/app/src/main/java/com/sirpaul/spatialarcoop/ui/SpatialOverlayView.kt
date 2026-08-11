@@ -8,12 +8,11 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.atan2
-import kotlin.math.cos
 import kotlin.math.min
-import kotlin.math.sin
 
+
+data class ProjectedCuboid(val points: List<FloatArray>)
 
 data class ProjectedTrack(
     val key: String,
@@ -26,8 +25,10 @@ data class ProjectedTrack(
     val uncertaintyMeters: Float,
     val ageMs: Long,
     val sourceId: String,
-    /** Viewer-facing box projected from the shared 3D track dimensions. */
-    val bounds: RectF? = null
+    val bounds: RectF? = null,
+    val cuboid: ProjectedCuboid? = null,
+    val offscreenDx: Float = 1f,
+    val offscreenDy: Float = 0f
 )
 
 data class ProjectedBox(val label: String, val confidence: Float, val rectangle: RectF)
@@ -57,7 +58,7 @@ class SpatialOverlayView @JvmOverloads constructor(
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(42, 213, 154, 74)
+        color = Color.argb(34, 213, 154, 74)
     }
     private val panel = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -72,13 +73,11 @@ class SpatialOverlayView @JvmOverloads constructor(
         color = Color.argb(220, 185, 179, 169)
         textSize = 10.5f * density
     }
-    /** Raw detector boxes from this phone only. Shared tracks use the amber spatial box. */
     private val boxStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
         color = Color.rgb(120, 149, 178)
     }
-    private val history = ConcurrentHashMap<String, ArrayDeque<Pair<Float, Float>>>()
     @Volatile private var tracks: List<ProjectedTrack> = emptyList()
     @Volatile private var boxes: List<ProjectedBox> = emptyList()
     @Volatile private var scan = ScanOverlayState()
@@ -86,16 +85,6 @@ class SpatialOverlayView @JvmOverloads constructor(
 
     fun updateTracks(values: List<ProjectedTrack>) {
         tracks = values
-        val active = values.mapTo(hashSetOf()) { it.key }
-        history.keys.removeIf { it !in active }
-        values.filter { it.onScreen }.forEach { value ->
-            val points = history.getOrPut(value.key) { ArrayDeque() }
-            val previous = points.lastOrNull()
-            if (previous == null || kotlin.math.hypot(value.x - previous.first, value.y - previous.second) > 2f * density) {
-                points.addLast(value.x to value.y)
-                while (points.size > 12) points.removeFirst()
-            }
-        }
         postInvalidateOnAnimation()
     }
 
@@ -112,8 +101,6 @@ class SpatialOverlayView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        // Source-camera detector boxes are drawn first. The stable spatial track box then remains
-        // visible on this phone and every other localized participant between detector frames.
         boxes.forEach { drawDetectionBox(canvas, it) }
         tracks.forEach { track -> if (track.onScreen) drawTrack(canvas, track) else drawOffscreen(canvas, track) }
         if (showScan) drawScanCard(canvas)
@@ -121,33 +108,27 @@ class SpatialOverlayView @JvmOverloads constructor(
     }
 
     private fun drawTrack(canvas: Canvas, track: ProjectedTrack) {
-        val ageAlpha = (255 - (track.ageMs / 10).toInt()).coerceIn(72, 255)
+        val ageAlpha = (255 - (track.ageMs / 10).toInt()).coerceIn(78, 255)
         stroke.alpha = ageAlpha
-        thinStroke.alpha = (ageAlpha * 0.72f).toInt()
-        fill.alpha = (ageAlpha * 0.20f).toInt()
+        thinStroke.alpha = (ageAlpha * 0.76f).toInt()
+        fill.alpha = (ageAlpha * 0.14f).toInt()
 
-        val radius = (15f + track.uncertaintyMeters.coerceIn(0f, 3f) * 10f) * density
+        val radius = (12f + track.uncertaintyMeters.coerceIn(0f, 3f) * 8f) * density
         val feetY = track.y
-        val markerTop = track.bounds?.let { bounds ->
-            canvas.drawRoundRect(bounds, 7f * density, 7f * density, fill)
-            canvas.drawRoundRect(bounds, 7f * density, 7f * density, stroke)
-            // Corner ticks make the shared box legible without filling the camera view.
-            val tick = min(bounds.width(), bounds.height()).coerceAtMost(22f * density) * 0.35f
-            drawCornerTicks(canvas, bounds, tick)
-            bounds.top
-        } ?: drawClassGeometry(canvas, track, feetY)
+        val markerTop = when {
+            track.cuboid != null -> drawCuboid(canvas, track.cuboid)
+            track.bounds != null -> {
+                canvas.drawRoundRect(track.bounds, 7f * density, 7f * density, fill)
+                canvas.drawRoundRect(track.bounds, 7f * density, 7f * density, stroke)
+                val tick = min(track.bounds.width(), track.bounds.height()).coerceAtMost(22f * density) * 0.35f
+                drawCornerTicks(canvas, track.bounds, tick)
+                track.bounds.top
+            }
+            else -> drawClassGeometry(canvas, track, feetY)
+        }
 
         canvas.drawCircle(track.x, feetY, radius, thinStroke)
         canvas.drawCircle(track.x, feetY, 4.5f * density, stroke)
-
-        val trail = history[track.key]
-        if (trail != null && trail.size > 1) {
-            val path = Path()
-            trail.forEachIndexed { index, point ->
-                if (index == 0) path.moveTo(point.first, point.second) else path.lineTo(point.first, point.second)
-            }
-            canvas.drawPath(path, thinStroke)
-        }
 
         val stableId = track.key.substringAfterLast(':').take(8)
         val title = "${track.label} · $stableId"
@@ -159,6 +140,25 @@ class SpatialOverlayView @JvmOverloads constructor(
         canvas.drawRoundRect(rect, 7f * density, 7f * density, panel)
         canvas.drawText(title, rect.left + 9f * density, rect.top + 15f * density, text)
         canvas.drawText(detail, rect.left + 9f * density, rect.top + 31f * density, subText)
+    }
+
+    private fun drawCuboid(canvas: Canvas, cuboid: ProjectedCuboid): Float {
+        if (cuboid.points.size != 8) return height * 0.5f
+        CUBOID_EDGES.forEach { edge ->
+            val a = cuboid.points[edge[0]]
+            val b = cuboid.points[edge[1]]
+            canvas.drawLine(a[0], a[1], b[0], b[1], stroke)
+        }
+        // Lightly indicate the ground footprint; vertical/top edges remain transparent so the
+        // camera view is not obscured even through a wall.
+        val groundPath = Path().apply {
+            val first = cuboid.points[0]
+            moveTo(first[0], first[1])
+            for (index in 1..3) lineTo(cuboid.points[index][0], cuboid.points[index][1])
+            close()
+        }
+        canvas.drawPath(groundPath, fill)
+        return cuboid.points.minOf { it[1] }
     }
 
     private fun drawCornerTicks(canvas: Canvas, bounds: RectF, tick: Float) {
@@ -186,11 +186,8 @@ class SpatialOverlayView @JvmOverloads constructor(
             "car" -> {
                 val top = feetY - 43f * density
                 val body = RectF(track.x - 48f * density, top + 13f * density, track.x + 48f * density, feetY - 8f * density)
-                val roof = RectF(track.x - 27f * density, top, track.x + 25f * density, feetY - 18f * density)
                 canvas.drawRoundRect(body, 9f * density, 9f * density, fill)
                 canvas.drawRoundRect(body, 9f * density, 9f * density, stroke)
-                canvas.drawRoundRect(roof, 8f * density, 8f * density, fill)
-                canvas.drawRoundRect(roof, 8f * density, 8f * density, stroke)
                 top
             }
             "bird" -> {
@@ -198,8 +195,6 @@ class SpatialOverlayView @JvmOverloads constructor(
                 val body = RectF(track.x - 23f * density, top + 11f * density, track.x + 20f * density, feetY - 5f * density)
                 canvas.drawOval(body, fill)
                 canvas.drawOval(body, stroke)
-                canvas.drawCircle(track.x + 19f * density, top + 12f * density, 8f * density, fill)
-                canvas.drawCircle(track.x + 19f * density, top + 12f * density, 8f * density, stroke)
                 top
             }
             else -> {
@@ -213,23 +208,24 @@ class SpatialOverlayView @JvmOverloads constructor(
     }
 
     private fun drawOffscreen(canvas: Canvas, track: ProjectedTrack) {
-        val centerX = width / 2f
-        val centerY = height / 2f
-        val angle = atan2(track.y - centerY, track.x - centerX)
-        val margin = 34f * density
-        val radiusX = width / 2f - margin
-        val radiusY = height / 2f - margin
-        val x = centerX + cos(angle) * min(radiusX, radiusY)
-        val y = centerY + sin(angle) * min(radiusX, radiusY)
+        val direction = OffscreenDirection(track.offscreenDx, track.offscreenDy)
+        val point = OffscreenIndicatorMath.edgePoint(width.toFloat(), height.toFloat(), 38f * density, direction)
+        val angle = atan2(direction.dy, direction.dx)
+        val x = point.x
+        val y = point.y
         val arrow = Path().apply {
-            moveTo(x + cos(angle) * 15f * density, y + sin(angle) * 15f * density)
-            lineTo(x + cos(angle + 2.55f) * 11f * density, y + sin(angle + 2.55f) * 11f * density)
-            lineTo(x + cos(angle - 2.55f) * 11f * density, y + sin(angle - 2.55f) * 11f * density)
+            moveTo(x + kotlin.math.cos(angle) * 15f * density, y + kotlin.math.sin(angle) * 15f * density)
+            lineTo(x + kotlin.math.cos(angle + 2.55f) * 11f * density, y + kotlin.math.sin(angle + 2.55f) * 11f * density)
+            lineTo(x + kotlin.math.cos(angle - 2.55f) * 11f * density, y + kotlin.math.sin(angle - 2.55f) * 11f * density)
             close()
         }
         canvas.drawPath(arrow, fill)
         canvas.drawPath(arrow, stroke)
-        canvas.drawText("${track.label} %.1fm".format(track.distanceMeters), x - 28f * density, y - 18f * density, subText)
+        val label = "${track.label} %.1fm".format(track.distanceMeters)
+        val labelWidth = subText.measureText(label)
+        val labelX = (x - labelWidth / 2f).coerceIn(8f * density, width - labelWidth - 8f * density)
+        val labelY = (y - 18f * density).coerceIn(16f * density, height - 12f * density)
+        canvas.drawText(label, labelX, labelY, subText)
     }
 
     private fun drawDetectionBox(canvas: Canvas, box: ProjectedBox) {
@@ -266,5 +262,13 @@ class SpatialOverlayView @JvmOverloads constructor(
         canvas.drawLine(x + 6f * density, y, x + 16f * density, y, reticle)
         canvas.drawLine(x, y - 16f * density, x, y - 6f * density, reticle)
         canvas.drawLine(x, y + 6f * density, x, y + 16f * density, reticle)
+    }
+
+    companion object {
+        private val CUBOID_EDGES = arrayOf(
+            intArrayOf(0, 1), intArrayOf(1, 2), intArrayOf(2, 3), intArrayOf(3, 0),
+            intArrayOf(4, 5), intArrayOf(5, 6), intArrayOf(6, 7), intArrayOf(7, 4),
+            intArrayOf(0, 4), intArrayOf(1, 5), intArrayOf(2, 6), intArrayOf(3, 7)
+        )
     }
 }

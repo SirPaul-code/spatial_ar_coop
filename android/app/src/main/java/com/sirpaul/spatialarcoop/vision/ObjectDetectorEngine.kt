@@ -90,8 +90,6 @@ class ObjectDetectorEngine(
 
                 val candidates = suppressOverlaps(rawCandidates)
                 val tracked = temporalTracker.update(candidates, capturedAtMs)
-                // One-frame hypotheses remain internal. The visible/local pipeline only receives an
-                // object after the image-space tracker has confirmed the same identity twice.
                 val detections = tracked.asSequence()
                     .filter { it.confirmed }
                     .map { detection ->
@@ -128,7 +126,7 @@ class ObjectDetectorEngine(
         detector?.let { return it }
         val modelThreshold = minOf(threshold, MIN_MODEL_SCORE_THRESHOLD)
         val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("efficientdet-lite0.tflite")
+            .setModelAssetPath("efficientdet-lite2.tflite")
             .setDelegate(Delegate.CPU)
             .build()
         val options = ObjectDetector.ObjectDetectorOptions.builder()
@@ -143,6 +141,7 @@ class ObjectDetectorEngine(
             logger.info(
                 "Object detector initialized",
                 mapOf(
+                    "model" to "EfficientDet-Lite2 int8",
                     "userThreshold" to threshold,
                     "modelFloor" to modelThreshold,
                     "temporalHysteresis" to true,
@@ -207,6 +206,6 @@ class ObjectDetectorEngine(
         private const val CONTAINMENT_THRESHOLD = 0.72f
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
         private const val BOTTOM_CENTER_INSET = 0.04f
-        private const val MAX_RESULTS = 48
+        private const val MAX_RESULTS = 40
     }
 }

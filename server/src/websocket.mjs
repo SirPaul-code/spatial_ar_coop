@@ -24,9 +24,6 @@ export class RealtimeHub {
     server.on('upgrade', (request, socket, head) => this.#upgrade(request, socket, head));
     this.wss.on('connection', (socket, request, identity) => this.#connected(socket, request, identity));
 
-    // Track TTL is intentionally checked much more frequently than WebSocket liveness. Mobile
-    // clients behind Tailscale/cellular links can easily take >1 s to answer a ping; using the
-    // object-track TTL as the heartbeat interval caused healthy phones to be terminated with 1006.
     this.expireTimer = setInterval(
       () => this.#expireTracks(),
       Math.max(200, Math.min(1000, Math.floor(trackTtlMs / 3)))
@@ -68,10 +65,6 @@ export class RealtimeHub {
     };
   }
 
-  /**
-   * Revoke all currently-open sessions for one map. New connections are still authorized by the
-   * caller's current map key, so rotating the key and then calling this makes revocation immediate.
-   */
   disconnectMap(mapId, code = 4003, reason = 'map access revoked') {
     const room = this.rooms.get(mapId);
     if (!room?.size) return 0;
@@ -172,10 +165,6 @@ export class RealtimeHub {
           serverReceivedAtMs: receivedAt
         }));
 
-        // New Android clients publish their complete active tracker snapshot. Remove this source's
-        // tracks that disappeared from that snapshot immediately, rather than leaving a chicken or
-        // person visible until the generic server TTL. Legacy clients omit replaceSource and keep
-        // the original TTL/upsert semantics.
         const expired = [];
         if (message.replaceSource) {
           const incomingKeys = new Set(normalized.map((track) => track.key));
@@ -201,6 +190,16 @@ export class RealtimeHub {
           serverReceivedAtMs: receivedAt,
           replaceSource: message.replaceSource,
           tracks: normalized
+        });
+        // A successful websocket write on Android only means the frame entered OkHttp's send queue.
+        // Explicitly acknowledge the batch after validation/storage so field diagnostics can
+        // distinguish detector/spatialization failures from transport/server failures.
+        this.#send(socket, {
+          type: 'track_ack',
+          sequence: message.sequence,
+          accepted: normalized.length,
+          expired: expired.length,
+          serverTimeMs: receivedAt
         });
         break;
       }

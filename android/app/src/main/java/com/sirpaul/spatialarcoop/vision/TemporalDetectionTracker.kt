@@ -35,9 +35,10 @@ data class TrackedDetection2D(
 /**
  * Lightweight ByteTrack-style front-end for detector output.
  *
- * Person/car/other classes require a strong observation before an identity exists. `bird` gets an
- * extra tentative path for wire-mesh/partial-occlusion cases: a weak candidate may exist internally,
- * but it needs several geometrically consistent frames before it becomes visible or spatial.
+ * Acquisition and maintenance deliberately use different thresholds. A low-confidence detection
+ * may maintain an already-established identity through wire mesh/partial occlusion, but it may not
+ * create a new visible/shared object. This prevents persistent background clutter from eventually
+ * becoming a stable false car/bird merely because it was misclassified several times.
  */
 class TemporalDetectionTracker(private val userThreshold: Float) {
     private data class State(
@@ -50,7 +51,8 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         var bottom: Float,
         var lastSeenAtMs: Long,
         var hitCount: Int,
-        var strongHitCount: Int
+        var strongHitCount: Int,
+        var missedUpdates: Int
     ) {
         fun box() = DetectionCandidate2D(label, confidence, left, top, right, bottom)
     }
@@ -61,6 +63,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     @Synchronized
     fun update(candidates: List<DetectionCandidate2D>, capturedAtMs: Long): List<TrackedDetection2D> {
         expire(capturedAtMs)
+        states.values.forEach { it.missedUpdates += 1 }
         val available = states.values.toMutableSet()
         val outputs = mutableListOf<TrackedDetection2D>()
 
@@ -81,8 +84,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
                 match
             } else {
                 val strong = candidate.confidence >= spawnThreshold(candidate.label)
-                val weakBird = candidate.label == "bird" && candidate.confidence >= BIRD_TENTATIVE_THRESHOLD
-                if (!strong && !weakBird) return@forEach
+                if (!strong) return@forEach
                 State(
                     id = "d${nextId++}",
                     label = candidate.label,
@@ -93,7 +95,8 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
                     bottom = candidate.bottom,
                     lastSeenAtMs = capturedAtMs,
                     hitCount = 1,
-                    strongHitCount = if (strong) 1 else 0
+                    strongHitCount = 1,
+                    missedUpdates = 0
                 ).also { states[it.id] = it }
             }
 
@@ -113,17 +116,18 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         val old = state.box()
         val normalizedMotion = normalizedCenterDistance(old, candidate)
         val alpha = when {
-            normalizedMotion > 0.9f -> 0.82f
-            normalizedMotion > 0.4f -> 0.66f
-            else -> 0.48f
+            normalizedMotion > 0.9f -> 0.78f
+            normalizedMotion > 0.4f -> 0.62f
+            else -> 0.42f
         }
         state.left = lerp(state.left, candidate.left, alpha)
         state.top = lerp(state.top, candidate.top, alpha)
         state.right = lerp(state.right, candidate.right, alpha)
         state.bottom = lerp(state.bottom, candidate.bottom, alpha)
-        state.confidence = state.confidence * 0.35f + candidate.confidence * 0.65f
+        state.confidence = state.confidence * 0.42f + candidate.confidence * 0.58f
         state.lastSeenAtMs = capturedAtMs
         state.hitCount += 1
+        state.missedUpdates = 0
         if (candidate.confidence >= spawnThreshold(candidate.label)) state.strongHitCount += 1
     }
 
@@ -140,11 +144,9 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     )
 
     private fun isConfirmed(state: State): Boolean = when (state.label) {
-        "bird" -> {
-            (state.strongHitCount >= 1 && state.hitCount >= NORMAL_CONFIRMATION_HITS) ||
-                state.hitCount >= WEAK_BIRD_CONFIRMATION_HITS
-        }
-        else -> state.strongHitCount >= 1 && state.hitCount >= NORMAL_CONFIRMATION_HITS
+        "person", "car" -> state.hitCount >= PERSON_CAR_CONFIRMATION_HITS && state.strongHitCount >= 2
+        "bird" -> state.hitCount >= BIRD_CONFIRMATION_HITS && state.strongHitCount >= 1
+        else -> state.hitCount >= OTHER_CONFIRMATION_HITS && state.strongHitCount >= 1
     }
 
     private fun associationCost(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
@@ -158,7 +160,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
 
         val iouCost = 1f - iou
         val centerCost = (center / centerLimit).coerceIn(0f, 1.5f)
-        return iouCost * 0.68f + centerCost * 0.32f
+        return iouCost * 0.72f + centerCost * 0.28f
     }
 
     private fun normalizedCenterDistance(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
@@ -184,8 +186,11 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     }
 
     private fun spawnThreshold(label: String): Float = when (label) {
-        "bird" -> minOf(userThreshold, BIRD_SPAWN_THRESHOLD)
-        "person", "car" -> maxOf(userThreshold, PERSON_CAR_SPAWN_THRESHOLD)
+        // Keep chicken acquisition below the generic preference, but never allow the old 10-15%
+        // weak path to create a bird. Low scores only maintain an already acquired bird.
+        "bird" -> maxOf(BIRD_SPAWN_THRESHOLD, minOf(userThreshold, BIRD_USER_THRESHOLD_CAP))
+        "person" -> maxOf(userThreshold, PERSON_SPAWN_THRESHOLD)
+        "car" -> maxOf(userThreshold, CAR_SPAWN_THRESHOLD)
         else -> maxOf(userThreshold, OTHER_SPAWN_THRESHOLD)
     }
 
@@ -196,26 +201,33 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     }
 
     private fun expire(nowMs: Long) {
-        states.entries.removeIf { nowMs - it.value.lastSeenAtMs > STATE_RETENTION_MS }
+        states.entries.removeIf { (_, state) ->
+            val stale = nowMs - state.lastSeenAtMs > STATE_RETENTION_MS
+            val tentativeLost = !isConfirmed(state) && state.missedUpdates > TENTATIVE_MAX_MISSES
+            stale || tentativeLost
+        }
     }
 
     private fun lerp(a: Float, b: Float, alpha: Float): Float = a + (b - a) * alpha
 
     companion object {
-        private const val BIRD_TENTATIVE_THRESHOLD = 0.10f
-        private const val BIRD_SPAWN_THRESHOLD = 0.18f
-        private const val PERSON_CAR_SPAWN_THRESHOLD = 0.56f
-        private const val OTHER_SPAWN_THRESHOLD = 0.48f
-        private const val BIRD_MAINTAIN_THRESHOLD = 0.08f
-        private const val PERSON_CAR_MAINTAIN_THRESHOLD = 0.30f
-        private const val OTHER_MAINTAIN_THRESHOLD = 0.24f
-        private const val NORMAL_CONFIRMATION_HITS = 2
-        private const val WEAK_BIRD_CONFIRMATION_HITS = 4
-        private const val MIN_ASSOCIATION_IOU = 0.06f
-        private const val GENERAL_CENTER_LIMIT = 1.25f
-        private const val BIRD_CENTER_LIMIT = 1.75f
-        private const val MAX_AREA_RATIO = 4.5f
+        private const val BIRD_SPAWN_THRESHOLD = 0.24f
+        private const val BIRD_USER_THRESHOLD_CAP = 0.28f
+        private const val PERSON_SPAWN_THRESHOLD = 0.60f
+        private const val CAR_SPAWN_THRESHOLD = 0.52f
+        private const val OTHER_SPAWN_THRESHOLD = 0.50f
+        private const val BIRD_MAINTAIN_THRESHOLD = 0.10f
+        private const val PERSON_CAR_MAINTAIN_THRESHOLD = 0.32f
+        private const val OTHER_MAINTAIN_THRESHOLD = 0.28f
+        private const val PERSON_CAR_CONFIRMATION_HITS = 3
+        private const val BIRD_CONFIRMATION_HITS = 3
+        private const val OTHER_CONFIRMATION_HITS = 2
+        private const val TENTATIVE_MAX_MISSES = 1
+        private const val MIN_ASSOCIATION_IOU = 0.08f
+        private const val GENERAL_CENTER_LIMIT = 1.10f
+        private const val BIRD_CENTER_LIMIT = 1.45f
+        private const val MAX_AREA_RATIO = 3.8f
         private const val MIN_NORMALIZATION_PIXELS = 24f
-        private const val STATE_RETENTION_MS = 1_400L
+        private const val STATE_RETENTION_MS = 1_200L
     }
 }

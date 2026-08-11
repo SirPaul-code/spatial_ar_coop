@@ -135,10 +135,15 @@ data class SpatialTrack(
     val sourceId: String,
     val label: String,
     val confidence: Float,
+    /** Ground-contact center in shared site coordinates. */
     val position: FloatArray,
     val velocity: FloatArray,
     val uncertaintyMeters: Float,
     val observedAtMs: Long,
+    /** Physical [width, height, depth] used to render a true shared 3D volume. */
+    val extentMeters: FloatArray = defaultTrackExtent(label),
+    /** Rotation around shared-site +Y. Zero means the object's depth axis follows site +Z. */
+    val yawRadians: Float = 0f,
     val serverReceivedAtMs: Long = System.currentTimeMillis()
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -149,30 +154,52 @@ data class SpatialTrack(
         .put("velocity", JSONArray(velocity.map { it.toDouble() }))
         .put("uncertaintyMeters", uncertaintyMeters)
         .put("observedAtMs", observedAtMs)
+        .put("extentMeters", JSONArray(extentMeters.map { it.toDouble() }))
+        .put("yawRadians", yawRadians)
 
     companion object {
         fun fromJson(json: JSONObject, sourceOverride: String? = null): SpatialTrack {
             val sourceId = sourceOverride ?: json.optString("sourceId", "unknown")
             val id = json.optString("id", "unknown")
+            val label = json.optString("label", "unknown")
+            val parsedExtent = json.optionalFloatArray("extentMeters", 3)
             return SpatialTrack(
                 key = json.optString("key", "$sourceId:$id"),
                 id = id,
                 sourceId = sourceId,
-                label = json.optString("label", "unknown"),
+                label = label,
                 confidence = json.optDouble("confidence", 0.0).toFloat(),
                 position = json.floatArray("position", 3),
                 velocity = json.floatArray("velocity", 3),
                 uncertaintyMeters = json.optDouble("uncertaintyMeters", 0.5).toFloat(),
                 observedAtMs = json.optLong("observedAtMs", System.currentTimeMillis()),
+                extentMeters = parsedExtent?.takeIf { values -> values.all { it.isFinite() && it > 0f } }
+                    ?: defaultTrackExtent(label),
+                yawRadians = json.optDouble("yawRadians", 0.0).toFloat().takeIf(Float::isFinite) ?: 0f,
                 serverReceivedAtMs = System.currentTimeMillis()
             )
         }
     }
 }
 
+fun defaultTrackExtent(label: String): FloatArray = when (label.lowercase()) {
+    "person" -> floatArrayOf(0.60f, 1.72f, 0.45f)
+    "car" -> floatArrayOf(1.85f, 1.50f, 4.40f)
+    "bird" -> floatArrayOf(0.45f, 0.45f, 0.55f)
+    "dog" -> floatArrayOf(0.55f, 0.70f, 1.00f)
+    "cat" -> floatArrayOf(0.35f, 0.42f, 0.65f)
+    else -> floatArrayOf(0.65f, 0.65f, 0.65f)
+}
+
 internal fun JSONObject.floatArray(name: String, size: Int): FloatArray {
     val array = optJSONArray(name) ?: JSONArray()
     return FloatArray(size) { index -> array.optDouble(index, 0.0).toFloat() }
+}
+
+private fun JSONObject.optionalFloatArray(name: String, size: Int): FloatArray? {
+    val array = optJSONArray(name) ?: return null
+    if (array.length() != size) return null
+    return FloatArray(size) { index -> array.optDouble(index, Double.NaN).toFloat() }
 }
 
 internal inline fun <reified T : Enum<T>> enumValueOr(value: String?, fallback: T): T =

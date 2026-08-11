@@ -2,6 +2,7 @@ package com.sirpaul.spatialarcoop.ar
 
 import com.sirpaul.spatialarcoop.data.SpatialTrack
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.sqrt
 
 class RemoteTrackStore {
     private val tracks = ConcurrentHashMap<String, SpatialTrack>()
@@ -13,11 +14,6 @@ class RemoteTrackStore {
         update(values)
     }
 
-    /**
-     * Replace only one participant's active tracks. This is used by the reporting phone itself so
-     * a locally-expired bird/person disappears on the same render frame without waiting for the
-     * server round trip. Remote reporters continue to use update + explicit tracks_expired events.
-     */
     fun replaceSource(sourceId: String, values: Collection<SpatialTrack>) {
         val incoming = values.associateBy { it.key }
         tracks.entries.removeIf { (_, track) -> track.sourceId == sourceId && track.key !in incoming }
@@ -66,9 +62,13 @@ class RemoteTrackStore {
             expired
         }
         return tracks.values.map { track ->
-            val ageSeconds = (
-                (nowMs - track.serverReceivedAtMs).coerceIn(0L, MAX_EXTRAPOLATION_MS) / 1000f
-            )
+            val speed = sqrt(track.velocity.sumOf { value -> (value * value).toDouble() }).toFloat()
+            val extrapolationMs = if (speed < STATIONARY_SPEED_METERS_PER_SECOND) {
+                0L
+            } else {
+                (nowMs - track.serverReceivedAtMs).coerceIn(0L, MAX_EXTRAPOLATION_MS)
+            }
+            val ageSeconds = extrapolationMs / 1000f
             track.copy(
                 position = FloatArray(3) { index ->
                     track.position[index] + track.velocity[index] * ageSeconds
@@ -79,6 +79,7 @@ class RemoteTrackStore {
 
     companion object {
         private const val REMOTE_TIMEOUT_MS = 4_000L
-        private const val MAX_EXTRAPOLATION_MS = 700L
+        private const val MAX_EXTRAPOLATION_MS = 250L
+        private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.25f
     }
 }
