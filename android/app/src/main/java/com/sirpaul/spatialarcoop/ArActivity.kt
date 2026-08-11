@@ -160,7 +160,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
     }
 
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -190,8 +189,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             ArMode.MAP -> "mapper"
             ArMode.SENSOR -> "sensor"
             ArMode.VIEWER -> "viewer"
-            // Keep the proven wire protocol compatible: LIVE observes like every client and is
-            // allowed to publish the same track messages as the legacy SENSOR role.
             ArMode.LIVE -> "participant"
         }
         realtime = RealtimeClient(
@@ -204,9 +201,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             listener = this
         )
         if (mode == ArMode.SENSOR || mode == ArMode.LIVE) {
-            // Live AR is cooperative by default: every participant detects and shares what its
-            // camera sees. There is no hidden "reporting" opt-in that can silently disable the
-            // core feature. Spatial publishing still waits for successful shared localization.
             reporting = true
             ensureDetector()
             if (mode == ArMode.LIVE) {
@@ -277,14 +271,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 }
                 actions.addView(action("More") { showMapSetupMenu() })
             }
-            ArMode.LIVE -> {
-                // Detection/sharing is automatic in Live AR. Keep the bottom bar focused on
-                // navigation/recovery instead of exposing an implementation-mode toggle.
-                actions.addView(action("More") { showLiveMenu() })
-            }
-            ArMode.SENSOR, ArMode.VIEWER -> {
-                actions.addView(action("More") { showLiveMenu() })
-            }
+            ArMode.LIVE -> actions.addView(action("More") { showLiveMenu() })
+            ArMode.SENSOR, ArMode.VIEWER -> actions.addView(action("More") { showLiveMenu() })
         }
         scroll.addView(actions)
         root.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
@@ -352,10 +340,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         }
                     }
                     ArSessionProfile.COMPATIBILITY -> {
-                        // Keep Cloud Anchors, which are required for shared localization, but remove
-                        // optional camera/depth features that have caused resume-time failures on
-                        // some current Samsung/Android combinations. The detector can still fall
-                        // back to hit/ground estimation when Depth is disabled.
                         planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
                         depthMode = Config.DepthMode.DISABLED
                     }
@@ -406,8 +390,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             }
             return
         }
-        // If a permission request has just completed, let its callback own the delayed start. This
-        // prevents onResume + ActivityResult from racing two Session.resume() calls.
         if (cameraPermissionRequestInFlight.get()) return
         try {
             when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
@@ -685,9 +667,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             return
         }
 
-        // 2D inference is local and does not require the shared worldFromSite transform. Run it
-        // while Cloud Anchors are still resolving so the user immediately sees detector boxes and
-        // we can distinguish "detector works" from "shared localization is not ready yet".
         if ((mode == ArMode.LIVE || mode == ArMode.SENSOR) && reporting) {
             captureDetectorFrame(frame)
             pendingDetection.get()?.let { pending ->
@@ -698,9 +677,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         var map = currentMap() ?: return
         val hostedBefore = map.anchors.any { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
 
-        // A brand-new map does not need a mysterious manual "Align origin" step. The first stable
-        // TRACKING frame defines the gravity-aligned site frame. Once a Cloud Anchor is hosted,
-        // subsequent sessions resolve back into this same shared site frame.
         if (mode == ArMode.MAP && manualWorldFromSite.get() == null && cloudAnchors?.currentWorldFromSite() == null && !hostedBefore) {
             val (existingChunks, _) = spatialApp.database.chunkCounts(mapId)
             if (existingChunks == 0 && map.anchors.isEmpty()) {
@@ -742,7 +718,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
         val cloudWorldFromSite = cloudAnchors?.currentWorldFromSite()
         val manualAlignment = manualWorldFromSite.get()
-        var worldFromSite = if (manualAlignmentOverride) manualAlignment else cloudWorldFromSite ?: manualAlignment
+        val worldFromSite = if (manualAlignmentOverride) manualAlignment else cloudWorldFromSite ?: manualAlignment
         if (worldFromSite == null) {
             val hosted = map.anchors.any { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
             val now = System.currentTimeMillis()
@@ -762,9 +738,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     "Resolving shared location · point around the mapped area and move slowly"
                 else -> "Shared location unavailable · use More → Align fallback at the saved physical origin"
             }
-            // In Live mode the diagnostic HUD itself reports room connectivity, buffered remote
-            // tracks and the actual Cloud Anchor resolver state. Do not overwrite it every frame
-            // with the generic localization sentence.
             updateHud(frame, null, if (mode == ArMode.LIVE) null else instruction)
             overlay.updateTracks(emptyList())
             return
@@ -805,8 +778,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             featureQuality = cloudAnchors?.featureQuality(frame.camera.pose) ?: FeatureQuality.UNKNOWN
         }
 
-        // Ground is a refinement for feet/wheels, not a prerequisite for mapping. Detect a plausible
-        // floor opportunistically so normal setup does not expose a "Set ground" concept.
         if (!mappingFinished && map.groundY == null && now - lastAutoGroundAttemptMs >= AUTO_GROUND_INTERVAL_MS) {
             lastAutoGroundAttemptMs = now
             val candidate = SpatialEstimator.centerGroundPoint(frame, worldFromSite, null)
@@ -819,8 +790,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             }
         }
 
-        // CloudAnchorCoordinator already spaces anchors and only hosts automatically at GOOD feature
-        // quality. No normal-user "Add anchor" step is required.
         if (!mappingFinished) cloudAnchors?.considerAutoHost(frame.camera.pose, worldFromSite, currentMap() ?: map)
         if (now - lastScanHudAtMs >= SCAN_HUD_INTERVAL_MS) {
             lastScanHudAtMs = now
@@ -844,9 +813,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 }
             }
             val tracks = localTracker.update(observations)
-            // The reporting phone renders the exact same stable spatial tracker state it publishes.
-            // Replace only this source so locally-expired birds disappear immediately while remote
-            // participants remain untouched until their own batch/expiry events arrive.
             remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
             realtime?.sendTracks(sequence++, tracks)
             val now = System.currentTimeMillis()
@@ -861,9 +827,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
 
         val now = System.currentTimeMillis()
-        // Keep the filtered/predicted tracker flowing even between detector callbacks. This makes
-        // motion look continuous on every participant and guarantees that a tracker timeout is
-        // published as an empty complete-source snapshot instead of waiting for server TTL.
         if (now - lastTrackPublishAtMs >= TRACK_PUBLISH_INTERVAL_MS) {
             val tracks = localTracker.current(now)
             remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
@@ -890,8 +853,20 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 runCatching { displayRotation.cameraSensorToDisplayRotation(cameraId) }.getOrDefault(0)
             }
             val intrinsics = frame.camera.imageIntrinsics
+            val manualAlignment = manualWorldFromSite.get()
+            val captureWorldFromSite = if (manualAlignmentOverride) {
+                manualAlignment
+            } else {
+                cloudAnchors?.currentWorldFromSite() ?: manualAlignment
+            }
+            val siteFromCamera = captureWorldFromSite?.let { worldFromSite ->
+                PoseMath.multiply(
+                    PoseMath.rigidInverse(worldFromSite),
+                    PoseMath.poseToMatrix(frame.camera.pose)
+                )
+            }
             val captureGeometry = CaptureGeometry(
-                worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose),
+                siteFromCamera = siteFromCamera,
                 focalLength = intrinsics.focalLength.copyOf(),
                 principalPoint = intrinsics.principalPoint.copyOf()
             )
@@ -1136,17 +1111,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         overlay.updateTracks(projected)
     }
 
-    /**
-     * Project a class-sized, viewer-facing AR box from the shared 3D ground/contact position.
-     * The source phone still shows the detector's raw image bounding box; this box is the stable
-     * spatial representation that every localized participant can render from their own viewpoint.
-     */
     private fun projectTrackBounds(track: SpatialTrack, worldFromSite: FloatArray): RectF? {
         val (heightMeters, aspect) = when (track.label.lowercase()) {
             "person" -> 1.72f to 0.40f
             "car" -> 1.50f to 1.85f
-            // EfficientDet/COCO reports chickens as bird. A ~45 cm field box works well for the
-            // chicken-sized targets this project is intended to visualize.
             "bird" -> 0.45f to 1.05f
             "dog" -> 0.70f to 1.25f
             "cat" -> 0.42f to 1.05f
