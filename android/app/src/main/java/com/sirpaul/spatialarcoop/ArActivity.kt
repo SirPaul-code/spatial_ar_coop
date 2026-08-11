@@ -51,7 +51,9 @@ import com.sirpaul.spatialarcoop.net.RealtimeClient
 import com.sirpaul.spatialarcoop.net.RealtimeListener
 import com.sirpaul.spatialarcoop.net.UploadScheduler
 import com.sirpaul.spatialarcoop.ui.FieldTheme
+import com.sirpaul.spatialarcoop.ui.OffscreenIndicatorMath
 import com.sirpaul.spatialarcoop.ui.ProjectedBox
+import com.sirpaul.spatialarcoop.ui.ProjectedCuboid
 import com.sirpaul.spatialarcoop.ui.ProjectedTrack
 import com.sirpaul.spatialarcoop.ui.ScanOverlayState
 import com.sirpaul.spatialarcoop.ui.SpatialOverlayView
@@ -109,6 +111,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var lastDetectorStatusAtMs = 0L
     private var latestInferenceMs = 0L
     private var latestLocalTrackCount = 0
+    private var latestSpatializedCount = 0
+    private var latestSentTrackCount = 0
+    @Volatile private var lastAckAccepted = -1
+    @Volatile private var lastAckSequence = -1L
+    @Volatile private var lastAckAtMs = 0L
     private var lastFeatureQualityAtMs = 0L
     private var lastScanHudAtMs = 0L
     private var lastMapRefreshAtMs = 0L
@@ -800,28 +807,50 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     private fun updateSensor(frame: Frame, worldFromSite: FloatArray, map: MapDefinition) {
         pendingDetection.getAndSet(null)?.let { pending ->
+            val rejected = linkedMapOf<String, Int>()
             val observations = pending.detections.mapNotNull { detection ->
-                SpatialEstimator.estimate(frame, detection, worldFromSite, map.groundY)?.let { estimate ->
+                val attempt = SpatialEstimator.estimateDetailed(frame, detection, worldFromSite, map.groundY)
+                val estimate = attempt.estimate
+                if (estimate == null) {
+                    val reason = attempt.rejectionReason ?: "unknown"
+                    rejected[reason] = (rejected[reason] ?: 0) + 1
+                    null
+                } else {
                     SpatialObservation(
                         label = detection.label,
                         confidence = detection.confidence,
                         position = estimate.sitePosition,
                         observedAtMs = detection.capturedAtMs,
                         uncertaintyMeters = estimate.uncertaintyMeters,
-                        associationKey = detection.temporalId
+                        associationKey = detection.temporalId,
+                        extentMeters = estimate.extentMeters,
+                        yawRadians = estimate.yawRadians,
+                        requiredHits = estimate.requiredHits
                     )
                 }
             }
             val tracks = localTracker.update(observations)
             remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
-            realtime?.sendTracks(sequence++, tracks)
+            val publishSequence = sequence++
+            val queued = realtime?.sendTracks(publishSequence, tracks) == true
             val now = System.currentTimeMillis()
             lastTrackPublishAtMs = now
             latestInferenceMs = pending.inferenceMs
+            latestSpatializedCount = observations.size
             latestLocalTrackCount = tracks.size
+            latestSentTrackCount = if (queued) tracks.size else 0
             if (now - lastDetectorStatusAtMs >= DETECTOR_STATUS_INTERVAL_MS) {
                 lastDetectorStatusAtMs = now
-                realtime?.sendStatus("detecting", "${tracks.size} tracks, ${pending.inferenceMs}ms inference")
+                realtime?.sendStatus(
+                    "detecting",
+                    "${pending.detections.size} detected, ${observations.size} spatialized, ${tracks.size} active, ${pending.inferenceMs}ms"
+                )
+                if (rejected.isNotEmpty()) {
+                    spatialApp.logger.debug(
+                        "Spatialization rejected detections",
+                        mapOf("mapId" to mapId, "reasons" to rejected.entries.joinToString { "${it.key}=${it.value}" })
+                    )
+                }
             }
             overlay.updateLocalBoxes(projectDetectionBoxes(frame, pending.detections))
         }
@@ -830,8 +859,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         if (now - lastTrackPublishAtMs >= TRACK_PUBLISH_INTERVAL_MS) {
             val tracks = localTracker.current(now)
             remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
-            realtime?.sendTracks(sequence++, tracks)
+            val queued = realtime?.sendTracks(sequence++, tracks) == true
             latestLocalTrackCount = tracks.size
+            latestSentTrackCount = if (queued) tracks.size else 0
             lastTrackPublishAtMs = now
         }
     }
@@ -896,8 +926,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         detector?.close()
         detector = null
         latestLocalTrackCount = 0
+        latestSpatializedCount = 0
+        latestSentTrackCount = 0
         latestDetectionCount = 0
         latestInferenceMs = 0
+        lastAckAccepted = -1
+        lastAckSequence = -1L
+        lastAckAtMs = 0L
         if (::overlay.isInitialized) overlay.updateLocalBoxes(emptyList())
     }
 
@@ -1090,49 +1125,65 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val projected = remoteTracks.snapshot(now)
             .asSequence()
             .filter { track -> track.sourceId == "marker" || track.sourceId != localDeviceId }
-            .mapNotNull { track ->
+            .map { track ->
                 val world = PoseMath.transformPoint(worldFromSite, track.position)
-                val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight) ?: return@mapNotNull null
+                val cameraPoint = PoseMath.transformPoint(viewMatrix, world)
+                val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                val direction = OffscreenIndicatorMath.direction(cameraPoint)
+                val onScreen = screen?.onScreen == true
                 ProjectedTrack(
                     key = track.key,
                     label = track.label,
                     confidence = track.confidence,
-                    x = screen.x,
-                    y = screen.y,
-                    onScreen = screen.onScreen,
+                    x = screen?.x ?: viewportWidth * 0.5f,
+                    y = screen?.y ?: viewportHeight * 0.5f,
+                    onScreen = onScreen,
                     distanceMeters = PoseMath.distance(cameraSite, track.position),
                     uncertaintyMeters = track.uncertaintyMeters,
                     ageMs = (now - track.serverReceivedAtMs).coerceAtLeast(0L),
                     sourceId = track.sourceId,
-                    bounds = projectTrackBounds(track, worldFromSite)
+                    cuboid = if (onScreen && track.sourceId != "marker") projectTrackCuboid(track, worldFromSite) else null,
+                    offscreenDx = direction.dx,
+                    offscreenDy = direction.dy
                 )
             }
             .toList()
         overlay.updateTracks(projected)
     }
 
-    private fun projectTrackBounds(track: SpatialTrack, worldFromSite: FloatArray): RectF? {
-        val (heightMeters, aspect) = when (track.label.lowercase()) {
-            "person" -> 1.72f to 0.40f
-            "car" -> 1.50f to 1.85f
-            "bird" -> 0.45f to 1.05f
-            "dog" -> 0.70f to 1.25f
-            "cat" -> 0.42f to 1.05f
-            else -> 0.65f to 0.85f
+    private fun projectTrackCuboid(track: SpatialTrack, worldFromSite: FloatArray): ProjectedCuboid? {
+        if (track.extentMeters.size < 3) return null
+        val width = track.extentMeters[0].coerceIn(0.05f, 12f)
+        val height = track.extentMeters[1].coerceIn(0.05f, 8f)
+        val depth = track.extentMeters[2].coerceIn(0.05f, 15f)
+        val halfWidth = width * 0.5f
+        val halfDepth = depth * 0.5f
+        val cosYaw = kotlin.math.cos(track.yawRadians)
+        val sinYaw = kotlin.math.sin(track.yawRadians)
+        val local = arrayOf(
+            floatArrayOf(-halfWidth, 0f, -halfDepth),
+            floatArrayOf(halfWidth, 0f, -halfDepth),
+            floatArrayOf(halfWidth, 0f, halfDepth),
+            floatArrayOf(-halfWidth, 0f, halfDepth),
+            floatArrayOf(-halfWidth, height, -halfDepth),
+            floatArrayOf(halfWidth, height, -halfDepth),
+            floatArrayOf(halfWidth, height, halfDepth),
+            floatArrayOf(-halfWidth, height, halfDepth)
+        )
+        val points = local.map { corner ->
+            val rotatedX = corner[0] * cosYaw - corner[2] * sinYaw
+            val rotatedZ = corner[0] * sinYaw + corner[2] * cosYaw
+            val site = floatArrayOf(
+                track.position[0] + rotatedX,
+                track.position[1] + corner[1],
+                track.position[2] + rotatedZ
+            )
+            val world = PoseMath.transformPoint(worldFromSite, site)
+            val projected = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                ?: return null
+            floatArrayOf(projected.x, projected.y)
         }
-        val topSite = floatArrayOf(track.position[0], track.position[1] + heightMeters, track.position[2])
-        val feetWorld = PoseMath.transformPoint(worldFromSite, track.position)
-        val topWorld = PoseMath.transformPoint(worldFromSite, topSite)
-        val feet = PoseMath.projectToScreen(viewProjectionMatrix, feetWorld, viewportWidth, viewportHeight) ?: return null
-        val top = PoseMath.projectToScreen(viewProjectionMatrix, topWorld, viewportWidth, viewportHeight) ?: return null
-        val rawHeight = kotlin.math.abs(feet.y - top.y)
-        if (!rawHeight.isFinite() || rawHeight < 1f) return null
-        val pixelHeight = rawHeight.coerceIn(14f, viewportHeight * 0.92f)
-        val pixelWidth = (pixelHeight * aspect).coerceIn(12f, viewportWidth * 0.92f)
-        val centerX = (feet.x + top.x) * 0.5f
-        val topY = minOf(feet.y, top.y)
-        val bottomY = maxOf(feet.y, top.y)
-        return RectF(centerX - pixelWidth / 2f, topY, centerX + pixelWidth / 2f, bottomY)
+        return ProjectedCuboid(points)
     }
 
     private fun publishClientPose(frame: Frame, siteFromWorld: FloatArray) {
@@ -1183,7 +1234,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         val resolver = localizationDetail.ifBlank { "resolving saved Cloud Anchors" }
                         "Detector active · $latestDetectionCount visible · $bufferedRemoteTracks remote buffered · $room · $resolver"
                     } else {
-                        "$latestDetectionCount detected · $latestLocalTrackCount spatial track(s) · sharing automatically"
+                        val ack = when {
+                            !realtimeConnected -> "server offline"
+                            lastAckAtMs > 0L && now - lastAckAtMs < 2_500L -> "server ✓$lastAckAccepted"
+                            latestSentTrackCount > 0 -> "server awaiting ack"
+                            else -> "server connected"
+                        }
+                        "$latestDetectionCount detected · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack"
                     }
                     ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks"
                 }
@@ -1234,6 +1291,17 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     }
 
     override fun onTracksExpired(trackKeys: List<String>) = remoteTracks.remove(trackKeys)
+
+    override fun onTrackAck(sequence: Long, accepted: Int, expired: Int, serverTimeMs: Long) {
+        if (sequence < lastAckSequence) return
+        lastAckSequence = sequence
+        lastAckAccepted = accepted
+        lastAckAtMs = System.currentTimeMillis()
+        spatialApp.logger.debug(
+            "Track batch acknowledged",
+            mapOf("mapId" to mapId, "sequence" to sequence, "accepted" to accepted, "expired" to expired)
+        )
+    }
 
     override fun onManualMarker(id: String, label: String, position: FloatArray, expiresAtMs: Long) {
         remoteTracks.addMarker(id, label, position, expiresAtMs)

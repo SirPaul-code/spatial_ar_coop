@@ -45,6 +45,7 @@ class CloudAnchorCoordinator(
     val hasReference: Boolean get() = reference.get() != null
     val isHosting: Boolean get() = hosting.get()
     val isResolving: Boolean get() = resolving.get()
+    val currentReferenceId: String? get() = reference.get()?.definition?.id
 
     /**
      * Refresh from the live anchor while it is tracking. After a successful resolve, retain the
@@ -82,10 +83,6 @@ class CloudAnchorCoordinator(
             return
         }
         if (hasReference) return
-
-        // ARCore resolution is itself an asynchronous visual feature-matching operation. Keep
-        // a pending batch alive until ARCore returns a real result; cancelling after a short app
-        // timer can repeatedly throw away an otherwise healthy resolve just before it matches.
         if (resolving.get() || !resolving.compareAndSet(false, true)) return
 
         val candidates = map.anchors
@@ -102,81 +99,110 @@ class CloudAnchorCoordinator(
         }
 
         val generation = resolveGeneration.incrementAndGet()
-        val remaining = AtomicInteger(candidates.size)
-        val failures = CopyOnWriteArrayList<String>()
-        onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")
+        val root = map.rootAnchorId?.let { id -> candidates.firstOrNull { it.id == id } }
+        val fallbacks = if (root == null) candidates else candidates.filterNot { it.id == root.id }
         logger.info(
             "Cloud Anchor resolve batch started",
             mapOf("mapId" to mapId, "anchors" to candidates.size, "rootAnchorId" to map.rootAnchorId)
         )
 
-        candidates.forEachIndexed { index, definition ->
-            logger.info(
-                "Resolving Cloud Anchor",
-                mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to (index + 1), "total" to candidates.size)
-            )
-            var pending: ResolveCloudAnchorFuture? = null
-            val future = session.resolveCloudAnchorAsync(definition.cloudAnchorId) { anchor, state ->
-                pending?.let(resolveFutures::remove)
-                if (generation != resolveGeneration.get() || reference.get() != null) {
-                    anchor?.detach()
-                    return@resolveCloudAnchorAsync
-                }
-
-                if (state == CloudAnchorState.SUCCESS && anchor != null) {
-                    if (reference.compareAndSet(null, Reference(anchor, definition))) {
-                        ownedAnchors += anchor
-                        lastWorldFromSite.set(
-                            PoseMath.multiply(
-                                PoseMath.poseToMatrix(anchor.pose),
-                                PoseMath.rigidInverse(definition.siteFromAnchor)
-                            )
-                        )
-                        resolving.set(false)
-                        // Invalidate/cancel every other candidate from this batch. First valid
-                        // shared reference wins; all remaining callbacks become stale by generation.
-                        resolveGeneration.incrementAndGet()
-                        val others = resolveFutures.toList()
-                        resolveFutures.clear()
-                        others.filter { it !== pending }.forEach { runCatching { it.cancel() } }
-                        logger.info(
-                            "Cloud Anchor resolved",
-                            mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to (index + 1), "total" to candidates.size)
-                        )
-                        onState("Localized · matched saved anchor ${index + 1}/${candidates.size}")
-                    } else {
-                        anchor.detach()
-                    }
-                    return@resolveCloudAnchorAsync
-                }
-
-                anchor?.detach()
-                val left = remaining.decrementAndGet()
-                failures += "${definition.id.takeLast(8)}=${state.name}"
+        if (root != null) {
+            onState("Trying the map root Cloud Anchor first · move slowly and look around")
+            resolveCandidate(root, generation, 1, candidates.size) { state ->
+                if (generation != resolveGeneration.get() || reference.get() != null) return@resolveCandidate
                 logger.warn(
-                    "Cloud Anchor resolve failed",
-                    mapOf(
-                        "mapId" to mapId,
-                        "anchorId" to definition.id,
-                        "candidate" to (index + 1),
-                        "total" to candidates.size,
-                        "state" to state.name,
-                        "remaining" to left
-                    )
+                    "Root Cloud Anchor resolve failed; starting fallbacks",
+                    mapOf("mapId" to mapId, "anchorId" to root.id, "state" to state.name, "fallbacks" to fallbacks.size)
                 )
-                if (left > 0 && generation == resolveGeneration.get() && reference.get() == null) {
-                    onState("Anchor ${index + 1}/${candidates.size}: ${state.name} · trying $left more")
-                }
-                if (left <= 0 && generation == resolveGeneration.get() && reference.get() == null) {
+                if (fallbacks.isEmpty()) {
                     resolving.set(false)
-                    resolveFutures.clear()
-                    val summary = failures.joinToString(", ").take(220)
-                    onState("Localization failed: $summary · retrying automatically")
+                    onState("Localization failed: root ${root.id.takeLast(8)}=${state.name} · retrying automatically")
+                } else {
+                    onState("Root anchor returned ${state.name} · trying ${fallbacks.size} backup anchor(s)")
+                    resolveFallbacks(fallbacks, generation, candidates.size)
                 }
             }
-            pending = future
-            resolveFutures += future
+        } else {
+            onState("Trying ${fallbacks.size} saved Cloud Anchors · move slowly and look around")
+            resolveFallbacks(fallbacks, generation, candidates.size)
         }
+    }
+
+    private fun resolveFallbacks(candidates: List<AnchorDefinition>, generation: Int, total: Int) {
+        if (candidates.isEmpty()) {
+            resolving.set(false)
+            return
+        }
+        val remaining = AtomicInteger(candidates.size)
+        val failures = CopyOnWriteArrayList<String>()
+        candidates.forEachIndexed { fallbackIndex, definition ->
+            resolveCandidate(definition, generation, fallbackIndex + 1, total) { state ->
+                if (generation != resolveGeneration.get() || reference.get() != null) return@resolveCandidate
+                failures += "${definition.id.takeLast(8)}=${state.name}"
+                val left = remaining.decrementAndGet()
+                if (left > 0) {
+                    onState("Backup anchor ${fallbackIndex + 1}/${candidates.size}: ${state.name} · trying $left more")
+                } else {
+                    resolving.set(false)
+                    resolveFutures.clear()
+                    onState("Localization failed: ${failures.joinToString(", ").take(220)} · retrying automatically")
+                }
+            }
+        }
+    }
+
+    private fun resolveCandidate(
+        definition: AnchorDefinition,
+        generation: Int,
+        index: Int,
+        total: Int,
+        onFailure: (CloudAnchorState) -> Unit
+    ) {
+        logger.info(
+            "Resolving Cloud Anchor",
+            mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to index, "total" to total)
+        )
+        var pending: ResolveCloudAnchorFuture? = null
+        val future = session.resolveCloudAnchorAsync(definition.cloudAnchorId) { anchor, state ->
+            pending?.let(resolveFutures::remove)
+            if (generation != resolveGeneration.get() || reference.get() != null) {
+                anchor?.detach()
+                return@resolveCloudAnchorAsync
+            }
+            if (state == CloudAnchorState.SUCCESS && anchor != null) {
+                if (reference.compareAndSet(null, Reference(anchor, definition))) {
+                    ownedAnchors += anchor
+                    lastWorldFromSite.set(
+                        PoseMath.multiply(
+                            PoseMath.poseToMatrix(anchor.pose),
+                            PoseMath.rigidInverse(definition.siteFromAnchor)
+                        )
+                    )
+                    resolving.set(false)
+                    resolveGeneration.incrementAndGet()
+                    val others = resolveFutures.toList()
+                    resolveFutures.clear()
+                    others.filter { it !== pending }.forEach { runCatching { it.cancel() } }
+                    logger.info(
+                        "Cloud Anchor resolved",
+                        mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to index, "total" to total)
+                    )
+                    onState("Localized · reference ${definition.id.takeLast(8)}")
+                } else {
+                    anchor.detach()
+                }
+                return@resolveCloudAnchorAsync
+            }
+
+            anchor?.detach()
+            logger.warn(
+                "Cloud Anchor resolve failed",
+                mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to index, "total" to total, "state" to state.name)
+            )
+            onFailure(state)
+        }
+        pending = future
+        resolveFutures += future
     }
 
     private fun cancelResolveBatch() {
