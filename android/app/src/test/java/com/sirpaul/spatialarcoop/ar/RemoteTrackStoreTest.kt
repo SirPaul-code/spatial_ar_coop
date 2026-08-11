@@ -18,14 +18,23 @@ class RemoteTrackStoreTest {
         serverReceivedAtMs = now
     )
 
-    @Test fun replacingOneSourceDoesNotTouchOtherParticipants() {
+    @Test fun localSourceIsClearedWithoutTouchingRemoteParticipants() {
         val now = 100_000L
         val store = RemoteTrackStore()
-        store.update(listOf(track("phone-b", "remote", 4f, now)))
-        store.replaceSource("phone-a", listOf(track("phone-a", "one", 0f, now), track("phone-a", "two", 1f, now)))
-        assertEquals(setOf("phone-a:one", "phone-a:two", "phone-b:remote"), store.snapshot(now).map { it.key }.toSet())
+        store.update(
+            listOf(
+                track("phone-a", "old-local", 0f, now),
+                track("phone-b", "remote", 4f, now)
+            )
+        )
+
+        store.replaceSource(
+            "phone-a",
+            listOf(track("phone-a", "one", 0f, now), track("phone-a", "two", 1f, now))
+        )
+        assertEquals(setOf("phone-b:remote"), store.snapshot(now).map { it.key }.toSet())
 
         store.replaceSource("phone-a", listOf(track("phone-a", "one", 0.2f, now + 100)))
-        assertEquals(setOf("phone-a:one", "phone-b:remote"), store.snapshot(now + 100).map { it.key }.toSet())
+        assertEquals(setOf("phone-b:remote"), store.snapshot(now + 100).map { it.key }.toSet())
     }
 }
