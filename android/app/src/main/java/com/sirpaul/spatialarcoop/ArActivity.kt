@@ -172,7 +172,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             ArMode.VIEWER -> "viewer"
             // Keep the proven wire protocol compatible: LIVE observes like every client and is
             // allowed to publish the same track messages as the legacy SENSOR role.
-            ArMode.LIVE -> "sensor"
+            ArMode.LIVE -> "participant"
         }
         realtime = RealtimeClient(
             serverUrl = map.serverUrl,
