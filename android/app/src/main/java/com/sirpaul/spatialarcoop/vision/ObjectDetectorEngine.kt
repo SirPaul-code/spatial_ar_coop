@@ -90,24 +90,29 @@ class ObjectDetectorEngine(
 
                 val candidates = suppressOverlaps(rawCandidates)
                 val tracked = temporalTracker.update(candidates, capturedAtMs)
-                val detections = tracked.map { detection ->
-                    val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
-                    Detection2D(
-                        label = detection.label,
-                        confidence = detection.confidence,
-                        rawBoundingBox = rawBox,
-                        rawBottomCenter = floatArrayOf(
-                            rawBox.centerX(),
-                            rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
-                        ),
-                        capturedAtMs = capturedAtMs,
-                        rawImageWidth = frame.width,
-                        rawImageHeight = frame.height,
-                        temporalId = detection.temporalId,
-                        temporallyConfirmed = detection.confirmed,
-                        captureGeometry = captureGeometry
-                    )
-                }
+                // One-frame hypotheses remain internal. The visible/local pipeline only receives an
+                // object after the image-space tracker has confirmed the same identity twice.
+                val detections = tracked.asSequence()
+                    .filter { it.confirmed }
+                    .map { detection ->
+                        val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
+                        Detection2D(
+                            label = detection.label,
+                            confidence = detection.confidence,
+                            rawBoundingBox = rawBox,
+                            rawBottomCenter = floatArrayOf(
+                                rawBox.centerX(),
+                                rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
+                            ),
+                            capturedAtMs = capturedAtMs,
+                            rawImageWidth = frame.width,
+                            rawImageHeight = frame.height,
+                            temporalId = detection.temporalId,
+                            temporallyConfirmed = true,
+                            captureGeometry = captureGeometry
+                        )
+                    }
+                    .toList()
                 onResult(detections, (System.nanoTime() - start) / 1_000_000L)
             } catch (error: Throwable) {
                 logger.error("Object detection failed", error)
