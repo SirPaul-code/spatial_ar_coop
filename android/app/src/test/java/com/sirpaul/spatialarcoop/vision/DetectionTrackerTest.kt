@@ -58,4 +58,26 @@ class DetectionTrackerTest {
         tracker.clear()
         assertTrue(tracker.current(t0 + 1).isEmpty())
     }
+
+    @Test fun sameImageTargetKeepsIdAcrossLargeDepthSpike() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 50_000L
+        fun person(z: Float, at: Long, box: FloatArray) = SpatialObservation("person", 0.82f, floatArrayOf(0f,0f,z), at, 0.8f, box)
+        val first = tracker.update(listOf(person(4f,t0,floatArrayOf(0.30f,0.15f,0.58f,0.92f))),t0).single()
+        val second = tracker.update(listOf(person(19f,t0+150,floatArrayOf(0.31f,0.16f,0.59f,0.93f))),t0+150).single()
+        assertEquals(first.key, second.key)
+        assertTrue(second.position[2] < 8f)
+    }
+
+    @Test fun visuallySeparatedSameClassTargetsRemainDistinct() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 60_000L
+        val left = SpatialObservation("bird",0.8f,floatArrayOf(-0.5f,0f,3f),t0,0.5f,floatArrayOf(0.10f,0.45f,0.28f,0.75f))
+        val right = SpatialObservation("bird",0.8f,floatArrayOf(0.5f,0f,3f),t0,0.5f,floatArrayOf(0.70f,0.45f,0.88f,0.75f))
+        val first = tracker.update(listOf(left,right),t0)
+        val next = tracker.update(listOf(left.copy(observedAtMs=t0+150),right.copy(observedAtMs=t0+150)),t0+150)
+        assertEquals(2, next.size)
+        assertEquals(first.map { it.key }.toSet(), next.map { it.key }.toSet())
+    }
+
 }

@@ -121,11 +121,12 @@ class RealtimeClient(
         when (json.optString("type")) {
             "welcome" -> {
                 val tracks = parseTracks(json.optJSONArray("tracks"), null)
+                    .filterNot { it.sourceId == clientId }
                 listener.onTracks(tracks, replaceSnapshot = true)
             }
             "track_batch" -> {
                 val source = json.optString("sourceId", "unknown")
-                listener.onTracks(parseTracks(json.optJSONArray("tracks"), source))
+                if (source != clientId) listener.onTracks(parseTracks(json.optJSONArray("tracks"), source))
             }
             "tracks_expired" -> {
                 val array = json.optJSONArray("trackKeys") ?: JSONArray()

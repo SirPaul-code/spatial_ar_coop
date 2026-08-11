@@ -829,7 +829,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         confidence = detection.confidence,
                         position = estimate.sitePosition,
                         observedAtMs = detection.capturedAtMs,
-                        uncertaintyMeters = estimate.uncertaintyMeters
+                        uncertaintyMeters = estimate.uncertaintyMeters,
+                        imageBox = floatArrayOf(
+                            detection.rawBoundingBox.left / detection.rawImageWidth.coerceAtLeast(1),
+                            detection.rawBoundingBox.top / detection.rawImageHeight.coerceAtLeast(1),
+                            detection.rawBoundingBox.right / detection.rawImageWidth.coerceAtLeast(1),
+                            detection.rawBoundingBox.bottom / detection.rawImageHeight.coerceAtLeast(1)
+                        )
                     )
                 }
             }
@@ -837,7 +843,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             // The reporting phone renders the exact same stable spatial tracker state it publishes.
             // Replace only this source so locally-expired birds disappear immediately while remote
             // participants remain untouched until their own batch/expiry events arrive.
-            remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
             realtime?.sendTracks(sequence++, tracks)
             val now = System.currentTimeMillis()
             lastTrackPublishAtMs = now
@@ -856,7 +861,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         // published as an empty complete-source snapshot instead of waiting for server TTL.
         if (now - lastTrackPublishAtMs >= TRACK_PUBLISH_INTERVAL_MS) {
             val tracks = localTracker.current(now)
-            remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
             realtime?.sendTracks(sequence++, tracks)
             latestLocalTrackCount = tracks.size
             lastTrackPublishAtMs = now
@@ -1226,7 +1230,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             networkText.text = when {
                 connected && mode == ArMode.MAP -> "Server connected · map sync is automatic"
                 connected && mode == ArMode.LIVE -> "Server connected · automatic object sharing active"
-                connected -> "Server connected · live sharing active"
+                connected -> "Server connected · room joined"
                 mode == ArMode.MAP -> "Server offline · scan is saved locally · upload retry automatic"
                 else -> "Server reconnecting · shared tracks temporarily unavailable"
             }

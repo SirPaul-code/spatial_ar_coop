@@ -68,13 +68,10 @@ class CloudAnchorCoordinator(
 
         val now = System.currentTimeMillis()
         if (resolving.get()) {
-            if (now - resolveStartedAtMs <= RESOLVE_BATCH_TIMEOUT_MS) return
-            logger.warn(
-                "Cloud Anchor resolve batch timed out",
-                mapOf("mapId" to mapId, "elapsedMs" to (now - resolveStartedAtMs), "pending" to resolveFutures.size)
-            )
-            cancelResolveBatch()
-            onState("Saved-anchor lookup timed out · retrying automatically")
+            if (now - resolveStartedAtMs > RESOLVE_SLOW_NOTICE_MS) {
+                onState("Still matching saved Cloud Anchors · keep moving slowly around the mapped area")
+            }
+            return
         }
         if (!resolving.compareAndSet(false, true)) return
 
@@ -94,6 +91,7 @@ class CloudAnchorCoordinator(
         resolveStartedAtMs = now
         val generation = resolveGeneration.incrementAndGet()
         val remaining = AtomicInteger(candidates.size)
+        val failures = CopyOnWriteArrayList<String>()
         onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")
         logger.info(
             "Cloud Anchor resolve batch started",
@@ -136,6 +134,7 @@ class CloudAnchorCoordinator(
                 }
 
                 anchor?.detach()
+                failures += "${definition.id}:${state.name}"
                 val left = remaining.decrementAndGet()
                 logger.warn(
                     "Cloud Anchor resolve failed",
@@ -152,7 +151,8 @@ class CloudAnchorCoordinator(
                     resolving.set(false)
                     resolveStartedAtMs = 0L
                     resolveFutures.clear()
-                    onState("No saved anchor matched yet · retrying automatically")
+                    val summary = failures.joinToString(", ").take(420)
+                    onState("Localization failed · $summary · retrying automatically")
                 }
             }
             pending = future
@@ -346,6 +346,6 @@ class CloudAnchorCoordinator(
         private const val AUTO_HOST_COOLDOWN_MS = 8_000L
         private const val RETRY_RADIUS_METERS = 4f
         private const val MAX_CONCURRENT_RESOLVES = 4
-        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L
+        private const val RESOLVE_SLOW_NOTICE_MS = 25_000L
     }
 }

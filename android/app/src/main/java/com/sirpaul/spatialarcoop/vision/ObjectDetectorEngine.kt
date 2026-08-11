@@ -57,7 +57,7 @@ class ObjectDetectorEngine(
                     // Chickens are represented by EfficientDet/COCO as "bird". Small birds are
                     // substantially harder than people/cars, so keep the user's normal threshold
                     // for other classes while allowing a modestly lower bird floor for recall.
-                    val effectiveThreshold = minOf(threshold, classScoreThreshold(label))
+                    val effectiveThreshold = if (label == "bird") minOf(threshold, BIRD_SCORE_THRESHOLD) else threshold
                     if (category.score() < effectiveThreshold) return@mapNotNull null
                     val box = detection.boundingBox()
                     val bottomCenterRotated = floatArrayOf(box.centerX(), box.bottom - box.height() * 0.04f)
@@ -116,7 +116,7 @@ class ObjectDetectorEngine(
                 mapOf(
                     "threshold" to threshold,
                     "birdThreshold" to minOf(threshold, BIRD_SCORE_THRESHOLD),
-                    "generalThreshold" to minOf(threshold, GENERAL_SCORE_THRESHOLD),
+                    "generalThreshold" to threshold,
                     "maxResults" to MAX_RESULTS,
                     "labels" to ALLOWED_LABELS.joinToString()
                 )
@@ -134,16 +134,10 @@ class ObjectDetectorEngine(
         executor.shutdown()
     }
 
-    private fun classScoreThreshold(label: String): Float = when (label) {
-        "bird" -> BIRD_SCORE_THRESHOLD
-        else -> GENERAL_SCORE_THRESHOLD
-    }
-
     companion object {
         private val ALLOWED_LABELS = setOf("person", "car", "bird", "dog", "cat")
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.25f
-        private const val BIRD_SCORE_THRESHOLD = 0.25f
-        private const val GENERAL_SCORE_THRESHOLD = 0.35f
+        private const val BIRD_SCORE_THRESHOLD = 0.30f
         private const val MAX_RESULTS = 48
     }
 }
