@@ -1,5 +1,11 @@
 # Android release notes
 
+## 1.0.4
+
+- A reporting phone no longer renders its own WebSocket/spatial-track copy on top of the precise local detector bounding box; shared amber spatial boxes are reserved for other participants and shared markers.
+- When a mapped ground plane is available, moving-object 3D position now uses the detector bbox bottom-center ground contact before Depth/plane hits. This prevents background geometry behind a person/car from producing distant ghost tracks and repeated tracker IDs.
+- Keeps the 1.0.3 Cloud Anchor resolver, detector NMS, two-hit track confirmation, tighter track expiry, and per-anchor localization diagnostics intact.
+
 ## 1.0.3
 
 - Cloud Anchor resolve futures are no longer cancelled by the app after 12 seconds; pending ARCore visual matching is allowed to complete and real per-anchor failure states are surfaced before retry.
