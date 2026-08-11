@@ -7,6 +7,7 @@
 - Monocular fallback projects the detector bottom-center and uses bbox height consistently, reducing depth jumps.
 - Person/car/dog/cat use a stricter field threshold while `bird` keeps lower recall tuning for chickens; same-class overlap NMS removes duplicate raw detections.
 - Spatial tracks require two observations before publication and expire faster, reducing one-frame IDs and stacked ghost tracks.
+- Field validation should separately verify WebSocket room membership and Cloud Anchor localization: a participant can be connected and buffering tracks while it is still unable to render them spatially.
 
 ## 1.0.2
 
