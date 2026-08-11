@@ -114,11 +114,13 @@ class ObjectDetectorEngine(
 
                     val detections = confirmed.map { detection ->
                         val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
+                        val pose = poseByTemporalId[detection.temporalId].orEmpty()
+                        val contact = if (detection.label == "person") poseGroundContact(pose) else null
                         Detection2D(
                             label = detection.label,
                             confidence = detection.confidence,
                             rawBoundingBox = rawBox,
-                            rawBottomCenter = floatArrayOf(
+                            rawBottomCenter = contact ?: floatArrayOf(
                                 rawBox.centerX(),
                                 rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
                             ),
@@ -128,7 +130,7 @@ class ObjectDetectorEngine(
                             temporalId = detection.temporalId,
                             temporallyConfirmed = true,
                             captureGeometry = captureGeometry,
-                            poseLandmarks = poseByTemporalId[detection.temporalId].orEmpty()
+                            poseLandmarks = pose
                         )
                     }
                     onResult(detections, (System.nanoTime() - start) / 1_000_000L)
@@ -251,6 +253,15 @@ class ObjectDetectorEngine(
         }
     }
 
+
+    private fun poseGroundContact(pose: List<PoseLandmark2D>): FloatArray? {
+        val feet = pose.filter { it.index in POSE_GROUND_INDICES && it.confidence >= POSE_GROUND_CONFIDENCE }
+        if (feet.size < 2) return null
+        val sortedX = feet.map { it.x }.sorted()
+        val sortedY = feet.map { it.y }.sorted()
+        return floatArrayOf(sortedX[sortedX.size / 2], sortedY[sortedY.size / 2])
+    }
+
     private fun suppressOverlaps(values: List<DetectionCandidate2D>): List<DetectionCandidate2D> {
         val kept = mutableListOf<DetectionCandidate2D>()
         values.sortedByDescending { it.confidence }.forEach { candidate ->
@@ -344,6 +355,7 @@ class ObjectDetectorEngine(
         private val ALLOWED_LABELS = linkedSetOf("person", "car", "bird", "dog", "cat")
         private val CONTAINMENT_SUPPRESSED_LABELS = setOf("person", "car")
         private val SHARED_POSE_INDICES = setOf(0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 31, 32)
+        private val POSE_GROUND_INDICES = setOf(27, 28, 31, 32)
         private const val CONTAINMENT_THRESHOLD = 0.72f
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
         private const val BOTTOM_CENTER_INSET = 0.04f
@@ -353,6 +365,7 @@ class ObjectDetectorEngine(
         private const val POSE_PRESENCE_CONFIDENCE = 0.45f
         private const val POSE_TRACKING_CONFIDENCE = 0.50f
         private const val POSE_BOX_CONFIDENCE = 0.28f
+        private const val POSE_GROUND_CONFIDENCE = 0.42f
         private const val MIN_POSE_BOX_JOINTS = 8
         private const val MIN_POSE_ASSOCIATION_SCORE = 0.12f
     }
