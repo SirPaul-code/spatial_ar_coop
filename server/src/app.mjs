@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
+import QRCode from 'qrcode';
 import { loadConfig } from './config.mjs';
 import { JsonLogger } from './logger.mjs';
 import { MapStore } from './persistence.mjs';
@@ -114,9 +115,26 @@ async function handleHttp({ request, response, config, logger, store, hub, ident
       const map = store.getMap(rotateMatch[1]);
       if (!map) return sendError(response, 404, 'MAP_NOT_FOUND', 'Map not found');
       identity.rotateMapKey(map.id);
+      hub.disconnectMap(map.id);
       return sendJson(response, 200, {
         map: withServerId(map, identity),
         invite: identity.invite(map.id, config.publicBaseUrl)
+      });
+    }
+
+    const inviteQrMatch = url.pathname.match(/^\/api\/v1\/maps\/([a-zA-Z0-9._-]+)\/invite-qr\.svg$/);
+    if (inviteQrMatch && request.method === 'GET') {
+      const map = authorizeMap({ mapId: inviteQrMatch[1], request, url, store, identity });
+      const invite = identity.invite(map.id, config.publicBaseUrl);
+      const svg = await QRCode.toString(invite.deepLink, {
+        type: 'svg',
+        errorCorrectionLevel: 'M',
+        margin: 2,
+        width: 360,
+        color: { dark: '#17181A', light: '#F2EFE8' }
+      });
+      return sendText(response, 200, svg, 'image/svg+xml; charset=utf-8', {
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'"
       });
     }
 
@@ -162,6 +180,7 @@ async function handleHttp({ request, response, config, logger, store, hub, ident
       const [, mapId, child] = match;
       if (!child && request.method === 'DELETE') {
         if (!isAdmin) return unauthorized(response, 'ADMIN_UNAUTHORIZED', 'Admin token required to delete a map');
+        hub.disconnectMap(mapId, 4004, 'map deleted');
         const deleted = store.deleteMap(mapId);
         identity.deleteMapKey(mapId);
         return sendJson(response, 200, deleted);
@@ -276,8 +295,15 @@ function setCommonHeaders(response) {
 }
 
 function unauthorized(response, code, message) { return sendError(response, 401, code, message); }
-function sendJson(response, status, value) { const text = JSON.stringify(value); response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) }); response.end(text); }
+function sendJson(response, status, value) {
+  const text = JSON.stringify(value);
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) });
+  response.end(text);
+}
 function sendError(response, status, code, message) { return sendJson(response, status, { error: { code, message } }); }
-function sendText(response, status, text, type) { response.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text) }); response.end(text); }
+function sendText(response, status, text, type, headers = {}) {
+  response.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text), ...headers });
+  response.end(text);
+}
 function sendBuffer(response, status, body, headers = {}) { response.writeHead(status, headers); response.end(body); }
 function sendEmpty(response, status, headers = {}) { response.writeHead(status, headers); response.end(); }
