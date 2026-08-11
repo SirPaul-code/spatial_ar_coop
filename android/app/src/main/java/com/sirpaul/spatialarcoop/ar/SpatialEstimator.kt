@@ -7,6 +7,7 @@ import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import com.sirpaul.spatialarcoop.vision.CaptureGeometry
 import com.sirpaul.spatialarcoop.vision.Detection2D
+import com.sirpaul.spatialarcoop.vision.SpatialAssociationHints
 
 
 data class EstimatedPosition(
@@ -38,7 +39,7 @@ object SpatialEstimator {
             if (ground != null) {
                 if (!hasPlausibleApparentScale(detection, ground, worldFromSite, geometry)) return null
                 return EstimatedPosition(
-                    sitePosition = ground,
+                    sitePosition = SpatialAssociationHints.attach(ground, detection.temporalId),
                     uncertaintyMeters = if (detection.captureGeometry != null) 0.28f else 0.40f,
                     method = if (detection.captureGeometry != null) "ground-capture" else "ground-current"
                 )
@@ -71,7 +72,11 @@ object SpatialEstimator {
             is DepthPoint -> 0.68f to "depth-fallback"
             else -> 0.80f to "hit-fallback"
         }
-        return EstimatedPosition(site, uncertainty, method)
+        return EstimatedPosition(
+            SpatialAssociationHints.attach(site, detection.temporalId),
+            uncertainty,
+            method
+        )
     }
 
     fun centerGroundPoint(frame: Frame, worldFromSite: FloatArray, groundY: Float?): FloatArray? {
