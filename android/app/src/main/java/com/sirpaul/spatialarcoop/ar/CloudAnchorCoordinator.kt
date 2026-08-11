@@ -1,5 +1,7 @@
 package com.sirpaul.spatialarcoop.ar
 
+import android.os.Handler
+import android.os.Looper
 import com.google.ar.core.Anchor
 import com.google.ar.core.Anchor.CloudAnchorState
 import com.google.ar.core.Session.FeatureMapQuality
@@ -33,6 +35,7 @@ class CloudAnchorCoordinator(
 
     private val reference = AtomicReference<Reference?>(null)
     private val lastWorldFromSite = AtomicReference<FloatArray?>(null)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val hosting = AtomicBoolean(false)
     private val resolving = AtomicBoolean(false)
     private val resolveGeneration = AtomicInteger(0)
@@ -101,30 +104,52 @@ class CloudAnchorCoordinator(
         val generation = resolveGeneration.incrementAndGet()
         val root = map.rootAnchorId?.let { id -> candidates.firstOrNull { it.id == id } }
         val fallbacks = if (root == null) candidates else candidates.filterNot { it.id == root.id }
+        val fallbackStarted = AtomicBoolean(false)
+        fun startFallbacks(detail: String) {
+            if (generation != resolveGeneration.get() || reference.get() != null || fallbacks.isEmpty()) return
+            if (!fallbackStarted.compareAndSet(false, true)) return
+            logger.info(
+                "Cloud Anchor fallback resolves started",
+                mapOf("mapId" to mapId, "fallbacks" to fallbacks.size, "detail" to detail)
+            )
+            onState(detail)
+            resolveFallbacks(fallbacks, generation, candidates.size)
+        }
+
         logger.info(
             "Cloud Anchor resolve batch started",
             mapOf("mapId" to mapId, "anchors" to candidates.size, "rootAnchorId" to map.rootAnchorId)
         )
 
         if (root != null) {
-            onState("Trying the map root Cloud Anchor first · move slowly and look around")
+            onState("Trying map root ${root.id.takeLast(8)} · backups will join if needed")
             resolveCandidate(root, generation, 1, candidates.size) { state ->
                 if (generation != resolveGeneration.get() || reference.get() != null) return@resolveCandidate
                 logger.warn(
-                    "Root Cloud Anchor resolve failed; starting fallbacks",
+                    "Root Cloud Anchor resolve failed",
                     mapOf("mapId" to mapId, "anchorId" to root.id, "state" to state.name, "fallbacks" to fallbacks.size)
                 )
                 if (fallbacks.isEmpty()) {
                     resolving.set(false)
                     onState("Localization failed: root ${root.id.takeLast(8)}=${state.name} · retrying automatically")
+                } else if (!fallbackStarted.get()) {
+                    startFallbacks("Root ${root.id.takeLast(8)} returned ${state.name} · trying backup anchors")
+                } else if (resolveFutures.isEmpty()) {
+                    resolving.set(false)
+                    onState("Localization failed: root and backup anchors did not resolve · retrying automatically")
                 } else {
-                    onState("Root anchor returned ${state.name} · trying ${fallbacks.size} backup anchor(s)")
-                    resolveFallbacks(fallbacks, generation, candidates.size)
+                    onState("Root returned ${state.name} · backup anchors still resolving")
                 }
             }
+            if (fallbacks.isNotEmpty()) {
+                mainHandler.postDelayed({
+                    if (generation == resolveGeneration.get() && reference.get() == null && resolving.get()) {
+                        startFallbacks("Root still resolving · trying ${fallbacks.size} backup anchor(s) in parallel")
+                    }
+                }, ROOT_PREFERENCE_GRACE_MS)
+            }
         } else {
-            onState("Trying ${fallbacks.size} saved Cloud Anchors · move slowly and look around")
-            resolveFallbacks(fallbacks, generation, candidates.size)
+            startFallbacks("Trying ${fallbacks.size} saved Cloud Anchors · move slowly and look around")
         }
     }
 
@@ -142,9 +167,12 @@ class CloudAnchorCoordinator(
                 val left = remaining.decrementAndGet()
                 if (left > 0) {
                     onState("Backup anchor ${fallbackIndex + 1}/${candidates.size}: ${state.name} · trying $left more")
+                } else if (resolveFutures.isNotEmpty()) {
+                    // A preferred root future may still be alive. Keep it running instead of
+                    // recreating the old cancel/retry localization loop.
+                    onState("Backup anchors failed · preferred root still resolving")
                 } else {
                     resolving.set(false)
-                    resolveFutures.clear()
                     onState("Localization failed: ${failures.joinToString(", ").take(220)} · retrying automatically")
                 }
             }
@@ -206,6 +234,7 @@ class CloudAnchorCoordinator(
     }
 
     private fun cancelResolveBatch() {
+        mainHandler.removeCallbacksAndMessages(null)
         resolveGeneration.incrementAndGet()
         resolveFutures.forEach { runCatching { it.cancel() } }
         resolveFutures.clear()
@@ -399,5 +428,6 @@ class CloudAnchorCoordinator(
         private const val AUTO_HOST_COOLDOWN_MS = 8_000L
         private const val RETRY_RADIUS_METERS = 4f
         private const val MAX_CONCURRENT_RESOLVES = 8
+        private const val ROOT_PREFERENCE_GRACE_MS = 8_000L
     }
 }

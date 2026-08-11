@@ -1208,7 +1208,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             track.sourceId != spatialApp.preferences.deviceId && track.sourceId != "marker"
         }
         val locationState = when {
-            worldFromSite != null -> "Localized"
+            worldFromSite != null -> cloudAnchors?.currentReferenceId
+                ?.let { "Localized · anchor ${it.takeLast(8)}" }
+                ?: "Localized · manual"
             cloudAnchors?.isResolving == true -> "Localizing…"
             else -> "Waiting for location"
         }
