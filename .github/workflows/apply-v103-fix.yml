@@ -1,0 +1,92 @@
+name: Apply v1.0.3 localization and tracker fix
+
+on:
+  push:
+    branches: [fix/localize-tracker-v103]
+    paths: ['.github/workflows/apply-v103-fix.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/localize-tracker-v103
+          fetch-depth: 0
+      - name: Apply deterministic source patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f"{path}: expected {count} occurrences, found {actual}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, count))
+
+          # Cloud Anchor resolution must not be cancelled by an arbitrary short app timeout.
+          cloud = 'android/app/src/main/java/com/sirpaul/spatialarcoop/ar/CloudAnchorCoordinator.kt'
+          replace(cloud, '    @Volatile private var resolveStartedAtMs = 0L\n', '')
+          replace(cloud, '''        val now = System.currentTimeMillis()\n        if (resolving.get()) {\n            if (now - resolveStartedAtMs <= RESOLVE_BATCH_TIMEOUT_MS) return\n            logger.warn(\n                "Cloud Anchor resolve batch timed out",\n                mapOf("mapId" to mapId, "elapsedMs" to (now - resolveStartedAtMs), "pending" to resolveFutures.size)\n            )\n            cancelResolveBatch()\n            onState("Saved-anchor lookup timed out · retrying automatically")\n        }\n        if (!resolving.compareAndSet(false, true)) return\n''', '''        // ARCore resolution is itself an asynchronous visual feature-matching operation. Keep\n        // a pending batch alive until ARCore returns a real result; cancelling after a short app\n        // timer can repeatedly throw away an otherwise healthy resolve just before it matches.\n        if (resolving.get() || !resolving.compareAndSet(false, true)) return\n''')
+          replace(cloud, '        resolveStartedAtMs = now\n', '')
+          replace(cloud, '        val remaining = AtomicInteger(candidates.size)\n', '        val remaining = AtomicInteger(candidates.size)\n        val failures = CopyOnWriteArrayList<String>()\n')
+          replace(cloud, '                        resolveStartedAtMs = 0L\n', '')
+          replace(cloud, '''                val left = remaining.decrementAndGet()\n                logger.warn(\n''', '''                val left = remaining.decrementAndGet()\n                failures += "${definition.id.takeLast(8)}=${state.name}"\n                logger.warn(\n''')
+          replace(cloud, '''                if (left <= 0 && generation == resolveGeneration.get() && reference.get() == null) {\n                    resolving.set(false)\n                    resolveStartedAtMs = 0L\n                    resolveFutures.clear()\n                    onState("No saved anchor matched yet · retrying automatically")\n                }\n''', '''                if (left > 0 && generation == resolveGeneration.get() && reference.get() == null) {\n                    onState("Anchor ${index + 1}/${candidates.size}: ${state.name} · trying $left more")\n                }\n                if (left <= 0 && generation == resolveGeneration.get() && reference.get() == null) {\n                    resolving.set(false)\n                    resolveFutures.clear()\n                    val summary = failures.joinToString(", ").take(220)\n                    onState("Localization failed: $summary · retrying automatically")\n                }\n''')
+          replace(cloud, '        resolveStartedAtMs = 0L\n', '')
+          replace(cloud, '        private const val MAX_CONCURRENT_RESOLVES = 4\n        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L\n', '        private const val MAX_CONCURRENT_RESOLVES = 8\n')
+
+          # Moving-object spatial estimation: generic feature points commonly belong to the static
+          # background behind a person/car. They are not valid object contact points.
+          estimator = 'android/app/src/main/java/com/sirpaul/spatialarcoop/ar/SpatialEstimator.kt'
+          replace(estimator, 'import com.google.ar.core.Point\n', '')
+          replace(estimator, '''                when (val trackable = hit.trackable) {\n                    is DepthPoint -> true\n                    is Plane -> trackable.trackingState == TrackingState.TRACKING && trackable.isPoseInPolygon(hit.hitPose)\n                    is Point -> trackable.trackingState == TrackingState.TRACKING\n                    else -> false\n                }\n''', '''                when (val trackable = hit.trackable) {\n                    is DepthPoint -> true\n                    is Plane -> trackable.trackingState == TrackingState.TRACKING &&\n                        trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&\n                        trackable.isPoseInPolygon(hit.hitPose)\n                    else -> false\n                }\n''')
+          replace(estimator, '        val pixelExtent = maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())\n', '        val pixelExtent = detection.rawBoundingBox.height()\n')
+          replace(estimator, '''        val centerX = detection.rawBoundingBox.centerX()\n        val centerY = detection.rawBoundingBox.centerY()\n''', '''        // Position represents the object contact point used by the shared tracker, so project\n        // the bbox bottom-center rather than its visual center.\n        val centerX = detection.rawBottomCenter[0]\n        val centerY = detection.rawBottomCenter[1]\n''')
+          replace(estimator, '''    private fun priority(trackable: Any): Int = when (trackable) {\n        is DepthPoint -> 0\n        is Plane -> 1\n        is Point -> 2\n        else -> 3\n    }\n''', '''    private fun priority(trackable: Any): Int = when (trackable) {\n        is DepthPoint -> 0\n        is Plane -> 1\n        else -> 2\n    }\n''')
+
+          # Detector: keep bird recall, but restore sane person/car thresholds and suppress overlaps.
+          detector = 'android/app/src/main/java/com/sirpaul/spatialarcoop/vision/ObjectDetectorEngine.kt'
+          replace(detector, '                val detections = result.detections().mapNotNull { detection ->\n', '                val candidates = result.detections().mapNotNull { detection ->\n')
+          replace(detector, '                    val effectiveThreshold = minOf(threshold, classScoreThreshold(label))\n', '                    val effectiveThreshold = if (label == "bird") minOf(threshold, BIRD_SCORE_THRESHOLD) else maxOf(threshold, GENERAL_SCORE_THRESHOLD)\n')
+          replace(detector, '''                    )\n                }\n                onResult(detections, (System.nanoTime() - start) / 1_000_000L)\n''', '''                    )\n                }\n                val detections = suppressOverlaps(candidates)\n                onResult(detections, (System.nanoTime() - start) / 1_000_000L)\n''')
+          replace(detector, '                    "generalThreshold" to minOf(threshold, GENERAL_SCORE_THRESHOLD),\n', '                    "generalThreshold" to maxOf(threshold, GENERAL_SCORE_THRESHOLD),\n')
+          replace(detector, '''    override fun close() {\n''', '''    private fun suppressOverlaps(values: List<Detection2D>): List<Detection2D> {\n        val kept = mutableListOf<Detection2D>()\n        values.sortedByDescending { it.confidence }.forEach { candidate ->\n            val duplicate = kept.any { existing ->\n                existing.label == candidate.label && intersectionOverUnion(existing.rawBoundingBox, candidate.rawBoundingBox) >= NMS_IOU_THRESHOLD\n            }\n            if (!duplicate) kept += candidate\n        }\n        return kept\n    }\n\n    private fun intersectionOverUnion(a: RectF, b: RectF): Float {\n        val left = maxOf(a.left, b.left)\n        val top = maxOf(a.top, b.top)\n        val right = minOf(a.right, b.right)\n        val bottom = minOf(a.bottom, b.bottom)\n        val intersection = (right - left).coerceAtLeast(0f) * (bottom - top).coerceAtLeast(0f)\n        if (intersection <= 0f) return 0f\n        val union = a.width() * a.height() + b.width() * b.height() - intersection\n        return if (union > 0f) intersection / union else 0f\n    }\n\n    override fun close() {\n''')
+          replace(detector, '        private const val GENERAL_SCORE_THRESHOLD = 0.35f\n        private const val MAX_RESULTS = 48\n', '        private const val GENERAL_SCORE_THRESHOLD = 0.45f\n        private const val NMS_IOU_THRESHOLD = 0.55f\n        private const val MAX_RESULTS = 24\n')
+
+          # Tracker: do not publish one-frame hypotheses and do not keep ghost IDs for 2.2 seconds.
+          tracker = 'android/app/src/main/java/com/sirpaul/spatialarcoop/vision/DetectionTracker.kt'
+          replace(tracker, '''        var uncertaintyMeters: Float,\n        var lastSeenAtMs: Long\n''', '''        var uncertaintyMeters: Float,\n        var lastSeenAtMs: Long,\n        var hitCount: Int\n''')
+          replace(tracker, '''                    uncertaintyMeters = observation.uncertaintyMeters,\n                    lastSeenAtMs = observation.observedAtMs\n''', '''                    uncertaintyMeters = observation.uncertaintyMeters,\n                    lastSeenAtMs = observation.observedAtMs,\n                    hitCount = 1\n''')
+          replace(tracker, '        return states.values.map { toPublicTrack(it, nowMs) }\n', '        return states.values.filter { it.hitCount >= CONFIRMATION_HITS }.map { toPublicTrack(it, nowMs) }\n', count=2)
+          replace(tracker, '        state.lastSeenAtMs = observation.observedAtMs\n', '        state.lastSeenAtMs = observation.observedAtMs\n        state.hitCount += 1\n')
+          replace(tracker, '''        return (base + ageSeconds * 1.1f + state.uncertaintyMeters + observation.uncertaintyMeters)\n            .coerceAtMost(4f)\n''', '''        val uncertaintyAllowance = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.6f)\n        return (base + ageSeconds * 0.8f + uncertaintyAllowance).coerceAtMost(2.8f)\n''')
+          replace(tracker, '        private const val MAX_PREDICTION_SECONDS = 1.5f\n        private const val TRACK_TIMEOUT_MS = 2_200L\n', '        private const val MAX_PREDICTION_SECONDS = 0.9f\n        private const val TRACK_TIMEOUT_MS = 1_200L\n        private const val CONFIRMATION_HITS = 2\n')
+
+          # Version marker for unambiguous device verification.
+          gradle = 'android/app/build.gradle.kts'
+          replace(gradle, '        versionCode = 3\n        versionName = "1.0.2"\n', '        versionCode = 4\n        versionName = "1.0.3"\n')
+
+          notes = Path('android/RELEASE_NOTES.md')
+          text = notes.read_text()
+          marker = '# Android release notes\n\n'
+          if not text.startswith(marker):
+              raise SystemExit('unexpected release notes header')
+          section = '''## 1.0.3\n\n- Cloud Anchor resolve futures are no longer cancelled by the app after 12 seconds; pending ARCore visual matching is allowed to complete and real per-anchor failure states are surfaced before retry.\n- Moving-object 3D estimation no longer accepts generic background feature-point hits. It uses Depth, upward-facing horizontal planes, saved-ground projection, then monocular class-size fallback.\n- Monocular fallback projects the detector bottom-center and uses bbox height consistently, reducing depth jumps.\n- Person/car/dog/cat use a stricter field threshold while `bird` keeps lower recall tuning for chickens; same-class overlap NMS removes duplicate raw detections.\n- Spatial tracks require two observations before publication and expire faster, reducing one-frame IDs and stacked ghost tracks.\n\n'''
+          notes.write_text(marker + section + text[len(marker):])
+          PY
+      - name: Commit clean source tree
+        shell: bash
+        run: |
+          git rm .github/workflows/apply-v103-fix.yml
+          git add android
+          git config user.name 'Pavol Duplinsky'
+          git config user.email '79102860+SirPaul-code@users.noreply.github.com'
+          git commit -m 'fix(android): stabilize localization and object tracks'
+          git push origin HEAD:fix/localize-tracker-v103
