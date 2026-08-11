@@ -15,16 +15,27 @@ class ArSessionStateMachineTest {
         assertTrue(machine.canRender())
     }
 
-    @Test fun failureHardGatesRendererAndCanRetry() {
+    @Test fun failureHardGatesRendererAndNeedsExplicitRetry() {
         val machine = ArSessionStateMachine()
         machine.beginStart()
         assertTrue(machine.fail())
         assertEquals(ArSessionState.FAILED, machine.current())
         assertFalse(machine.canRender())
         assertFalse(machine.fail())
-        assertTrue(machine.beginStart())
+        assertFalse(machine.beginStart())
+        assertTrue(machine.beginRetryStart())
         assertTrue(machine.markRunning())
         assertTrue(machine.canRender())
+    }
+
+    @Test fun explicitRetryOnlyWorksFromFailed() {
+        val machine = ArSessionStateMachine()
+        assertFalse(machine.beginRetryStart())
+        assertTrue(machine.beginStart())
+        assertFalse(machine.beginRetryStart())
+        assertTrue(machine.fail())
+        assertTrue(machine.beginRetryStart())
+        assertFalse(machine.beginRetryStart())
     }
 
     @Test fun pauseIsIdempotentAndStopsRendering() {
@@ -44,6 +55,7 @@ class ArSessionStateMachineTest {
         assertFalse(machine.beginClosing())
         assertFalse(machine.canRender())
         assertFalse(machine.beginStart())
+        assertFalse(machine.beginRetryStart())
         machine.markClosed()
         assertEquals(ArSessionState.CLOSED, machine.current())
         assertFalse(machine.beginClosing())
