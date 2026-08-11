@@ -1,5 +1,5 @@
 export const PROTOCOL_VERSION = 1;
-const ALLOWED_ROLES = new Set(['mapper', 'sensor', 'viewer', 'observer']);
+const ALLOWED_ROLES = new Set(['mapper', 'participant', 'sensor', 'viewer', 'observer']);
 const ALLOWED_LABEL = /^[a-zA-Z0-9_.:-]{1,48}$/;
 
 export class ProtocolError extends Error {
@@ -80,7 +80,7 @@ function normalizeClientPose(value) {
   const pose = value.pose;
   if (!pose || typeof pose !== 'object') throw new ProtocolError('INVALID_POSE', 'pose is required');
   return {
-    type: 'client_pose',
+    type,
     pose: {
       position: vector(pose.position, 3, 'pose.position'),
       rotation: vector(pose.rotation, 4, 'pose.rotation'),
