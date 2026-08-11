@@ -57,35 +57,41 @@ test('REST map API and WebSocket multi-track snapshots relay end to end', async 
     ({ socket: sensor } = await openWebSocket(`${wsBase}&clientId=sensor&role=participant`));
     ({ socket: viewer } = await openWebSocket(`${wsBase}&clientId=viewer&role=participant`));
 
+    const firstAckPromise = nextMessage(sensor, (value) => value.type === 'track_ack' && value.sequence === 1);
     const firstBatchPromise = nextMessage(viewer, (value) => value.type === 'track_batch' && value.sequence === 1);
     sensor.send(JSON.stringify({
       type: 'track_batch',
       sequence: 1,
       replaceSource: true,
       tracks: [
-        { id: 'bird-1', label: 'bird', confidence: .87, position: [1, 0, 2], velocity: [.1, 0, 0], observedAtMs: Date.now() },
-        { id: 'bird-2', label: 'bird', confidence: .81, position: [2, 0, 3], velocity: [0, 0, 0], observedAtMs: Date.now() }
+        { id: 'bird-1', label: 'bird', confidence: .87, position: [1, 0, 2], velocity: [.1, 0, 0], extentMeters: [.4, .45, .55], yawRadians: .2, observedAtMs: Date.now() },
+        { id: 'bird-2', label: 'bird', confidence: .81, position: [2, 0, 3], velocity: [0, 0, 0], extentMeters: [.5, .5, .6], yawRadians: -.1, observedAtMs: Date.now() }
       ]
     }));
-    const firstBatch = await firstBatchPromise;
+    const [firstAck, firstBatch] = await Promise.all([firstAckPromise, firstBatchPromise]);
+    assert.equal(firstAck.accepted, 2);
+    assert.equal(firstAck.expired, 0);
     assert.equal(firstBatch.replaceSource, true);
     assert.equal(firstBatch.tracks.length, 2);
     assert.deepEqual(firstBatch.tracks.map((track) => track.key).sort(), ['sensor:bird-1', 'sensor:bird-2']);
     assert.ok(firstBatch.tracks.every((track) => track.sourceId === 'sensor'));
+    assert.deepEqual(firstBatch.tracks[0].extentMeters, [.4, .45, .55]);
+    assert.equal(firstBatch.tracks[0].yawRadians, .2);
 
-    // The next complete snapshot contains only bird-1. bird-2 must disappear immediately from
-    // every viewer and from the server live snapshot instead of lingering until TRACK_TTL_MS.
     const expiredPromise = nextMessage(viewer, (value) => value.type === 'tracks_expired');
+    const secondAckPromise = nextMessage(sensor, (value) => value.type === 'track_ack' && value.sequence === 2);
     const secondBatchPromise = nextMessage(viewer, (value) => value.type === 'track_batch' && value.sequence === 2);
     sensor.send(JSON.stringify({
       type: 'track_batch',
       sequence: 2,
       replaceSource: true,
-      tracks: [{ id: 'bird-1', label: 'bird', confidence: .9, position: [1.1, 0, 2], velocity: [.1, 0, 0], observedAtMs: Date.now() }]
+      tracks: [{ id: 'bird-1', label: 'bird', confidence: .9, position: [1.1, 0, 2], velocity: [.1, 0, 0], extentMeters: [.4, .45, .55], observedAtMs: Date.now() }]
     }));
     const expired = await expiredPromise;
     assert.deepEqual(expired.trackKeys, ['sensor:bird-2']);
-    const secondBatch = await secondBatchPromise;
+    const [secondAck, secondBatch] = await Promise.all([secondAckPromise, secondBatchPromise]);
+    assert.equal(secondAck.accepted, 1);
+    assert.equal(secondAck.expired, 1);
     assert.equal(secondBatch.tracks.length, 1);
     assert.equal(secondBatch.tracks[0].key, 'sensor:bird-1');
 
@@ -98,6 +104,7 @@ test('REST map API and WebSocket multi-track snapshots relay end to end', async 
     assert.equal(state.clients.length, 2);
     assert.equal(state.tracks.length, 1);
     assert.equal(state.tracks[0].key, 'sensor:bird-1');
+    assert.deepEqual(state.tracks[0].extentMeters, [.4, .45, .55]);
     assert.equal(state.clients.find((client) => client.clientId === 'sensor')?.status?.state, 'reporting');
   } finally {
     sensor?.close();
