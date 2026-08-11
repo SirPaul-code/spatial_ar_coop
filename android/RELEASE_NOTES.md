@@ -1,5 +1,13 @@
 # Android release notes
 
+## 1.0.4
+
+- Preserve the last valid shared transform after a successful Cloud Anchor resolve through temporary anchor tracking pauses.
+- Show `room connected/reconnecting` and the count of buffered remote tracks even while a phone is still localizing.
+- Do not draw a participant's own network-spatial boxes over its local raw detector boxes.
+- Remove the class-size monocular 3D fallback; shared moving-object tracks now require Depth, a valid upward-facing plane, or saved-ground evidence.
+- Retain v1.0.3 detector NMS, stricter person/car thresholds, two-hit track confirmation, short stale-track lifetime, and uncapped ARCore resolve duration.
+
 ## 1.0.3
 
 - Cloud Anchor resolve futures are no longer cancelled by the app after 12 seconds; pending ARCore visual matching is allowed to complete and real per-anchor failure states are surfaced before retry.

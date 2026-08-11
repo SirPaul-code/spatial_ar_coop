@@ -116,6 +116,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var setupOriginAutoEstablished = false
     private var lastAutoGroundAttemptMs = 0L
     @Volatile private var realtimeConnected = false
+    @Volatile private var localizationDetail = ""
     private var sequence = 0L
 
     private val cachedMap = AtomicReference<MapDefinition?>(null)
@@ -366,7 +367,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 database = spatialApp.database,
                 logger = spatialApp.logger,
                 scheduleUpload = { UploadScheduler.enqueue(this) },
-                onState = ::showDetail
+                onState = { message ->
+                    localizationDetail = message
+                    showDetail(message)
+                }
             )
             session = created
             spatialApp.logger.info(
@@ -731,7 +735,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             manualAlignmentOverride = false
             cloudAnchors?.resetReference()
             resolveLastAttemptMs = 0L
-            showDetail("Re-localizing · point around a mapped anchor area and move slowly")
+            localizationDetail = "Re-localizing · point around a mapped anchor area and move slowly"
+            showDetail(localizationDetail)
         }
 
         val cloudWorldFromSite = cloudAnchors?.currentWorldFromSite()
@@ -756,7 +761,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     "Resolving shared location · point around the mapped area and move slowly"
                 else -> "Shared location unavailable · use More → Align fallback at the saved physical origin"
             }
-            updateHud(frame, null, instruction)
+            // In Live mode the diagnostic HUD itself reports room connectivity, buffered remote
+            // tracks and the actual Cloud Anchor resolver state. Do not overwrite it every frame
+            // with the generic localization sentence.
+            updateHud(frame, null, if (mode == ArMode.LIVE) null else instruction)
             overlay.updateTracks(emptyList())
             return
         }
@@ -1095,23 +1103,28 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     private fun updateProjectedTracks(cameraSite: FloatArray, worldFromSite: FloatArray) {
         val now = System.currentTimeMillis()
-        val projected = remoteTracks.snapshot(now).mapNotNull { track ->
-            val world = PoseMath.transformPoint(worldFromSite, track.position)
-            val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight) ?: return@mapNotNull null
-            ProjectedTrack(
-                key = track.key,
-                label = track.label,
-                confidence = track.confidence,
-                x = screen.x,
-                y = screen.y,
-                onScreen = screen.onScreen,
-                distanceMeters = PoseMath.distance(cameraSite, track.position),
-                uncertaintyMeters = track.uncertaintyMeters,
-                ageMs = (now - track.serverReceivedAtMs).coerceAtLeast(0L),
-                sourceId = track.sourceId,
-                bounds = projectTrackBounds(track, worldFromSite)
-            )
-        }
+        val localDeviceId = spatialApp.preferences.deviceId
+        val projected = remoteTracks.snapshot(now)
+            .asSequence()
+            .filter { track -> track.sourceId == "marker" || track.sourceId != localDeviceId }
+            .mapNotNull { track ->
+                val world = PoseMath.transformPoint(worldFromSite, track.position)
+                val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight) ?: return@mapNotNull null
+                ProjectedTrack(
+                    key = track.key,
+                    label = track.label,
+                    confidence = track.confidence,
+                    x = screen.x,
+                    y = screen.y,
+                    onScreen = screen.onScreen,
+                    distanceMeters = PoseMath.distance(cameraSite, track.position),
+                    uncertaintyMeters = track.uncertaintyMeters,
+                    ageMs = (now - track.serverReceivedAtMs).coerceAtLeast(0L),
+                    sourceId = track.sourceId,
+                    bounds = projectTrackBounds(track, worldFromSite)
+                )
+            }
+            .toList()
         overlay.updateTracks(projected)
     }
 
@@ -1164,6 +1177,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val hosting = anchors.count { it.status == AnchorStatus.HOSTING }
         val failed = anchors.count { it.status == AnchorStatus.NEEDS_RESCAN || it.status == AnchorStatus.FAILED }
         val (chunks, points) = spatialApp.database.chunkCounts(mapId)
+        val bufferedRemoteTracks = remoteTracks.snapshot(now).count { track ->
+            track.sourceId != spatialApp.preferences.deviceId && track.sourceId != "marker"
+        }
         val locationState = when {
             worldFromSite != null -> "Localized"
             cloudAnchors?.isResolving == true -> "Localizing…"
@@ -1187,7 +1203,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     }
                     ArMode.SENSOR -> "$latestLocalTrackCount tracks · ${latestInferenceMs} ms inference"
                     ArMode.LIVE -> if (worldFromSite == null) {
-                        "Detector active · $latestDetectionCount visible object(s) · resolving shared location"
+                        val room = if (realtimeConnected) "room connected" else "room reconnecting"
+                        val resolver = localizationDetail.ifBlank { "resolving saved Cloud Anchors" }
+                        "Detector active · $latestDetectionCount visible · $bufferedRemoteTracks remote buffered · $room · $resolver"
                     } else {
                         "$latestDetectionCount detected · $latestLocalTrackCount spatial track(s) · sharing automatically"
                     }

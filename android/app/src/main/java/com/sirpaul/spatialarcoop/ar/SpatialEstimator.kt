@@ -63,10 +63,10 @@ object SpatialEstimator {
         val fallback = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
         if (fallback != null) return EstimatedPosition(fallback, 0.65f, "ground-ray")
 
-        // Last-resort monocular estimate. It is intentionally marked with much larger uncertainty
-        // than Depth/plane/ground hits, but keeps obvious people/cars/birds shareable when ARCore
-        // has no hit at the moving object's contact point.
-        return estimateFromBoundingBoxSize(frame, detection, siteFromWorld)
+        // Do not invent a networked 3D point from class-size assumptions. Keep the accurate local
+        // 2D detector box; publish a shared track only when Depth/plane/saved-ground supplies actual
+        // spatial evidence.
+        return null
     }
 
     fun centerGroundPoint(frame: Frame, worldFromSite: FloatArray, groundY: Float?): FloatArray? {
@@ -86,55 +86,6 @@ object SpatialEstimator {
                 PoseMath.transformPoint(PoseMath.rigidInverse(worldFromSite), it)
             }
         }
-    }
-
-    private fun estimateFromBoundingBoxSize(
-        frame: Frame,
-        detection: Detection2D,
-        siteFromWorld: FloatArray
-    ): EstimatedPosition? {
-        val physicalHeightMeters = when (detection.label.lowercase()) {
-            "person" -> 1.70f
-            "car" -> 1.50f
-            "bird" -> 0.40f
-            "dog" -> 0.65f
-            "cat" -> 0.38f
-            else -> 0.60f
-        }
-        val pixelExtent = detection.rawBoundingBox.height()
-        if (!pixelExtent.isFinite() || pixelExtent < 6f) return null
-
-        val intrinsics = frame.camera.imageIntrinsics
-        val focal = intrinsics.focalLength
-        val principal = intrinsics.principalPoint
-        if (focal[0] <= 0f || focal[1] <= 0f) return null
-        val focalPixels = (focal[0] + focal[1]) * 0.5f
-        val opticalDepth = (focalPixels * physicalHeightMeters / pixelExtent).coerceIn(0.45f, 55f)
-        if (!opticalDepth.isFinite()) return null
-
-        // Position represents the object contact point used by the shared tracker, so project
-        // the bbox bottom-center rather than its visual center.
-        val centerX = detection.rawBottomCenter[0]
-        val centerY = detection.rawBottomCenter[1]
-        val cameraDirection = PoseMath.normalize(
-            floatArrayOf(
-                (centerX - principal[0]) / focal[0],
-                -(centerY - principal[1]) / focal[1],
-                -1f
-            )
-        )
-        val worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose)
-        val worldDirection = PoseMath.transformDirection(worldFromCamera, cameraDirection)
-        val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromWorld, worldDirection))
-        val siteOrigin = PoseMath.transformPoint(siteFromWorld, frame.camera.pose.translation)
-        val rayLength = (opticalDepth / abs(cameraDirection[2]).coerceAtLeast(0.18f)).coerceIn(0.45f, 70f)
-        val site = floatArrayOf(
-            siteOrigin[0] + siteDirection[0] * rayLength,
-            siteOrigin[1] + siteDirection[1] * rayLength,
-            siteOrigin[2] + siteDirection[2] * rayLength
-        )
-        val uncertainty = (0.75f + opticalDepth * 0.28f).coerceIn(0.9f, 10f)
-        return EstimatedPosition(site, uncertainty, "monocular-class-size")
     }
 
     private fun intersectGround(
