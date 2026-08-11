@@ -13,7 +13,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class CaptureGeometry(
-    val worldFromCamera: FloatArray,
+    val siteFromCamera: FloatArray?,
     val focalLength: FloatArray,
     val principalPoint: FloatArray
 )
