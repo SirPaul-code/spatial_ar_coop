@@ -25,26 +25,32 @@ object SpatialEstimator {
         if (frame.camera.trackingState != TrackingState.TRACKING) return null
         if (!detection.temporallyConfirmed) return null
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
-        val geometry = detection.captureGeometry ?: currentGeometry(frame)
+        val geometry = detection.captureGeometry?.let { captured ->
+            // If the image was captured before this participant had a shared site transform, do not
+            // retroactively combine that old bbox with a later ARCore frame. The next detector frame
+            // arrives shortly and will carry a valid capture-time site pose.
+            if (captured.siteFromCamera == null) return null
+            captured
+        } ?: currentGeometry(frame, worldFromSite)
 
         // Every currently shared field class is represented by its ground/contact point. Prefer the
-        // ray through feet/wheels at the detector capture pose. Depth on a moving target/background
-        // is evidence, not a stable definition of the shared site position.
+        // ray through feet/wheels at the exact detector capture pose. Depth on a moving target or
+        // background is evidence, not a stable definition of the networked site position.
         if (groundY != null && detection.label in GROUND_CONTACT_LABELS) {
-            val ground = intersectGround(detection.rawBottomCenter, geometry, siteFromWorld, groundY)
+            val ground = intersectGround(detection.rawBottomCenter, geometry, groundY)
             if (ground != null) {
-                if (!hasPlausibleApparentScale(detection, ground, worldFromSite, geometry)) return null
+                if (!hasPlausibleApparentScale(detection, ground, geometry)) return null
                 return EstimatedPosition(
                     sitePosition = ground,
-                    uncertaintyMeters = if (detection.captureGeometry != null) 0.28f else 0.40f,
-                    method = if (detection.captureGeometry != null) "ground-capture" else "ground-current"
+                    uncertaintyMeters = if (detection.captureGeometry != null) 0.26f else 0.40f,
+                    method = if (detection.captureGeometry != null) "ground-capture-site" else "ground-current"
                 )
             }
         }
 
-        // Maps without a saved floor use real AR geometry only. Prefer an upward horizontal plane
-        // to a DepthPoint because the networked representation is the contact point, not an
-        // arbitrary surface point on the object/background.
+        // Maps without a saved floor use real AR geometry only. This fallback necessarily comes
+        // from the current ARCore frame, so it is assigned higher uncertainty than capture-time
+        // saved-ground projection and remains guarded by the spatial tracker's measurement gate.
         val image = detection.rawBottomCenter
         val view = FloatArray(2)
         frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
@@ -62,11 +68,11 @@ object SpatialEstimator {
             ?: return null
 
         val site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
-        if (!hasPlausibleApparentScale(detection, site, worldFromSite, geometry)) return null
+        if (!hasPlausibleApparentScale(detection, site, geometry)) return null
         val (uncertainty, method) = when (bestHit.trackable) {
-            is Plane -> 0.42f to "plane-contact"
-            is DepthPoint -> 0.68f to "depth-fallback"
-            else -> 0.80f to "hit-fallback"
+            is Plane -> 0.48f to "plane-current-fallback"
+            is DepthPoint -> 0.78f to "depth-current-fallback"
+            else -> 0.90f to "hit-current-fallback"
         }
         return EstimatedPosition(site, uncertainty, method)
     }
@@ -76,8 +82,7 @@ object SpatialEstimator {
         return if (groundY != null) {
             intersectGround(
                 floatArrayOf(dimensions[0] * 0.5f, dimensions[1] * 0.58f),
-                currentGeometry(frame),
-                PoseMath.rigidInverse(worldFromSite),
+                currentGeometry(frame, worldFromSite),
                 groundY
             )
         } else {
@@ -96,10 +101,14 @@ object SpatialEstimator {
         }
     }
 
-    private fun currentGeometry(frame: Frame): CaptureGeometry {
+    private fun currentGeometry(frame: Frame, worldFromSite: FloatArray): CaptureGeometry {
         val intrinsics = frame.camera.imageIntrinsics
+        val siteFromCamera = PoseMath.multiply(
+            PoseMath.rigidInverse(worldFromSite),
+            PoseMath.poseToMatrix(frame.camera.pose)
+        )
         return CaptureGeometry(
-            worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose),
+            siteFromCamera = siteFromCamera,
             focalLength = intrinsics.focalLength.copyOf(),
             principalPoint = intrinsics.principalPoint.copyOf()
         )
@@ -108,9 +117,9 @@ object SpatialEstimator {
     private fun intersectGround(
         imagePixel: FloatArray,
         geometry: CaptureGeometry,
-        siteFromWorld: FloatArray,
         groundY: Float
     ): FloatArray? {
+        val siteFromCamera = geometry.siteFromCamera ?: return null
         val focal = geometry.focalLength
         val principal = geometry.principalPoint
         if (focal.size < 2 || principal.size < 2 || focal[0] <= 0f || focal[1] <= 0f) return null
@@ -121,13 +130,11 @@ object SpatialEstimator {
                 -1f
             )
         )
-        val worldDirection = PoseMath.transformDirection(geometry.worldFromCamera, cameraDirection)
-        val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromWorld, worldDirection))
+        val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromCamera, cameraDirection))
         // Near-horizon rays amplify a few detector pixels into metres of position error. Refuse the
         // sample rather than publishing a wildly unstable shared object.
         if (siteDirection[1] > -MIN_DOWNWARD_RAY_COMPONENT) return null
-        val worldOrigin = PoseMath.translationOf(geometry.worldFromCamera)
-        val siteOrigin = PoseMath.transformPoint(siteFromWorld, worldOrigin)
+        val siteOrigin = PoseMath.translationOf(siteFromCamera)
         val distance = (groundY - siteOrigin[1]) / siteDirection[1]
         if (!distance.isFinite() || distance !in MIN_GROUND_RANGE_METERS..MAX_GROUND_RANGE_METERS) return null
         return floatArrayOf(
@@ -140,9 +147,9 @@ object SpatialEstimator {
     private fun hasPlausibleApparentScale(
         detection: Detection2D,
         sitePosition: FloatArray,
-        worldFromSite: FloatArray,
         geometry: CaptureGeometry
     ): Boolean {
+        val siteFromCamera = geometry.siteFromCamera ?: return false
         val focalY = geometry.focalLength.getOrNull(1) ?: return true
         if (focalY <= 0f) return true
         val box = detection.rawBoundingBox
@@ -153,9 +160,8 @@ object SpatialEstimator {
         val clipped = box.top <= margin || box.bottom >= detection.rawImageHeight - margin
         if (clipped) return true
 
-        val worldPoint = PoseMath.transformPoint(worldFromSite, sitePosition)
-        val cameraFromWorld = PoseMath.rigidInverse(geometry.worldFromCamera)
-        val cameraPoint = PoseMath.transformPoint(cameraFromWorld, worldPoint)
+        val cameraFromSite = PoseMath.rigidInverse(siteFromCamera)
+        val cameraPoint = PoseMath.transformPoint(cameraFromSite, sitePosition)
         val opticalDepth = -cameraPoint[2]
         if (!opticalDepth.isFinite() || opticalDepth !in 0.20f..MAX_GROUND_RANGE_METERS) return false
 
