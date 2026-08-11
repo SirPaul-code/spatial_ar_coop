@@ -14,17 +14,22 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.sirpaul.spatialarcoop.data.AnchorStatus
 import com.sirpaul.spatialarcoop.data.MapDefinition
 import com.sirpaul.spatialarcoop.data.MapStatus
 import com.sirpaul.spatialarcoop.net.MapApiClient
 import com.sirpaul.spatialarcoop.net.MapApiException
 import com.sirpaul.spatialarcoop.ui.FieldTheme
+import com.sirpaul.spatialarcoop.ui.QrTools
 import com.sirpaul.spatialarcoop.util.Diagnostics
 import java.io.File
 import java.text.NumberFormat
@@ -41,6 +46,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var settingsBody: LinearLayout
     private var settingsVisible = false
     private var firstResume = true
+
+    private val placeScanner by lazy {
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+        GmsBarcodeScanning.getClient(this, options)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,36 +100,46 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
         })
         content.addView(TextView(this).apply {
-            text = "Private self-hosted places and live cooperative AR"
+            text = "Private self-hosted places · scan a place QR to join"
             textSize = 14f
             setTextColor(FieldTheme.textSecondary)
-            setPadding(0, dp(4), 0, dp(24))
+            setPadding(0, dp(4), 0, dp(20))
+        })
+
+        val joinRow = horizontal()
+        joinRow.addView(actionButton("Scan place QR", primary = true, action = ::scanPlaceQr), weightParams())
+        joinRow.addView(actionButton("Paste invite", primary = false, action = ::showPasteInviteDialog), weightParams(left = 8))
+        content.addView(joinRow)
+        content.addView(TextView(this).apply {
+            text = "A place QR gives this phone access to one shared map only. It never contains the server owner token."
+            textSize = 11f
+            setTextColor(FieldTheme.textSecondary)
+            setPadding(0, dp(7), 0, dp(22))
         })
 
         val header = horizontal().apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(TextView(this).apply {
-            text = "My places"
+            text = "Places on this phone"
             textSize = 19f
             setTextColor(FieldTheme.textPrimary)
             typeface = Typeface.DEFAULT_BOLD
         }, weightParams())
-        header.addView(actionButton("Sync owner", primary = false) { refreshFromServer(silent = false) }, wrapParams())
+        header.addView(actionButton("Refresh", primary = false) { refreshFromServer(silent = false) }, wrapParams())
         header.addView(actionButton("New place", primary = true, action = ::showCreateMapDialog), wrapParams(left = 8))
         content.addView(header)
 
         status = TextView(this).apply {
-            text = "Each place is private to its server and map key. No global server or map directory is used."
+            text = "Ready. Joined places keep their own server address and private map key."
             textSize = 12f
             setTextColor(FieldTheme.textSecondary)
             setPadding(0, dp(7), 0, dp(8))
         }
         content.addView(status)
-        content.addView(actionButton("Join a shared place", primary = false, action = ::showJoinInviteDialog), marginParams(bottom = 12))
 
         mapsContainer = vertical(0)
         content.addView(mapsContainer)
 
-        val settingsToggle = actionButton("Server owner & diagnostics", primary = false) {
+        val settingsToggle = actionButton("Owner server & diagnostics", primary = false) {
             settingsVisible = !settingsVisible
             settingsBody.visibility = if (settingsVisible) View.VISIBLE else View.GONE
         }
@@ -133,14 +156,14 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
         })
         settingsBody.addView(TextView(this).apply {
-            text = "This profile is used only to create/list/delete maps you own. Joined places keep their own server URL and map key."
+            text = "Only the server owner needs this admin token. It can create and list every map on that server. Participants join individual places with QR codes instead."
             textSize = 11f
             setTextColor(FieldTheme.textSecondary)
             setPadding(0, dp(4), 0, dp(6))
         })
         serverInput = EditText(this).apply {
             setText(spatialApp.preferences.serverUrl)
-            hint = "https://server.tailnet.ts.net"
+            hint = "http://100.x.y.z:8080 or https://server.tailnet.ts.net"
             setTextColor(FieldTheme.textPrimary)
             setHintTextColor(FieldTheme.textSecondary)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
@@ -148,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         }
         tokenInput = EditText(this).apply {
             setText(spatialApp.preferences.apiToken)
-            hint = "sar_admin_… (owner token)"
+            hint = "sar_admin_… (owner only)"
             setTextColor(FieldTheme.textPrimary)
             setHintTextColor(FieldTheme.textSecondary)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -156,27 +179,22 @@ class MainActivity : AppCompatActivity() {
         }
         settingsBody.addView(serverInput)
         settingsBody.addView(tokenInput)
-        val connectionActions = horizontal()
-        connectionActions.addView(actionButton("Save", primary = true) { saveSettings(showMessage = true) }, weightParams())
-        connectionActions.addView(actionButton("Test & sync", primary = false) { refreshFromServer(silent = false) }, weightParams(left = 8))
-        settingsBody.addView(connectionActions)
+        settingsBody.addView(actionButton("Save & verify owner server", primary = true) {
+            if (saveSettings(showMessage = false)) refreshFromServer(silent = false)
+        }, marginParams(top = 8))
 
         settingsBody.addView(TextView(this).apply {
             text = if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) {
                 "Cloud Anchor credentials are configured in this build."
             } else {
-                "Cloud Anchors are disabled in this build. Manual shared-origin alignment remains available for development."
+                "Cloud Anchors are disabled in this build. Manual shared-origin fallback remains available for development."
             }
             textSize = 12f
             setTextColor(if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) FieldTheme.statusBlue else FieldTheme.accent)
             setPadding(0, dp(12), 0, dp(8))
         })
         val diagnosticsActions = horizontal()
-        diagnosticsActions.addView(actionButton("Operator dashboard", primary = false) {
-            saveSettings(showMessage = false)
-            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(spatialApp.preferences.serverUrl))) }
-                .onFailure { showStatus("Could not open dashboard: ${it.message}", true) }
-        }, weightParams())
+        diagnosticsActions.addView(actionButton("Open operator dashboard", primary = false) { openOwnerDashboard() }, weightParams())
         diagnosticsActions.addView(actionButton("Share diagnostics", primary = false) {
             Diagnostics.shareLogs(this, spatialApp.logger)
         }, weightParams(left = 8))
@@ -198,6 +216,21 @@ class MainActivity : AppCompatActivity() {
         return root
     }
 
+    private fun scanPlaceQr() {
+        showStatus("Opening QR scanner…", false)
+        placeScanner.startScan()
+            .addOnSuccessListener { barcode ->
+                val raw = barcode.rawValue?.trim().orEmpty()
+                if (raw.isBlank()) showStatus("The QR code did not contain a Spatial AR invite.", true)
+                else importInvite(raw)
+            }
+            .addOnCanceledListener { showStatus("QR scan cancelled.", false) }
+            .addOnFailureListener { error ->
+                spatialApp.logger.warn("Place QR scanner failed", mapOf("error" to error.message))
+                showStatus("Could not open QR scanner: ${error.message}", true)
+            }
+    }
+
     private fun saveSettings(showMessage: Boolean): Boolean {
         if (!::serverInput.isInitialized) return true
         val url = serverInput.text.toString().trim().trimEnd('/')
@@ -208,7 +241,7 @@ class MainActivity : AppCompatActivity() {
         spatialApp.preferences.serverUrl = url
         spatialApp.preferences.apiToken = tokenInput.text.toString().trim()
         spatialApp.logger.info("Owner server settings saved", mapOf("serverUrl" to url))
-        if (showMessage) showStatus("Owner connection saved. Existing joined places were not changed.", false)
+        if (showMessage) showStatus("Owner connection saved. Joined places were not changed.", false)
         return true
     }
 
@@ -216,8 +249,13 @@ class MainActivity : AppCompatActivity() {
         val url = if (::serverInput.isInitialized) serverInput.text.toString().trim().trimEnd('/') else spatialApp.preferences.serverUrl
         if (!validServerUrl(url)) return
         if (::serverInput.isInitialized && !saveSettings(showMessage = false)) return
-        if (!silent) showStatus("Checking owner server…", false)
         val adminToken = spatialApp.preferences.apiToken
+        if (!silent) {
+            showStatus(
+                if (adminToken.isBlank()) "Checking server identity…" else "Checking owner server and refreshing owned maps…",
+                false
+            )
+        }
         executor.execute {
             runCatching {
                 val api = MapApiClient(url, adminToken, spatialApp.logger)
@@ -228,31 +266,34 @@ class MainActivity : AppCompatActivity() {
             }.onSuccess { (info, maps) ->
                 runOnUiThread {
                     val detail = if (adminToken.isBlank()) {
-                        "Server ${info.serverName} · ${shortId(info.serverId)} online · add owner token to list maps"
+                        "${info.serverName} · ${shortId(info.serverId)} is online. Add its owner token only if this phone manages that server."
                     } else {
-                        "Server ${info.serverName} · ${shortId(info.serverId)} · ${maps.size} owner place(s)"
+                        "Owner verified · ${info.serverName} · ${maps.size} owned place(s) refreshed"
                     }
                     showStatus(detail, false)
                     renderMaps()
                 }
             }.onFailure { error ->
                 spatialApp.logger.warn("Owner map refresh failed", mapOf("error" to error.message, "serverUrl" to url))
-                if (!silent) runOnUiThread { showStatus("Server check failed: ${error.message}. Local places are preserved.", true) }
+                if (!silent) runOnUiThread {
+                    val help = if (error is MapApiException && error.statusCode == 401) {
+                        "Owner verification failed. This field needs the sar_admin_… server token, not a sar_map_… place key."
+                    } else {
+                        "Server check failed: ${error.message}. Local/joined places are preserved."
+                    }
+                    showStatus(help, true)
+                }
             }
         }
     }
 
     private fun showCreateMapDialog() {
         if (!saveSettings(showMessage = false)) {
-            settingsVisible = true
-            settingsBody.visibility = View.VISIBLE
-            showStatus("Set a valid owner server URL before creating a place.", true)
+            revealOwnerSettings("Set a valid owner server URL before creating a place.")
             return
         }
         if (spatialApp.preferences.apiToken.isBlank()) {
-            settingsVisible = true
-            settingsBody.visibility = View.VISIBLE
-            showStatus("Creating a place requires this server's owner admin token.", true)
+            revealOwnerSettings("Creating a place requires this server's sar_admin_… owner token.")
             return
         }
         val input = EditText(this).apply {
@@ -261,10 +302,10 @@ class MainActivity : AppCompatActivity() {
         }
         AlertDialog.Builder(this)
             .setTitle("New private place")
-            .setMessage("The server creates an independent random map key. Only people you share that map invite with can open the place.")
+            .setMessage("The server creates a separate private map key automatically. After setup, show the place QR to participants.")
             .setView(input)
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Create") { _, _ -> createMap(input.text.toString()) }
+            .setPositiveButton("Create & start setup") { _, _ -> createMap(input.text.toString()) }
             .show()
     }
 
@@ -278,7 +319,7 @@ class MainActivity : AppCompatActivity() {
         val id = "$slug-${UUID.randomUUID().toString().take(6)}"
         val url = spatialApp.preferences.serverUrl.trimEnd('/')
         val token = spatialApp.preferences.apiToken
-        showStatus("Creating $name on owner server…", false)
+        showStatus("Creating $name on the owner server…", false)
         executor.execute {
             runCatching {
                 val api = MapApiClient(url, token, spatialApp.logger)
@@ -292,7 +333,7 @@ class MainActivity : AppCompatActivity() {
                 spatialApp.database.upsertMap(map.copy(syncPending = false))
                 spatialApp.logger.info("Private map created", mapOf("mapId" to map.id, "serverId" to map.serverId))
                 runOnUiThread {
-                    showStatus("${map.name} created · private map key saved on this device", false)
+                    showStatus("${map.name} created · starting guided map setup…", false)
                     renderMaps()
                     launchMap(map.id, ArMode.MAP)
                 }
@@ -303,7 +344,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showJoinInviteDialog() {
+    private fun showPasteInviteDialog() {
         val input = EditText(this).apply {
             hint = "spatialar://join?…"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -311,8 +352,8 @@ class MainActivity : AppCompatActivity() {
             maxLines = 6
         }
         AlertDialog.Builder(this)
-            .setTitle("Join shared place")
-            .setMessage("Paste the invite link from the place owner. It grants access only to that map, not to the owner's other maps.")
+            .setTitle("Paste place invite")
+            .setMessage("Usually you can just scan the owner's QR. Paste is available for links received in chat or email.")
             .setView(input)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Join") { _, _ -> importInvite(input.text.toString()) }
@@ -328,16 +369,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun importInvite(raw: String) {
         val parsed = runCatching { parseInvite(raw) }.getOrElse {
-            showStatus("Invalid invite: ${it.message}", true)
+            showStatus("Invalid place invite: ${it.message}", true)
             return
         }
-        showStatus("Verifying ${shortId(parsed.serverId)} and opening ${parsed.mapId}…", false)
+        showStatus("Verifying server ${shortId(parsed.serverId)} and opening ${parsed.mapId}…", false)
         executor.execute {
             runCatching {
                 val api = MapApiClient(parsed.serverUrl, parsed.mapKey, spatialApp.logger)
                 val info = api.getServerInfo()
                 check(info.serverId == parsed.serverId) {
-                    "Server identity mismatch: invite is for ${parsed.serverId}, endpoint reports ${info.serverId}"
+                    "Server identity mismatch: invite expects ${parsed.serverId}, endpoint reports ${info.serverId}"
                 }
                 val remote = api.getMap(parsed.mapId)
                 check(remote.id == parsed.mapId) { "Server returned a different map" }
@@ -352,9 +393,9 @@ class MainActivity : AppCompatActivity() {
                 spatialApp.database.upsertMap(map)
                 spatialApp.logger.info("Map invite joined", mapOf("mapId" to map.id, "serverId" to map.serverId))
                 runOnUiThread {
-                    showStatus("Joined ${map.name} on ${shortId(map.serverId)}", false)
+                    showStatus("Joined ${map.name} · this phone can access only that shared place", false)
                     renderMaps()
-                    if (map.status == MapStatus.READY) launchMap(map.id, ArMode.LIVE)
+                    if (map.status == MapStatus.READY) prepareAndLaunch(map, ArMode.LIVE)
                 }
             }.onFailure { error ->
                 spatialApp.logger.warn("Map invite rejected", mapOf("serverId" to parsed.serverId, "mapId" to parsed.mapId, "error" to error.message))
@@ -368,7 +409,7 @@ class MainActivity : AppCompatActivity() {
     private fun parseInvite(raw: String): ParsedInvite {
         val uri = Uri.parse(raw.trim())
         require(uri.scheme.equals("spatialar", ignoreCase = true) && uri.host.equals("join", ignoreCase = true)) {
-            "expected spatialar://join link"
+            "expected a spatialar://join QR/link"
         }
         val serverId = uri.getQueryParameter("serverId").orEmpty()
         val mapId = uri.getQueryParameter("mapId").orEmpty()
@@ -376,7 +417,7 @@ class MainActivity : AppCompatActivity() {
         val serverUrl = uri.getQueryParameter("url")?.trim()?.trimEnd('/')
             ?.takeIf(::validServerUrl)
             ?: spatialApp.preferences.serverUrl.trim().trimEnd('/').takeIf(::validServerUrl)
-            ?: error("invite has no server URL and no valid owner/default server is configured")
+            ?: error("invite has no usable server URL")
         require(serverId.matches(Regex("[a-zA-Z0-9._-]{4,96}"))) { "invalid serverId" }
         require(mapId.matches(Regex("[a-zA-Z0-9._-]{1,96}"))) { "invalid mapId" }
         require(mapKey.startsWith("sar_map_") && mapKey.length >= 32) { "invalid map key" }
@@ -389,7 +430,7 @@ class MainActivity : AppCompatActivity() {
         val maps = spatialApp.database.listMaps()
         if (maps.isEmpty()) {
             mapsContainer.addView(TextView(this).apply {
-                text = "No places on this device. Create one on your server or join an invite."
+                text = "No places on this phone yet. Scan a place QR, or configure an owner server and create one."
                 setTextColor(FieldTheme.textSecondary)
                 textSize = 14f
                 setPadding(0, dp(18), 0, dp(18))
@@ -414,7 +455,7 @@ class MainActivity : AppCompatActivity() {
         titleRow.addView(TextView(this).apply {
             text = when (map.status) {
                 MapStatus.READY -> "Ready"
-                MapStatus.MAPPING -> "Map setup"
+                MapStatus.MAPPING -> "Setup in progress"
                 MapStatus.ARCHIVED -> "Archived"
             }
             textSize = 12f
@@ -439,7 +480,7 @@ class MainActivity : AppCompatActivity() {
                 append("$hosted hosted anchor")
                 if (hosted != 1) append('s')
                 if (needsAttention > 0) append(" · $needsAttention need attention")
-                append(" · ${shortId(map.serverId.ifBlank { "legacy" })} · ${map.id}")
+                if (map.serverId.isNotBlank()) append(" · ${shortId(map.serverId)}")
             }
             setTextColor(if (needsAttention > 0) FieldTheme.accent else FieldTheme.textSecondary)
             textSize = 11f
@@ -448,19 +489,21 @@ class MainActivity : AppCompatActivity() {
 
         val readyForLive = map.status == MapStatus.READY && (hosted > 0 || !BuildConfig.CLOUD_ANCHORS_CONFIGURED)
         val actions = horizontal()
-        val live = actionButton("Live AR session", primary = true) { launchMap(map.id, ArMode.LIVE) }.apply {
+        val live = actionButton("Live AR", primary = true) { prepareAndLaunch(map, ArMode.LIVE) }.apply {
             isEnabled = readyForLive
             alpha = if (readyForLive) 1f else 0.45f
         }
         actions.addView(live, weightParams())
-        actions.addView(actionButton("Manage & share", primary = false) { showManageMapDialog(map) }, weightParams(left = 10))
+        actions.addView(actionButton(if (map.status == MapStatus.READY) "Share & manage" else "Continue setup", primary = false) {
+            if (map.status == MapStatus.READY) showManageMapDialog(map) else prepareAndLaunch(map, ArMode.MAP)
+        }, weightParams(left = 10))
         body.addView(actions)
         if (!readyForLive) {
             body.addView(TextView(this).apply {
                 text = when {
-                    map.status != MapStatus.READY -> "Complete Map setup before starting Live AR."
-                    hosted == 0 -> "This build expects a hosted Cloud Anchor for a ready shared place."
-                    else -> "Map setup is incomplete."
+                    map.status != MapStatus.READY -> "Map setup is not finished yet. Open Continue setup and follow the on-camera progress."
+                    hosted == 0 -> "A hosted Cloud Anchor is still required before shared Live AR is ready."
+                    else -> "Map setup needs attention."
                 }
                 setTextColor(FieldTheme.accent)
                 textSize = 11f
@@ -474,52 +517,109 @@ class MainActivity : AppCompatActivity() {
         val nf = NumberFormat.getIntegerInstance()
         if (serverPoints == null || serverChunks == null) {
             return if (localChunks > 0) {
-                "${nf.format(localPoints)} local points · $localChunks local scan chunks · server count not synchronized"
+                "${nf.format(localPoints)} local points · $localChunks local chunks · waiting for server refresh"
             } else {
-                "Server geometry not synchronized · no local scan cache"
+                "Server geometry not refreshed · no local scan cache"
             }
         }
         if (localChunks == 0 && serverChunks > 0) {
-            return "${nf.format(serverPoints)} points on server · $serverChunks scan chunks · not cached on this device"
+            return "${nf.format(serverPoints)} points on server · $serverChunks chunks · geometry is not cached on this phone"
         }
         if (localChunks > 0) {
-            return "${nf.format(serverPoints)} server points · $serverChunks server chunks · ${nf.format(localPoints)} local points in $localChunks chunks"
+            return "${nf.format(serverPoints)} server points · $serverChunks server chunks · ${nf.format(localPoints)} local points"
         }
         return "${nf.format(serverPoints)} points on server · $serverChunks scan chunks"
     }
 
     private fun showManageMapDialog(map: MapDefinition) {
-        val items = arrayOf("Continue Map setup", "Share invite", "Rotate invite key…", "Delete map…")
+        val content = vertical(dp(14))
+        content.addView(TextView(this).apply {
+            text = "Share this place"
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(FieldTheme.textPrimary)
+        })
+        content.addView(TextView(this).apply {
+            text = "Anyone who scans this QR gets access to ${map.name} only. They do not receive the server owner token or any other map."
+            textSize = 12f
+            setTextColor(FieldTheme.textSecondary)
+            setPadding(0, dp(5), 0, dp(10))
+        })
+
+        val invite = if (map.serverId.isNotBlank() && map.accessKey.startsWith("sar_map_")) buildInviteLink(map) else null
+        if (invite != null) {
+            content.addView(ImageView(this).apply {
+                setImageBitmap(QrTools.encode(invite, dp(300)))
+                adjustViewBounds = true
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                contentDescription = "QR invite for ${map.name}"
+                setBackgroundColor(android.graphics.Color.rgb(242, 239, 232))
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(316)))
+            content.addView(TextView(this).apply {
+                text = "Map key ${maskKey(map.accessKey)} · ${shortId(map.serverId)}"
+                textSize = 10f
+                setTextColor(FieldTheme.textSecondary)
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(0, dp(6), 0, dp(8))
+            })
+            val shareActions = horizontal()
+            shareActions.addView(actionButton("Share invite", primary = true) { shareMap(map) }, weightParams())
+            shareActions.addView(actionButton("Copy link", primary = false) { copyInvite(map) }, weightParams(left = 8))
+            content.addView(shareActions)
+        } else {
+            content.addView(TextView(this).apply {
+                text = "This local/legacy map does not have a share key on this phone yet. Refresh it from the owner server first."
+                textSize = 12f
+                setTextColor(FieldTheme.accent)
+                setPadding(0, dp(8), 0, dp(10))
+            })
+        }
+
+        content.addView(divider(), marginParams(top = 12, bottom = 8))
+        content.addView(TextView(this).apply {
+            text = "Map maintenance"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(FieldTheme.textPrimary)
+        })
+        content.addView(TextView(this).apply {
+            text = "Setup changes shared geometry and Cloud Anchors. Rotate invite only when you intentionally want old participant links to stop working."
+            textSize = 11f
+            setTextColor(FieldTheme.textSecondary)
+            setPadding(0, dp(4), 0, dp(8))
+        })
+        content.addView(actionButton("Update map setup", primary = false) { prepareAndLaunch(map, ArMode.MAP) })
+        content.addView(actionButton("Revoke old invites & create new QR", primary = false) { confirmRotateMapKey(map) }, marginParams(top = 7))
+        content.addView(actionButton("Delete place…", primary = false) { showDeleteMapDialog(map) }, marginParams(top = 7))
+
+        val scroll = ScrollView(this).apply { addView(content) }
         AlertDialog.Builder(this)
             .setTitle(map.name)
-            .setMessage("Map setup changes shared geometry. Sharing exposes only this place's map key. Rotating it revokes old invites.")
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> launchMap(map.id, ArMode.MAP)
-                    1 -> shareMap(map)
-                    2 -> confirmRotateMapKey(map)
-                    3 -> showDeleteMapDialog(map)
-                }
-            }
+            .setView(scroll)
             .setNegativeButton("Close", null)
             .show()
     }
 
     private fun shareMap(map: MapDefinition) {
         if (map.serverId.isBlank() || map.accessKey.isBlank()) {
-            showStatus("This legacy/local place has no share key yet. Sync it from the owner server first.", true)
+            showStatus("This place has no share key yet. Refresh it from the owner server first.", true)
             return
         }
         val link = buildInviteLink(map)
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("Spatial AR invite", link))
         val share = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "Spatial AR invite: ${map.name}")
+            putExtra(Intent.EXTRA_SUBJECT, "Spatial AR place: ${map.name}")
             putExtra(Intent.EXTRA_TEXT, link)
         }
         startActivity(Intent.createChooser(share, "Share private place invite"))
-        showStatus("Invite copied. It grants access only to ${map.name}.", false)
+    }
+
+    private fun copyInvite(map: MapDefinition) {
+        val link = buildInviteLink(map)
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Spatial AR invite", link))
+        showStatus("${map.name} invite copied. It grants access to this place only.", false)
     }
 
     private fun buildInviteLink(map: MapDefinition): String = Uri.Builder()
@@ -534,19 +634,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun confirmRotateMapKey(map: MapDefinition) {
         if (spatialApp.preferences.apiToken.isBlank()) {
-            showStatus("Rotating an invite requires the owner admin token in Server owner settings.", true)
+            revealOwnerSettings("Revoking an invite requires the sar_admin_… owner token for this server.")
             return
         }
         AlertDialog.Builder(this)
-            .setTitle("Revoke old invites?")
-            .setMessage("This creates a new key for ${map.name}. Existing saved copies using the old key will lose server access until they receive the new invite.")
+            .setTitle("Revoke old participant access?")
+            .setMessage("This immediately disconnects clients using the old ${map.name} key. A new QR will be generated and must be shared with participants again.")
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Rotate key") { _, _ -> rotateMapKey(map) }
+            .setPositiveButton("Revoke & rotate") { _, _ -> rotateMapKey(map) }
             .show()
     }
 
     private fun rotateMapKey(map: MapDefinition) {
-        showStatus("Rotating invite key for ${map.name}…", false)
+        showStatus("Rotating ${map.name} invite…", false)
         executor.execute {
             runCatching {
                 val api = MapApiClient(map.serverUrl, spatialApp.preferences.apiToken, spatialApp.logger)
@@ -559,8 +659,8 @@ class MainActivity : AppCompatActivity() {
                 spatialApp.database.upsertMap(updated)
                 runOnUiThread {
                     renderMaps()
-                    showStatus("Old invites revoked. Share the new invite with active participants.", false)
-                    shareMap(updated)
+                    showStatus("Old ${updated.name} invites revoked · new QR ready", false)
+                    showManageMapDialog(updated)
                 }
             }.onFailure { error ->
                 runOnUiThread { showStatus("Could not rotate invite: ${error.message}", true) }
@@ -572,8 +672,8 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("Delete ${map.name}?")
             .setMessage(
-                "Local deletion removes this device's scan chunks, anchor metadata and pending uploads. " +
-                    "Server + local requires the owner admin token and deletes the shared server copy. This cannot be undone."
+                "Local deletion removes this phone's scan cache and pending uploads. " +
+                    "Server + local requires the owner token and removes the shared copy for everyone."
             )
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Local only") { _, _ -> deleteLocalMap(map) }
@@ -583,7 +683,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun deleteMapEverywhere(map: MapDefinition) {
         if (spatialApp.preferences.apiToken.isBlank()) {
-            showStatus("Server deletion requires the owner admin token.", true)
+            revealOwnerSettings("Server deletion requires the sar_admin_… owner token.")
             return
         }
         showStatus("Deleting ${map.name} from server…", false)
@@ -615,8 +715,64 @@ class MainActivity : AppCompatActivity() {
         }
         spatialApp.database.deleteMap(map.id)
         spatialApp.logger.warn("Map deleted locally", mapOf("mapId" to map.id, "serverDeleted" to serverDeleted))
-        showStatus(if (serverDeleted) "Place deleted from server and this device" else "Local copy deleted; server copy was preserved", false)
+        showStatus(if (serverDeleted) "Place deleted from server and this phone" else "Local copy deleted; server copy was preserved", false)
         renderMaps()
+    }
+
+    private fun prepareAndLaunch(map: MapDefinition, mode: ArMode) {
+        val label = if (mode == ArMode.MAP) "map setup" else "Live AR"
+        showStatus("${map.name}: checking server before $label…", false)
+        executor.execute {
+            runCatching {
+                val credential = map.accessKey.ifBlank { spatialApp.preferences.apiToken }
+                val api = MapApiClient(map.serverUrl, credential, spatialApp.logger)
+                val info = api.getServerInfo()
+                if (map.serverId.isNotBlank()) check(info.serverId == map.serverId) { "This URL now belongs to a different Spatial AR server" }
+                val remote = api.getMap(map.id).copy(
+                    serverUrl = map.serverUrl,
+                    serverId = info.serverId,
+                    accessKey = map.accessKey.ifBlank { map.accessKey },
+                    syncPending = false
+                )
+                val merged = if (map.accessKey.isNotBlank()) remote.copy(accessKey = map.accessKey) else remote
+                spatialApp.database.mergeServerMap(merged)
+                if (merged.accessKey.isNotBlank()) spatialApp.database.upsertMap(merged)
+                merged
+            }.onSuccess {
+                runOnUiThread {
+                    showStatus("${map.name}: server synchronized · starting $label…", false)
+                    launchMap(map.id, mode)
+                }
+            }.onFailure { error ->
+                spatialApp.logger.warn("Pre-session map sync failed", mapOf("mapId" to map.id, "mode" to mode.name, "error" to error.message))
+                runOnUiThread {
+                    if (mode == ArMode.MAP) {
+                        showStatus("Server unavailable · setup will continue local-first and retry uploads automatically.", true)
+                        launchMap(map.id, mode)
+                    } else {
+                        showStatus("Live AR needs the shared server now: ${error.message}", true)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun openOwnerDashboard() {
+        if (!saveSettings(showMessage = false)) return
+        val token = spatialApp.preferences.apiToken
+        if (token.isBlank()) {
+            revealOwnerSettings("The operator dashboard is owner-only. Enter this server's sar_admin_… token first.")
+            return
+        }
+        val url = spatialApp.preferences.serverUrl.trimEnd('/') + "/#admin=" + Uri.encode(token)
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { showStatus("Could not open dashboard: ${it.message}", true) }
+    }
+
+    private fun revealOwnerSettings(message: String) {
+        settingsVisible = true
+        if (::settingsBody.isInitialized) settingsBody.visibility = View.VISIBLE
+        showStatus(message, true)
     }
 
     private fun launchMap(mapId: String, mode: ArMode) {
@@ -634,7 +790,13 @@ class MainActivity : AppCompatActivity() {
         else -> value.take(9) + "…" + value.takeLast(6)
     }
 
+    private fun maskKey(value: String): String = when {
+        value.length < 18 -> "configured"
+        else -> value.take(8) + "…" + value.takeLast(5)
+    }
+
     private fun showStatus(message: String, error: Boolean) {
+        if (!::status.isInitialized) return
         status.text = message
         status.setTextColor(if (error) FieldTheme.error else FieldTheme.statusBlue)
     }
