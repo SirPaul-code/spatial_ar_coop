@@ -56,6 +56,9 @@ function normalizeTrackBatch(value) {
     type: 'track_batch',
     sequence: finiteInt(value.sequence, 0),
     sentAtMs: finiteInt(value.sentAtMs, Date.now()),
+    // New clients declare that this batch is the full currently-active snapshot for this source.
+    // Old clients omit the flag and retain the original TTL/upsert behavior.
+    replaceSource: value.replaceSource === true,
     tracks: value.tracks.map((track, index) => normalizeTrack(track, index))
   };
 }
