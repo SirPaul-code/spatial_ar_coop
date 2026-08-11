@@ -2,10 +2,20 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { parseClientMessage, ProtocolError, validateClientIdentity, PROTOCOL_VERSION } from './protocol.mjs';
 
 export class RealtimeHub {
-  constructor({ server, logger, trackTtlMs = 1800, maxPayload = 256 * 1024, authorize }) {
+  constructor({
+    server,
+    logger,
+    trackTtlMs = 1800,
+    maxPayload = 256 * 1024,
+    authorize,
+    heartbeatIntervalMs = 15_000,
+    heartbeatTimeoutMs = 45_000
+  }) {
     this.logger = logger;
     this.trackTtlMs = trackTtlMs;
     this.authorize = authorize;
+    this.heartbeatIntervalMs = heartbeatIntervalMs;
+    this.heartbeatTimeoutMs = Math.max(heartbeatTimeoutMs, heartbeatIntervalMs * 2);
     this.rooms = new Map();
     this.tracks = new Map();
     this.poses = new Map();
@@ -13,8 +23,17 @@ export class RealtimeHub {
     this.wss = new WebSocketServer({ noServer: true, maxPayload });
     server.on('upgrade', (request, socket, head) => this.#upgrade(request, socket, head));
     this.wss.on('connection', (socket, request, identity) => this.#connected(socket, request, identity));
-    this.timer = setInterval(() => this.#expire(), Math.max(200, Math.min(1000, Math.floor(trackTtlMs / 3))));
-    this.timer.unref();
+
+    // Track TTL is intentionally checked much more frequently than WebSocket liveness. Mobile
+    // clients behind Tailscale/cellular links can easily take >1 s to answer a ping; using the
+    // object-track TTL as the heartbeat interval caused healthy phones to be terminated with 1006.
+    this.expireTimer = setInterval(
+      () => this.#expireTracks(),
+      Math.max(200, Math.min(1000, Math.floor(trackTtlMs / 3)))
+    );
+    this.heartbeatTimer = setInterval(() => this.#heartbeat(), this.heartbeatIntervalMs);
+    this.expireTimer.unref();
+    this.heartbeatTimer.unref();
   }
 
   metrics() {
@@ -36,6 +55,7 @@ export class RealtimeHub {
         connected: socket.readyState === WebSocket.OPEN,
         connectedAtMs: socket.connectedAtMs,
         lastMessageAtMs: socket.lastMessageAtMs,
+        lastPongAtMs: socket.lastPongAtMs,
         pose: this.poses.get(key) ?? null,
         status: this.statuses.get(key) ?? null
       };
@@ -67,7 +87,8 @@ export class RealtimeHub {
   }
 
   async close() {
-    clearInterval(this.timer);
+    clearInterval(this.expireTimer);
+    clearInterval(this.heartbeatTimer);
     const sockets = [...this.wss.clients];
     for (const socket of sockets) socket.terminate();
     await new Promise((resolve) => {
@@ -75,6 +96,7 @@ export class RealtimeHub {
       this.wss.close(() => resolve());
     });
     this.rooms.clear();
+    this.tracks.clear();
     this.poses.clear();
     this.statuses.clear();
   }
@@ -104,14 +126,15 @@ export class RealtimeHub {
   }
 
   #connected(socket, request, identity) {
+    const now = Date.now();
     socket.identity = identity;
-    socket.isAlive = true;
-    socket.connectedAtMs = Date.now();
-    socket.lastMessageAtMs = socket.connectedAtMs;
+    socket.connectedAtMs = now;
+    socket.lastMessageAtMs = now;
+    socket.lastPongAtMs = now;
     const room = this.rooms.get(identity.mapId) ?? new Set();
     room.add(socket);
     this.rooms.set(identity.mapId, room);
-    socket.on('pong', () => { socket.isAlive = true; });
+    socket.on('pong', () => { socket.lastPongAtMs = Date.now(); });
     socket.on('message', (payload, isBinary) => this.#message(socket, payload, isBinary));
     socket.on('close', (code, reason) => this.#disconnected(socket, code, reason));
     socket.on('error', (error) => this.logger.warn('ws_client_error', { ...identity, error: error.message }));
@@ -119,7 +142,7 @@ export class RealtimeHub {
     this.#send(socket, {
       type: 'welcome',
       protocolVersion: PROTOCOL_VERSION,
-      serverTimeMs: Date.now(),
+      serverTimeMs: now,
       mapId: identity.mapId,
       tracks: [...(this.tracks.get(identity.mapId)?.values() ?? [])]
     });
@@ -182,7 +205,7 @@ export class RealtimeHub {
     }
   }
 
-  #expire() {
+  #expireTracks() {
     const now = Date.now();
     for (const [mapId, roomTracks] of this.tracks) {
       const expired = [];
@@ -195,10 +218,27 @@ export class RealtimeHub {
       if (expired.length) this.#broadcast(mapId, { type: 'tracks_expired', trackKeys: expired, serverTimeMs: now });
       if (roomTracks.size === 0) this.tracks.delete(mapId);
     }
+  }
+
+  #heartbeat() {
+    const now = Date.now();
     for (const room of this.rooms.values()) {
       for (const socket of room) {
-        if (!socket.isAlive) socket.terminate();
-        else { socket.isAlive = false; socket.ping(); }
+        if (socket.readyState !== WebSocket.OPEN) continue;
+        const lastPong = Number(socket.lastPongAtMs || socket.connectedAtMs || now);
+        if (now - lastPong > this.heartbeatTimeoutMs) {
+          this.logger.warn('ws_heartbeat_timeout', {
+            ...socket.identity,
+            silenceMs: now - lastPong
+          });
+          socket.terminate();
+          continue;
+        }
+        try { socket.ping(); }
+        catch (error) {
+          this.logger.warn('ws_ping_failed', { ...socket.identity, error: error.message });
+          socket.terminate();
+        }
       }
     }
   }
