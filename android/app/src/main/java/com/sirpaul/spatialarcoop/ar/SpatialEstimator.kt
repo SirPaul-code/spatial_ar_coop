@@ -4,7 +4,6 @@ import com.google.ar.core.Coordinates2d
 import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
-import com.google.ar.core.Point
 import com.google.ar.core.TrackingState
 import com.sirpaul.spatialarcoop.vision.Detection2D
 import kotlin.math.abs
@@ -33,8 +32,9 @@ object SpatialEstimator {
             .filter { hit ->
                 when (val trackable = hit.trackable) {
                     is DepthPoint -> true
-                    is Plane -> trackable.trackingState == TrackingState.TRACKING && trackable.isPoseInPolygon(hit.hitPose)
-                    is Point -> trackable.trackingState == TrackingState.TRACKING
+                    is Plane -> trackable.trackingState == TrackingState.TRACKING &&
+                        trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                        trackable.isPoseInPolygon(hit.hitPose)
                     else -> false
                 }
             }
@@ -101,7 +101,7 @@ object SpatialEstimator {
             "cat" -> 0.38f
             else -> 0.60f
         }
-        val pixelExtent = maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
+        val pixelExtent = detection.rawBoundingBox.height()
         if (!pixelExtent.isFinite() || pixelExtent < 6f) return null
 
         val intrinsics = frame.camera.imageIntrinsics
@@ -112,8 +112,10 @@ object SpatialEstimator {
         val opticalDepth = (focalPixels * physicalHeightMeters / pixelExtent).coerceIn(0.45f, 55f)
         if (!opticalDepth.isFinite()) return null
 
-        val centerX = detection.rawBoundingBox.centerX()
-        val centerY = detection.rawBoundingBox.centerY()
+        // Position represents the object contact point used by the shared tracker, so project
+        // the bbox bottom-center rather than its visual center.
+        val centerX = detection.rawBottomCenter[0]
+        val centerY = detection.rawBottomCenter[1]
         val cameraDirection = PoseMath.normalize(
             floatArrayOf(
                 (centerX - principal[0]) / focal[0],
@@ -169,7 +171,6 @@ object SpatialEstimator {
     private fun priority(trackable: Any): Int = when (trackable) {
         is DepthPoint -> 0
         is Plane -> 1
-        is Point -> 2
-        else -> 3
+        else -> 2
     }
 }

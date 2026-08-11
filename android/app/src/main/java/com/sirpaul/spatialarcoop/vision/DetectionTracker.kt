@@ -26,7 +26,8 @@ class DetectionTracker(private val sourceId: String) {
         var position: FloatArray,
         var velocity: FloatArray,
         var uncertaintyMeters: Float,
-        var lastSeenAtMs: Long
+        var lastSeenAtMs: Long,
+        var hitCount: Int
     )
 
     private val states = linkedMapOf<String, State>()
@@ -53,7 +54,8 @@ class DetectionTracker(private val sourceId: String) {
                     position = observation.position.copyOf(),
                     velocity = floatArrayOf(0f, 0f, 0f),
                     uncertaintyMeters = observation.uncertaintyMeters,
-                    lastSeenAtMs = observation.observedAtMs
+                    lastSeenAtMs = observation.observedAtMs,
+                    hitCount = 1
                 )
             } else {
                 unmatched.remove(candidate)
@@ -61,13 +63,13 @@ class DetectionTracker(private val sourceId: String) {
             }
         }
         expire(nowMs)
-        return states.values.map { toPublicTrack(it, nowMs) }
+        return states.values.filter { it.hitCount >= CONFIRMATION_HITS }.map { toPublicTrack(it, nowMs) }
     }
 
     @Synchronized
     fun current(nowMs: Long = System.currentTimeMillis()): List<SpatialTrack> {
         expire(nowMs)
-        return states.values.map { toPublicTrack(it, nowMs) }
+        return states.values.filter { it.hitCount >= CONFIRMATION_HITS }.map { toPublicTrack(it, nowMs) }
     }
 
     @Synchronized
@@ -87,6 +89,7 @@ class DetectionTracker(private val sourceId: String) {
         state.confidence = state.confidence * 0.35f + observation.confidence * 0.65f
         state.uncertaintyMeters = state.uncertaintyMeters * 0.4f + observation.uncertaintyMeters * 0.6f
         state.lastSeenAtMs = observation.observedAtMs
+        state.hitCount += 1
     }
 
     private fun predictedPosition(state: State, atMs: Long): FloatArray {
@@ -107,8 +110,8 @@ class DetectionTracker(private val sourceId: String) {
     private fun associationRadius(state: State, observation: SpatialObservation): Float {
         val ageSeconds = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f)
         val base = if (observation.label == "bird") BIRD_ASSOCIATION_METERS else BASE_ASSOCIATION_METERS
-        return (base + ageSeconds * 1.1f + state.uncertaintyMeters + observation.uncertaintyMeters)
-            .coerceAtMost(4f)
+        val uncertaintyAllowance = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.6f)
+        return (base + ageSeconds * 0.8f + uncertaintyAllowance).coerceAtMost(2.8f)
     }
 
     private fun expire(nowMs: Long) {
@@ -137,7 +140,8 @@ class DetectionTracker(private val sourceId: String) {
         private const val BASE_ASSOCIATION_METERS = 0.8f
         private const val BIRD_ASSOCIATION_METERS = 0.45f
         private const val MAX_SPEED_METERS_PER_SECOND = 18f
-        private const val MAX_PREDICTION_SECONDS = 1.5f
-        private const val TRACK_TIMEOUT_MS = 2_200L
+        private const val MAX_PREDICTION_SECONDS = 0.9f
+        private const val TRACK_TIMEOUT_MS = 1_200L
+        private const val CONFIRMATION_HITS = 2
     }
 }

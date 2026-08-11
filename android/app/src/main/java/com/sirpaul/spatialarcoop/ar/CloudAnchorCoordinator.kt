@@ -35,7 +35,6 @@ class CloudAnchorCoordinator(
     private val hosting = AtomicBoolean(false)
     private val resolving = AtomicBoolean(false)
     private val resolveGeneration = AtomicInteger(0)
-    @Volatile private var resolveStartedAtMs = 0L
     private val hostFutures = CopyOnWriteArrayList<HostCloudAnchorFuture>()
     private val resolveFutures = CopyOnWriteArrayList<ResolveCloudAnchorFuture>()
     private val ownedAnchors = CopyOnWriteArrayList<Anchor>()
@@ -66,17 +65,10 @@ class CloudAnchorCoordinator(
         }
         if (hasReference) return
 
-        val now = System.currentTimeMillis()
-        if (resolving.get()) {
-            if (now - resolveStartedAtMs <= RESOLVE_BATCH_TIMEOUT_MS) return
-            logger.warn(
-                "Cloud Anchor resolve batch timed out",
-                mapOf("mapId" to mapId, "elapsedMs" to (now - resolveStartedAtMs), "pending" to resolveFutures.size)
-            )
-            cancelResolveBatch()
-            onState("Saved-anchor lookup timed out · retrying automatically")
-        }
-        if (!resolving.compareAndSet(false, true)) return
+        // ARCore resolution is itself an asynchronous visual feature-matching operation. Keep
+        // a pending batch alive until ARCore returns a real result; cancelling after a short app
+        // timer can repeatedly throw away an otherwise healthy resolve just before it matches.
+        if (resolving.get() || !resolving.compareAndSet(false, true)) return
 
         val candidates = map.anchors
             .filter { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
@@ -91,9 +83,9 @@ class CloudAnchorCoordinator(
             return
         }
 
-        resolveStartedAtMs = now
         val generation = resolveGeneration.incrementAndGet()
         val remaining = AtomicInteger(candidates.size)
+        val failures = CopyOnWriteArrayList<String>()
         onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")
         logger.info(
             "Cloud Anchor resolve batch started",
@@ -117,7 +109,6 @@ class CloudAnchorCoordinator(
                     if (reference.compareAndSet(null, Reference(anchor, definition))) {
                         ownedAnchors += anchor
                         resolving.set(false)
-                        resolveStartedAtMs = 0L
                         // Invalidate/cancel every other candidate from this batch. First valid
                         // shared reference wins; all remaining callbacks become stale by generation.
                         resolveGeneration.incrementAndGet()
@@ -137,6 +128,7 @@ class CloudAnchorCoordinator(
 
                 anchor?.detach()
                 val left = remaining.decrementAndGet()
+                failures += "${definition.id.takeLast(8)}=${state.name}"
                 logger.warn(
                     "Cloud Anchor resolve failed",
                     mapOf(
@@ -148,11 +140,14 @@ class CloudAnchorCoordinator(
                         "remaining" to left
                     )
                 )
+                if (left > 0 && generation == resolveGeneration.get() && reference.get() == null) {
+                    onState("Anchor ${index + 1}/${candidates.size}: ${state.name} · trying $left more")
+                }
                 if (left <= 0 && generation == resolveGeneration.get() && reference.get() == null) {
                     resolving.set(false)
-                    resolveStartedAtMs = 0L
                     resolveFutures.clear()
-                    onState("No saved anchor matched yet · retrying automatically")
+                    val summary = failures.joinToString(", ").take(220)
+                    onState("Localization failed: $summary · retrying automatically")
                 }
             }
             pending = future
@@ -165,7 +160,6 @@ class CloudAnchorCoordinator(
         resolveFutures.forEach { runCatching { it.cancel() } }
         resolveFutures.clear()
         resolving.set(false)
-        resolveStartedAtMs = 0L
     }
 
     fun featureQuality(cameraPose: Pose): FeatureQuality = runCatching {
@@ -345,7 +339,6 @@ class CloudAnchorCoordinator(
     companion object {
         private const val AUTO_HOST_COOLDOWN_MS = 8_000L
         private const val RETRY_RADIUS_METERS = 4f
-        private const val MAX_CONCURRENT_RESOLVES = 4
-        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L
+        private const val MAX_CONCURRENT_RESOLVES = 8
     }
 }

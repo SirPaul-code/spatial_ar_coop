@@ -1,5 +1,13 @@
 # Android release notes
 
+## 1.0.3
+
+- Cloud Anchor resolve futures are no longer cancelled by the app after 12 seconds; pending ARCore visual matching is allowed to complete and real per-anchor failure states are surfaced before retry.
+- Moving-object 3D estimation no longer accepts generic background feature-point hits. It uses Depth, upward-facing horizontal planes, saved-ground projection, then monocular class-size fallback.
+- Monocular fallback projects the detector bottom-center and uses bbox height consistently, reducing depth jumps.
+- Person/car/dog/cat use a stricter field threshold while `bird` keeps lower recall tuning for chickens; same-class overlap NMS removes duplicate raw detections.
+- Spatial tracks require two observations before publication and expire faster, reducing one-frame IDs and stacked ghost tracks.
+
 ## 1.0.2
 
 - Live AR now starts on-device object detection and compact track sharing automatically for every participant. There is no separate reporting opt-in in the normal Live flow.

@@ -50,14 +50,14 @@ class ObjectDetectorEngine(
                     if (upright !== rawBitmap) upright.recycle()
                     rawBitmap.recycle()
                 }
-                val detections = result.detections().mapNotNull { detection ->
+                val candidates = result.detections().mapNotNull { detection ->
                     val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
                     val label = category.categoryName().lowercase()
                     if (label !in ALLOWED_LABELS) return@mapNotNull null
                     // Chickens are represented by EfficientDet/COCO as "bird". Small birds are
                     // substantially harder than people/cars, so keep the user's normal threshold
                     // for other classes while allowing a modestly lower bird floor for recall.
-                    val effectiveThreshold = minOf(threshold, classScoreThreshold(label))
+                    val effectiveThreshold = if (label == "bird") minOf(threshold, BIRD_SCORE_THRESHOLD) else maxOf(threshold, GENERAL_SCORE_THRESHOLD)
                     if (category.score() < effectiveThreshold) return@mapNotNull null
                     val box = detection.boundingBox()
                     val bottomCenterRotated = floatArrayOf(box.centerX(), box.bottom - box.height() * 0.04f)
@@ -85,6 +85,7 @@ class ObjectDetectorEngine(
                         rawImageHeight = frame.height
                     )
                 }
+                val detections = suppressOverlaps(candidates)
                 onResult(detections, (System.nanoTime() - start) / 1_000_000L)
             } catch (error: Throwable) {
                 logger.error("Object detection failed", error)
@@ -116,12 +117,34 @@ class ObjectDetectorEngine(
                 mapOf(
                     "threshold" to threshold,
                     "birdThreshold" to minOf(threshold, BIRD_SCORE_THRESHOLD),
-                    "generalThreshold" to minOf(threshold, GENERAL_SCORE_THRESHOLD),
+                    "generalThreshold" to maxOf(threshold, GENERAL_SCORE_THRESHOLD),
                     "maxResults" to MAX_RESULTS,
                     "labels" to ALLOWED_LABELS.joinToString()
                 )
             )
         }
+    }
+
+    private fun suppressOverlaps(values: List<Detection2D>): List<Detection2D> {
+        val kept = mutableListOf<Detection2D>()
+        values.sortedByDescending { it.confidence }.forEach { candidate ->
+            val duplicate = kept.any { existing ->
+                existing.label == candidate.label && intersectionOverUnion(existing.rawBoundingBox, candidate.rawBoundingBox) >= NMS_IOU_THRESHOLD
+            }
+            if (!duplicate) kept += candidate
+        }
+        return kept
+    }
+
+    private fun intersectionOverUnion(a: RectF, b: RectF): Float {
+        val left = maxOf(a.left, b.left)
+        val top = maxOf(a.top, b.top)
+        val right = minOf(a.right, b.right)
+        val bottom = minOf(a.bottom, b.bottom)
+        val intersection = (right - left).coerceAtLeast(0f) * (bottom - top).coerceAtLeast(0f)
+        if (intersection <= 0f) return 0f
+        val union = a.width() * a.height() + b.width() * b.height() - intersection
+        return if (union > 0f) intersection / union else 0f
     }
 
     override fun close() {
@@ -143,7 +166,8 @@ class ObjectDetectorEngine(
         private val ALLOWED_LABELS = setOf("person", "car", "bird", "dog", "cat")
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.25f
         private const val BIRD_SCORE_THRESHOLD = 0.25f
-        private const val GENERAL_SCORE_THRESHOLD = 0.35f
-        private const val MAX_RESULTS = 48
+        private const val GENERAL_SCORE_THRESHOLD = 0.45f
+        private const val NMS_IOU_THRESHOLD = 0.55f
+        private const val MAX_RESULTS = 24
     }
 }
