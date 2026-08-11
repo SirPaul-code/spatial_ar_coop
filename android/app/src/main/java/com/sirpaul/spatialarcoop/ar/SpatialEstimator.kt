@@ -288,7 +288,10 @@ object SpatialEstimator {
         val bearing = atan2(sitePosition[0] - camera[0], sitePosition[2] - camera[2])
         val sideView = detection.label.equals("car", true) &&
             detection.rawBoundingBox.width() / detection.rawBoundingBox.height().coerceAtLeast(1f) >= CAR_SIDE_ASPECT
-        return normalizeAngle(if (sideView) bearing + (PI.toFloat() / 2f) else bearing)
+        val desiredDepthAxisBearing = if (sideView) bearing + (PI.toFloat() / 2f) else bearing
+        // The cuboid renderer rotates local [x,z] as x'=x*cos-z*sin, z'=x*sin+z*cos.
+        // Therefore the resulting +Z axis has site bearing -yaw.
+        return normalizeAngle(-desiredDepthAxisBearing)
     }
 
     private fun normalizeAngle(value: Float): Float {
