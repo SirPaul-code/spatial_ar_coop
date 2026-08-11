@@ -1,0 +1,34 @@
+name: Apply live AR lifecycle patch
+
+on:
+  push:
+    branches: [live-bird-arcore-fix]
+    paths:
+      - 'scripts/_apply_live_arcore_tracking_fix.py'
+      - '.github/workflows/_apply-live-arcore-tracking-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: live-bird-arcore-fix
+      - name: Apply deterministic source patch
+        run: |
+          python3 scripts/_apply_live_arcore_tracking_fix.py
+          git diff --check
+          grep -q 'ArSessionProfile.COMPATIBILITY' android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
+          grep -q 'projectTrackBounds' android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
+      - name: Commit patched source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix(android): stabilize ARCore startup and shared live boxes'
+          git push origin HEAD:live-bird-arcore-fix
