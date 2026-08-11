@@ -64,18 +64,7 @@ class CloudAnchorCoordinator(
             onState("Cloud Anchors are not configured in this APK")
             return
         }
-        if (hasReference) return
-
-        val now = System.currentTimeMillis()
-        if (resolving.get()) {
-            if (now - resolveStartedAtMs <= RESOLVE_BATCH_TIMEOUT_MS) return
-            logger.warn(
-                "Cloud Anchor resolve batch timed out",
-                mapOf("mapId" to mapId, "elapsedMs" to (now - resolveStartedAtMs), "pending" to resolveFutures.size)
-            )
-            cancelResolveBatch()
-            onState("Saved-anchor lookup timed out · retrying automatically")
-        }
+        if (hasReference || resolving.get()) return
         if (!resolving.compareAndSet(false, true)) return
 
         val candidates = map.anchors
@@ -91,7 +80,7 @@ class CloudAnchorCoordinator(
             return
         }
 
-        resolveStartedAtMs = now
+        resolveStartedAtMs = System.currentTimeMillis()
         val generation = resolveGeneration.incrementAndGet()
         val remaining = AtomicInteger(candidates.size)
         onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")
@@ -118,8 +107,8 @@ class CloudAnchorCoordinator(
                         ownedAnchors += anchor
                         resolving.set(false)
                         resolveStartedAtMs = 0L
-                        // Invalidate/cancel every other candidate from this batch. First valid
-                        // shared reference wins; all remaining callbacks become stale by generation.
+                        // First valid shared reference wins. Invalidate and cancel the remaining
+                        // candidates only after success, not merely because localization took time.
                         resolveGeneration.incrementAndGet()
                         val others = resolveFutures.toList()
                         resolveFutures.clear()
@@ -152,7 +141,7 @@ class CloudAnchorCoordinator(
                     resolving.set(false)
                     resolveStartedAtMs = 0L
                     resolveFutures.clear()
-                    onState("No saved anchor matched yet · retrying automatically")
+                    onState("No saved anchor matched yet · keep looking around; retrying automatically")
                 }
             }
             pending = future
@@ -346,6 +335,5 @@ class CloudAnchorCoordinator(
         private const val AUTO_HOST_COOLDOWN_MS = 8_000L
         private const val RETRY_RADIUS_METERS = 4f
         private const val MAX_CONCURRENT_RESOLVES = 4
-        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L
     }
 }
