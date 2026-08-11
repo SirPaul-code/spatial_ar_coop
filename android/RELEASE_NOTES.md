@@ -2,10 +2,11 @@
 
 ## 1.0.5
 
-- Add temporal image-space association before spatial tracking. Weak detections may maintain an existing object, but only stronger class-specific detections may create a new identity.
-- Lower the detector candidate floor for difficult `bird`/chicken views while requiring temporal confirmation before any detection can become a shared 3D track.
+- Add temporal image-space association before spatial tracking. Person/car require a strong observation to create an identity; `bird` may start as an internal weak hypothesis but must persist across several consistent frames before it becomes visible or shared.
+- Lower the detector candidate floor for difficult `bird`/chicken views, keep weak confirmed birds alive through short confidence drops, and retain temporal identities longer through brief mesh/occlusion gaps.
+- Use class-aware duplicate suppression, including containment suppression for nested person/car boxes, before temporal association.
 - Smooth detector boxes over time and keep short confidence dips/partial occlusion from immediately destroying an object's local identity.
-- Bind every accepted detection to the ARCore camera pose and image intrinsics captured with that detector frame, so inference latency cannot mix an older bbox with a newer camera pose while the phone is moving.
+- Bind every accepted detection to the ARCore image intrinsics and shared-site camera pose captured with that detector frame, so inference latency cannot mix an older bbox with a newer camera pose while the phone is moving.
 - Prefer saved-ground contact projection for people, cars, birds, dogs and cats instead of allowing target/background Depth hits to redefine the shared position frame-to-frame.
 - Reject near-horizon ground rays and physically implausible class scale/range combinations instead of publishing large 3D jumps.
 - Harden the spatial tracker with measurement outlier rejection, conservative identity re-acquisition, adaptive correction, stationary deadband and bounded 300 ms motion prediction so stale velocity cannot keep drifting a marker.
