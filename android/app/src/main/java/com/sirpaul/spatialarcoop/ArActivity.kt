@@ -17,8 +17,10 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.google.ar.core.ArCoreApk
@@ -80,6 +82,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private lateinit var arErrorPanel: LinearLayout
     private lateinit var arErrorText: TextView
     private var reportButton: Button? = null
+    private var finishSetupButton: Button? = null
 
     @Volatile private var session: Session? = null
     private val arState = ArSessionStateMachine()
@@ -101,6 +104,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var lastMapRefreshAtMs = 0L
     private var featureQuality = FeatureQuality.UNKNOWN
     private var mappingFinished = false
+    private var setupOriginAutoEstablished = false
+    private var lastAutoGroundAttemptMs = 0L
+    @Volatile private var realtimeConnected = false
     private var sequence = 0L
 
     private val cachedMap = AtomicReference<MapDefinition?>(null)
@@ -228,32 +234,31 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val scroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(6), dp(8), dp(8))
-            setBackgroundColor(Color.argb(218, 23, 24, 26))
+            setBackgroundColor(Color.argb(224, 23, 24, 26))
         }
         actions.addView(action("Back") { finishSafely() })
         when (mode) {
             ArMode.MAP -> {
-                actions.addView(action("Align origin") { requestManualAlign.set(true) })
-                actions.addView(action("Add anchor") { requestHost.set(true) })
-                actions.addView(action("Retry nearby") { requestRetryAnchor.set(true) })
-                actions.addView(action("Set ground") { requestGround.set(true) })
-                actions.addView(action("Finish map") { requestFinish.set(true) })
+                finishSetupButton = action("Finish setup") {
+                    showDetail("Checking map readiness…")
+                    requestFinish.set(true)
+                }.also { button ->
+                    button.isEnabled = false
+                    button.alpha = 0.48f
+                    actions.addView(button)
+                }
+                actions.addView(action("More") { showMapSetupMenu() })
             }
             ArMode.LIVE -> {
                 reportButton = action("Start reporting") { setReporting(!reporting) }.also(actions::addView)
-                actions.addView(action("Re-localize") { requestRelocalize.set(true) })
-                if (!BuildConfig.CLOUD_ANCHORS_CONFIGURED) {
-                    actions.addView(action("Align fallback") { requestManualAlign.set(true) })
-                }
+                actions.addView(action("More") { showLiveMenu() })
             }
             ArMode.SENSOR, ArMode.VIEWER -> {
-                actions.addView(action("Align fallback") { requestManualAlign.set(true) })
-                actions.addView(action("Re-localize") { requestRelocalize.set(true) })
+                actions.addView(action("More") { showLiveMenu() })
             }
         }
-        actions.addView(action("Mark") { requestMarker.set(true) })
-        actions.addView(action("Diagnostics") { Diagnostics.shareLogs(this, spatialApp.logger) })
         scroll.addView(actions)
         root.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
 
@@ -355,7 +360,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             }
             hideArFailure()
             resumeGlIfNeeded()
-            showDetail("AR session running · looking for shared anchor")
+            showDetail(
+                when (mode) {
+                    ArMode.MAP -> "AR ready · preparing shared coordinates…"
+                    ArMode.LIVE -> "AR ready · resolving this place…"
+                    else -> "AR ready · resolving shared location…"
+                }
+            )
         } catch (error: Throwable) {
             failArSession(error, "resume")
         }
@@ -541,15 +552,34 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
 
         var map = currentMap() ?: return
+        val hostedBefore = map.anchors.any { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
+
+        // A brand-new map does not need a mysterious manual "Align origin" step. The first stable
+        // TRACKING frame defines the gravity-aligned site frame. Once a Cloud Anchor is hosted,
+        // subsequent sessions resolve back into this same shared site frame.
+        if (mode == ArMode.MAP && manualWorldFromSite.get() == null && cloudAnchors?.currentWorldFromSite() == null && !hostedBefore) {
+            val (existingChunks, _) = spatialApp.database.chunkCounts(mapId)
+            if (existingChunks == 0 && map.anchors.isEmpty()) {
+                val automaticOrigin = PoseMath.horizontalOrigin(camera.pose)
+                if (manualWorldFromSite.compareAndSet(null, automaticOrigin)) {
+                    setupOriginAutoEstablished = true
+                    resolveLastAttemptMs = System.currentTimeMillis()
+                    showDetail("Shared origin ready · walk slowly around the area; scanning is automatic")
+                    spatialApp.logger.info("Map origin established automatically", mapOf("mapId" to mapId))
+                }
+            }
+        }
+
         if (requestManualAlign.getAndSet(false)) {
             manualWorldFromSite.set(PoseMath.horizontalOrigin(camera.pose))
             manualAlignmentOverride = mode != ArMode.MAP
+            setupOriginAutoEstablished = false
             resolveLastAttemptMs = System.currentTimeMillis()
             showDetail(
                 if (mode == ArMode.MAP) {
-                    "Site origin aligned. Keep this physical spot and facing direction as the manual fallback."
+                    "Shared origin re-established here. Only use this recovery action at the original map start position and heading."
                 } else {
-                    "Manual site alignment active. Tracking now uses this marked origin and heading."
+                    "Fallback alignment active from this position and heading."
                 }
             )
             spatialApp.logger.info(
@@ -562,6 +592,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             manualAlignmentOverride = false
             cloudAnchors?.resetReference()
             resolveLastAttemptMs = 0L
+            showDetail("Re-localizing · point around a mapped anchor area and move slowly")
         }
 
         val cloudWorldFromSite = cloudAnchors?.currentWorldFromSite()
@@ -577,10 +608,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
         if (worldFromSite == null) {
             val hosted = map.anchors.any { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
+            val (existingChunks, _) = spatialApp.database.chunkCounts(mapId)
             val instruction = when {
-                mode == ArMode.MAP && !hosted -> "Stand at the chosen map origin, face a repeatable direction, then tap ALIGN ORIGIN"
-                BuildConfig.CLOUD_ANCHORS_CONFIGURED && hosted -> "Point at a mapped anchor area and move slowly, or use ALIGN HERE at the saved origin"
-                else -> "Stand at the saved physical origin, face the saved direction, then tap ALIGN HERE"
+                mode == ArMode.MAP && !hosted && existingChunks > 0 ->
+                    "This unfinished map has no usable Cloud Anchor. Stand at its original start position and use More → Re-establish shared origin."
+                mode == ArMode.MAP -> "Preparing shared coordinates · hold the phone steady and look around"
+                BuildConfig.CLOUD_ANCHORS_CONFIGURED && hosted ->
+                    "Resolving shared location · point around the mapped area and move slowly"
+                else -> "Shared location unavailable · use More → Align fallback at the saved physical origin"
             }
             updateHud(frame, null, instruction)
             overlay.updateTracks(emptyList())
@@ -621,7 +656,24 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             lastFeatureQualityAtMs = now
             featureQuality = cloudAnchors?.featureQuality(frame.camera.pose) ?: FeatureQuality.UNKNOWN
         }
-        if (!mappingFinished) cloudAnchors?.considerAutoHost(frame.camera.pose, worldFromSite, map)
+
+        // Ground is a refinement for feet/wheels, not a prerequisite for mapping. Detect a plausible
+        // floor opportunistically so normal setup does not expose a "Set ground" concept.
+        if (!mappingFinished && map.groundY == null && now - lastAutoGroundAttemptMs >= AUTO_GROUND_INTERVAL_MS) {
+            lastAutoGroundAttemptMs = now
+            val candidate = SpatialEstimator.centerGroundPoint(frame, worldFromSite, null)
+            if (candidate != null && candidate[1] in -3.0f..-0.25f) {
+                spatialApp.database.updateMapRuntime(mapId, groundY = candidate[1])
+                currentMap(forceRefresh = true)
+                UploadScheduler.enqueue(this)
+                showDetail("Floor detected automatically · keep walking slowly to map the area")
+                spatialApp.logger.info("Ground plane detected automatically", mapOf("mapId" to mapId, "groundY" to candidate[1]))
+            }
+        }
+
+        // CloudAnchorCoordinator already spaces anchors and only hosts automatically at GOOD feature
+        // quality. No normal-user "Add anchor" step is required.
+        if (!mappingFinished) cloudAnchors?.considerAutoHost(frame.camera.pose, worldFromSite, currentMap() ?: map)
         if (now - lastScanHudAtMs >= SCAN_HUD_INTERVAL_MS) {
             lastScanHudAtMs = now
             val (chunks, points) = spatialApp.database.chunkCounts(mapId)
@@ -708,6 +760,75 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         showDetail(if (enabled) "Reporting enabled · detections are shared with this place" else "Observing · reporting is off")
     }
 
+    private fun showMapSetupMenu() {
+        val labels = arrayOf(
+            "Re-establish shared origin",
+            "Host Cloud Anchor here now",
+            "Retry nearest failed anchor",
+            "Set floor from camera center",
+            "Place shared test marker",
+            "Share diagnostics"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Map setup · advanced")
+            .setMessage("Scanning, anchor placement and floor detection are automatic. Use these recovery tools only when the guided status asks for them.")
+            .setItems(labels) { _, which ->
+                when (which) {
+                    0 -> {
+                        showDetail("Recovery: stand at the original map start position and heading; re-establishing origin…")
+                        requestManualAlign.set(true)
+                    }
+                    1 -> {
+                        showDetail("Manual Cloud Anchor request · keep the phone steady in a visually detailed area")
+                        requestHost.set(true)
+                    }
+                    2 -> {
+                        showDetail("Looking for the nearest failed anchor to retry…")
+                        requestRetryAnchor.set(true)
+                    }
+                    3 -> {
+                        showDetail("Look at the floor near the center of the camera while it is detected…")
+                        requestGround.set(true)
+                    }
+                    4 -> {
+                        showDetail("Placing a temporary shared test marker…")
+                        requestMarker.set(true)
+                    }
+                    5 -> Diagnostics.shareLogs(this, spatialApp.logger)
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showLiveMenu() {
+        val labels = buildList {
+            add("Re-localize with saved Cloud Anchors")
+            if (!BuildConfig.CLOUD_ANCHORS_CONFIGURED) add("Align fallback at saved origin")
+            add("Place shared test marker")
+            add("Share diagnostics")
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Live AR · tools")
+            .setItems(labels) { _, which ->
+                val selected = labels[which]
+                when {
+                    selected.startsWith("Re-localize") -> {
+                        showDetail("Re-localizing · move slowly while looking around the mapped area")
+                        requestRelocalize.set(true)
+                    }
+                    selected.startsWith("Align fallback") -> {
+                        showDetail("Fallback alignment: stand at the saved physical origin and face the saved heading")
+                        requestManualAlign.set(true)
+                    }
+                    selected.startsWith("Place") -> requestMarker.set(true)
+                    selected.startsWith("Share diagnostics") -> Diagnostics.shareLogs(this, spatialApp.logger)
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
     private fun projectDetectionBoxes(frame: Frame, detections: List<Detection2D>): List<ProjectedBox> {
         return detections.mapNotNull { detection ->
             val box = detection.rawBoundingBox
@@ -738,12 +859,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
         if (requestGround.getAndSet(false) && mode == ArMode.MAP) {
             val point = SpatialEstimator.centerGroundPoint(frame, worldFromSite, null)
-            if (point == null) showDetail("No ground hit; scan the floor and try again")
+            if (point == null) showDetail("Floor not found · point the camera at a visible floor area and try again")
             else {
                 spatialApp.database.updateMapRuntime(mapId, groundY = point[1])
                 currentMap(forceRefresh = true)
                 UploadScheduler.enqueue(this)
-                showDetail("Ground plane set to site Y ${"%.2f".format(point[1])} m")
+                showDetail("Floor saved · object positions can now use ground projection")
             }
         }
         if (requestMarker.getAndSet(false)) {
@@ -752,15 +873,55 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             val id = "m-${System.currentTimeMillis()}-${UUID.randomUUID().toString().take(4)}"
             realtime?.sendManualMarker(id, "marker", point)
             remoteTracks.addMarker(id, "marker", point, System.currentTimeMillis() + 60_000L)
-            showDetail("Shared marker placed")
+            showDetail("Shared test marker placed for 60 seconds")
         }
         if (requestFinish.getAndSet(false) && mode == ArMode.MAP) {
-            pointRecorder?.flush()
-            mappingFinished = true
-            spatialApp.database.updateMapRuntime(mapId, status = MapStatus.READY)
-            currentMap(forceRefresh = true)
-            UploadScheduler.enqueue(this)
-            showDetail("Map marked READY; saved chunks continue uploading")
+            val latest = currentMap(forceRefresh = true) ?: map
+            val (ready, reason) = setupReadiness(latest)
+            if (!ready) {
+                showDetail(reason)
+            } else {
+                pointRecorder?.flush()
+                pointRecorder?.stop()
+                pointRecorder = null
+                mappingFinished = true
+                spatialApp.database.updateMapRuntime(mapId, status = MapStatus.READY)
+                currentMap(forceRefresh = true)
+                UploadScheduler.enqueue(this)
+                realtime?.sendStatus("map_ready", "setup complete; final uploads queued")
+                runOnUiThread {
+                    stateText.text = "${latest.name} · Setup complete"
+                    detailText.text = "Saved locally · final server sync is queued automatically"
+                    Toast.makeText(this, "${latest.name} is ready for Live AR", Toast.LENGTH_LONG).show()
+                    window.decorView.postDelayed({ if (!closing.get()) finishSafely() }, 900L)
+                }
+            }
+        }
+    }
+
+    private fun setupReadiness(map: MapDefinition): Pair<Boolean, String> {
+        val (chunks, points) = spatialApp.database.chunkCounts(mapId)
+        val hosted = map.anchors.count { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
+        val geometryReady = chunks >= MIN_SETUP_CHUNKS && points >= MIN_SETUP_POINTS
+        val anchorReady = !BuildConfig.CLOUD_ANCHORS_CONFIGURED || hosted > 0
+        val ready = geometryReady && anchorReady
+        val reason = when {
+            !geometryReady -> "Keep scanning · move slowly around the area until at least $MIN_SETUP_POINTS points are captured ($points now)"
+            !anchorReady -> "Keep mapping a visually detailed area · waiting for the first Cloud Anchor to finish hosting"
+            else -> "Ready to finish setup"
+        }
+        return ready to reason
+    }
+
+    private fun updateFinishButton(map: MapDefinition, chunks: Int, points: Int) {
+        if (mode != ArMode.MAP) return
+        val hosted = map.anchors.count { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
+        val ready = chunks >= MIN_SETUP_CHUNKS && points >= MIN_SETUP_POINTS &&
+            (!BuildConfig.CLOUD_ANCHORS_CONFIGURED || hosted > 0)
+        runOnUiThread {
+            finishSetupButton?.isEnabled = ready
+            finishSetupButton?.alpha = if (ready) 1f else 0.48f
+            finishSetupButton?.text = if (ready) "Finish setup" else "Keep scanning"
         }
     }
 
@@ -800,23 +961,43 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val map = currentMap() ?: return
         val anchors = map.anchors
         val hosted = anchors.count { it.status == AnchorStatus.HOSTED }
-        val pending = anchors.count { it.status == AnchorStatus.HOSTING || it.status == AnchorStatus.NEEDS_RESCAN }
-        val localization = when {
-            worldFromSite != null -> "LOCALIZED"
-            cloudAnchors?.isResolving == true -> "RESOLVING"
-            else -> "NOT LOCALIZED"
+        val hosting = anchors.count { it.status == AnchorStatus.HOSTING }
+        val failed = anchors.count { it.status == AnchorStatus.NEEDS_RESCAN || it.status == AnchorStatus.FAILED }
+        val (chunks, points) = spatialApp.database.chunkCounts(mapId)
+        val locationState = when {
+            worldFromSite != null -> "Localized"
+            cloudAnchors?.isResolving == true -> "Localizing…"
+            else -> "Waiting for location"
         }
         runOnUiThread {
-            stateText.text = "${currentMap()?.name ?: mapId} · ${localization.lowercase().replaceFirstChar { it.uppercase() }} · ${frame.camera.trackingState.name.lowercase()}"
+            stateText.text = when (mode) {
+                ArMode.MAP -> "${map.name} · Map setup · ${if (worldFromSite != null) "Scanning" else "Preparing"}"
+                ArMode.LIVE -> "${map.name} · $locationState"
+                else -> "${map.name} · $locationState"
+            }
             overrideDetail?.let { detailText.text = it } ?: run {
                 detailText.text = when (mode) {
-                    ArMode.MAP -> "${featureQuality.name.lowercase()} features · $hosted anchors · $pending pending/rescan"
+                    ArMode.MAP -> buildString {
+                        append("Move slowly · $points points in $chunks chunks · $hosted anchor")
+                        if (hosted != 1) append('s')
+                        if (hosting > 0) append(" · hosting $hosting")
+                        if (failed > 0) append(" · $failed retry automatically when nearby")
+                        append(" · features ${featureQuality.name.lowercase()}")
+                        append(if (map.groundY != null) " · floor ready" else " · finding floor")
+                    }
                     ArMode.SENSOR -> "$latestLocalTrackCount tracks · ${latestInferenceMs} ms inference"
-                    ArMode.LIVE -> if (reporting) "$latestLocalTrackCount live tracks · reporting" else "Observing shared tracks · reporting off"
-                    ArMode.VIEWER -> "Observing shared tracks"
+                    ArMode.LIVE -> if (worldFromSite == null) {
+                        "Move slowly while the app resolves a saved Cloud Anchor"
+                    } else if (reporting) {
+                        "$latestLocalTrackCount local tracks · reporting to this place"
+                    } else {
+                        "Observing shared tracks · tap Start reporting to contribute detections"
+                    }
+                    ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks"
                 }
             }
         }
+        updateFinishButton(map, chunks, points)
     }
 
     private fun updateScanOverlay(chunks: Int, points: Int) {
@@ -824,6 +1005,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val hosted = map.anchors.count { it.status == AnchorStatus.HOSTED }
         val pending = map.anchors.count { it.status == AnchorStatus.HOSTING || it.status == AnchorStatus.NEEDS_RESCAN }
         overlay.updateScanState(ScanOverlayState(chunks, points, featureQuality.name, hosted, pending), visible = mode == ArMode.MAP)
+        updateFinishButton(map, chunks, points)
     }
 
     private fun currentMap(forceRefresh: Boolean = false): MapDefinition? {
@@ -841,8 +1023,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     }
 
     override fun onConnectionState(connected: Boolean, detail: String) {
+        realtimeConnected = connected
         runOnUiThread {
-            networkText.text = if (connected) "Server connected" else "Server: $detail"
+            networkText.text = when {
+                connected && mode == ArMode.MAP -> "Server connected · map sync is automatic"
+                connected -> "Server connected · live sharing active"
+                mode == ArMode.MAP -> "Server offline · scan is saved locally · upload retry automatic"
+                else -> "Server reconnecting · shared tracks temporarily unavailable"
+            }
             networkText.setTextColor(if (connected) FieldTheme.statusBlue else FieldTheme.accent)
             if (connected && mode == ArMode.LIVE) realtime?.sendStatus(if (reporting) "reporting" else "observing")
         }
@@ -884,6 +1072,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val MAP_CACHE_INTERVAL_MS = 500L
         private const val HUD_INTERVAL_MS = 350L
         private const val RESOLVE_RETRY_MS = 15_000L
+        private const val AUTO_GROUND_INTERVAL_MS = 1_000L
+        private const val MIN_SETUP_CHUNKS = 2
+        private const val MIN_SETUP_POINTS = 1_000
     }
 }
 
