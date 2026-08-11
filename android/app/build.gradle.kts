@@ -91,9 +91,8 @@ android {
 
 val modelFile = layout.projectDirectory.file("src/main/assets/efficientdet-lite2.tflite").asFile
 val modelUrl = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite"
-// Filled after the one-shot metadata probe on a clean GitHub runner.
-val expectedModelBytes = 0L
-val expectedModelSha256 = "PENDING"
+val expectedModelBytes = 7_515_971L
+val expectedModelSha256 = "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896"
 
 fun sha256(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
@@ -113,7 +112,6 @@ tasks.register("downloadObjectDetectorModel") {
     doLast {
         if (
             modelFile.exists() &&
-            expectedModelBytes > 0L &&
             modelFile.length() == expectedModelBytes &&
             sha256(modelFile) == expectedModelSha256
         ) return@doLast
@@ -123,9 +121,6 @@ tasks.register("downloadObjectDetectorModel") {
         URL(modelUrl).openStream().use { input -> temporary.outputStream().use { input.copyTo(it) } }
         val actualBytes = temporary.length()
         val actualSha256 = sha256(temporary)
-        check(expectedModelBytes > 0L && expectedModelSha256 != "PENDING") {
-            "MODEL_METADATA actualBytes=$actualBytes actualSha256=$actualSha256"
-        }
         check(actualBytes == expectedModelBytes) {
             "Downloaded model size $actualBytes did not match expected $expectedModelBytes"
         }
