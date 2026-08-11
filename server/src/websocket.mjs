@@ -171,13 +171,35 @@ export class RealtimeHub {
           sourceId: identity.clientId,
           serverReceivedAtMs: receivedAt
         }));
+
+        // New Android clients publish their complete active tracker snapshot. Remove this source's
+        // tracks that disappeared from that snapshot immediately, rather than leaving a chicken or
+        // person visible until the generic server TTL. Legacy clients omit replaceSource and keep
+        // the original TTL/upsert semantics.
+        const expired = [];
+        if (message.replaceSource) {
+          const incomingKeys = new Set(normalized.map((track) => track.key));
+          for (const [key, track] of roomTracks) {
+            if (track.sourceId === identity.clientId && !incomingKeys.has(key)) {
+              roomTracks.delete(key);
+              expired.push(key);
+            }
+          }
+        }
+
         for (const track of normalized) roomTracks.set(track.key, track);
-        this.tracks.set(identity.mapId, roomTracks);
+        if (roomTracks.size) this.tracks.set(identity.mapId, roomTracks);
+        else this.tracks.delete(identity.mapId);
+
+        if (expired.length) {
+          this.#broadcast(identity.mapId, { type: 'tracks_expired', trackKeys: expired, serverTimeMs: receivedAt });
+        }
         this.#broadcast(identity.mapId, {
           type: 'track_batch',
           sourceId: identity.clientId,
           sequence: message.sequence,
           serverReceivedAtMs: receivedAt,
+          replaceSource: message.replaceSource,
           tracks: normalized
         });
         break;
