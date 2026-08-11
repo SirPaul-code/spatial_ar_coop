@@ -1,0 +1,37 @@
+name: Repair v1.0.3 patch runner
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-v103-runner.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/v103-tracking-localization
+      - name: Repair and retrigger
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/apply-v103-runtime-fix.yml')
+          text = p.read_text()
+          old = "          git add android .github/workflows/apply-v103-runtime-fix.yml\n"
+          new = "          git add -A\n"
+          if old not in text:
+              raise SystemExit('broken git add line not found')
+          p.write_text(text.replace(old, new, 1))
+          PY
+          git rm .github/workflows/fix-v103-runner.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'ci: repair v1.0.3 patch runner'
+          git push origin HEAD:fix/v103-tracking-localization
