@@ -1,5 +1,19 @@
 # Android release notes
 
+## 1.0.6
+
+- Upgrade the on-device detector to the verified EfficientDet-Lite2 int8 model for a higher-precision COCO front end on current Samsung devices.
+- Make acquisition precision-first: weak `bird`/person/car scores may maintain an already acquired identity but cannot create a new visible/shared object by themselves; person/car also require repeated strong evidence.
+- Preserve class-aware IoU + containment suppression and tighten temporal association so persistent clutter does not become a stable car/bird track merely because the classifier repeats a weak mistake.
+- Separate `detected`, `spatialized`, `active` and server-acknowledged counts in the Live HUD. The server now explicitly acknowledges accepted `track_batch` snapshots, so field diagnostics can distinguish detector, 3D estimation and transport failures.
+- Add a guarded capture-time monocular 3D fallback only for strong, temporally confirmed detections when ground/plane/depth cannot produce a stable solution. These high-uncertainty tracks require four consistent 3D observations before publication.
+- Carry physical object extents `[width,height,depth]` and shared-site yaw in the realtime track protocol while retaining defaults for older clients.
+- Render remote people/cars/birds as projected 3D wireframe cuboids instead of camera-facing 2D billboard rectangles, keeping the object volume anchored to the shared site frame through viewpoint changes and walls.
+- Replace screen-coordinate offscreen arrows with camera-space bearing/elevation math and viewport-edge intersection, including correct handling for objects behind the camera.
+- Reduce remote-client extrapolation to 250 ms and disable it for practically stationary objects to avoid double-prediction drift on top of the source tracker.
+- Prefer the map root Cloud Anchor as the shared reference. Backup anchors join after an 8-second root preference grace period without cancelling the root resolve, preserving localization reliability while reducing cross-device reference drift.
+- Show the active Cloud Anchor reference ID in the Live localization status so two physical phones can be checked against the same shared reference during field validation.
+
 ## 1.0.5
 
 - Add temporal image-space association before spatial tracking. Person/car require a strong observation to create an identity; `bird` may start as an internal weak hypothesis but must persist across several consistent frames before it becomes visible or shared.
