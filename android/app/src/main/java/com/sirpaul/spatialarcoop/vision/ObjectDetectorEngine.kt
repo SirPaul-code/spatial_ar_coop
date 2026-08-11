@@ -136,6 +136,7 @@ class ObjectDetectorEngine(
         val options = ObjectDetector.ObjectDetectorOptions.builder()
             .setBaseOptions(baseOptions)
             .setScoreThreshold(modelThreshold)
+            .setCategoryAllowlist(ALLOWED_LABELS.toList())
             .setMaxResults(MAX_RESULTS)
             .setRunningMode(RunningMode.IMAGE)
             .build()
@@ -147,8 +148,8 @@ class ObjectDetectorEngine(
                     "userThreshold" to threshold,
                     "modelFloor" to modelThreshold,
                     "temporalHysteresis" to true,
-                    "maxResults" to MAX_RESULTS,
-                    "labels" to ALLOWED_LABELS.joinToString()
+                    "categoryAllowlist" to ALLOWED_LABELS.joinToString(),
+                    "maxResults" to MAX_RESULTS
                 )
             )
         }
@@ -197,7 +198,7 @@ class ObjectDetectorEngine(
     }
 
     companion object {
-        private val ALLOWED_LABELS = setOf("person", "car", "bird", "dog", "cat")
+        private val ALLOWED_LABELS = linkedSetOf("person", "car", "bird", "dog", "cat")
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
         private const val BOTTOM_CENTER_INSET = 0.04f
         private const val MAX_RESULTS = 48
