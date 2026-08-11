@@ -50,4 +50,12 @@ class DetectionTrackerTest {
         assertEquals(3, tracker.update(listOf(bird(0f, 2f, t0), bird(1f, 2f, t0), bird(2f, 2f, t0)), t0).size)
         assertEquals(3, tracker.update(emptyList(), t0 + 600).size)
     }
+
+    @Test fun clearImmediatelyRemovesAllSourceTracks() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 40_000L
+        assertEquals(2, tracker.update(listOf(bird(0f, 2f, t0), bird(1f, 2f, t0)), t0).size)
+        tracker.clear()
+        assertTrue(tracker.current(t0 + 1).isEmpty())
+    }
 }
