@@ -9,7 +9,6 @@ import com.sirpaul.spatialarcoop.data.defaultTrackExtent
 import com.sirpaul.spatialarcoop.vision.CaptureGeometry
 import com.sirpaul.spatialarcoop.vision.Detection2D
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.atan2
 
 
@@ -45,7 +44,8 @@ object SpatialEstimator {
         if (frame.camera.trackingState != TrackingState.TRACKING) return rejected("camera-not-tracking")
         if (!detection.temporallyConfirmed) return rejected("temporal-not-confirmed")
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
-        val geometry = detection.captureGeometry?.let { captured ->
+        val captureGeometry = detection.captureGeometry
+        val geometry = captureGeometry?.let { captured ->
             if (captured.siteFromCamera == null) return rejected("capture-before-localization")
             captured
         } ?: currentGeometry(frame, worldFromSite)
@@ -57,30 +57,35 @@ object SpatialEstimator {
                     detection = detection,
                     position = ground,
                     geometry = geometry,
-                    uncertainty = if (detection.captureGeometry != null) 0.22f else 0.36f,
-                    method = if (detection.captureGeometry != null) "ground-capture-site" else "ground-current",
+                    uncertainty = if (captureGeometry != null) 0.22f else 0.36f,
+                    method = if (captureGeometry != null) "ground-capture-site" else "ground-current",
                     requiredHits = 2
                 )
             }
         }
 
-        // Maps without a usable saved floor may still have a real horizontal plane/depth sample.
-        val image = detection.rawBottomCenter
-        val view = FloatArray(2)
-        val bestHit = runCatching {
-            frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
-            frame.hitTest(view[0], view[1])
-                .filter { hit ->
-                    when (val trackable = hit.trackable) {
-                        is Plane -> trackable.trackingState == TrackingState.TRACKING &&
-                            trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            trackable.isPoseInPolygon(hit.hitPose)
-                        is DepthPoint -> true
-                        else -> false
+        // A detector result from CPU image t0 must never be hit-tested against an unrelated ARCore
+        // frame t1 after inference. Current-frame plane/depth is valid only for callers that did not
+        // provide capture geometry (manual/current-frame paths). Live detector results use either
+        // capture-time ground geometry above or the guarded capture-time monocular fallback below.
+        val bestHit = if (captureGeometry == null) {
+            val image = detection.rawBottomCenter
+            val view = FloatArray(2)
+            runCatching {
+                frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
+                frame.hitTest(view[0], view[1])
+                    .filter { hit ->
+                        when (val trackable = hit.trackable) {
+                            is Plane -> trackable.trackingState == TrackingState.TRACKING &&
+                                trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                trackable.isPoseInPolygon(hit.hitPose)
+                            is DepthPoint -> true
+                            else -> false
+                        }
                     }
-                }
-                .minWithOrNull(compareBy({ priority(it.trackable) }, { it.distance }))
-        }.getOrNull()
+                    .minWithOrNull(compareBy({ priority(it.trackable) }, { it.distance }))
+            }.getOrNull()
+        } else null
 
         if (bestHit != null) {
             val site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
