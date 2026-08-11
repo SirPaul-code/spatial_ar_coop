@@ -31,6 +31,7 @@ test('normalizes track batches, geometry and complete-source semantics', () => {
   assert.deepEqual(message.tracks[0].velocity, [0, 0, 0]);
   assert.deepEqual(message.tracks[0].extentMeters, [1.9, 1.55, 4.6]);
   assert.equal(message.tracks[0].yawRadians, 0.75);
+  assert.deepEqual(message.tracks[0].poseJoints, []);
 
   const legacy = parseClientMessage(JSON.stringify({
     type: 'track_batch', tracks: [{ id: 't1', label: 'bird', position: [0, 0, 0] }]
@@ -38,6 +39,40 @@ test('normalizes track batches, geometry and complete-source semantics', () => {
   assert.equal(legacy.replaceSource, false);
   assert.deepEqual(legacy.tracks[0].extentMeters, [0.45, 0.45, 0.55]);
   assert.equal(legacy.tracks[0].yawRadians, 0);
+  assert.deepEqual(legacy.tracks[0].poseJoints, []);
+});
+
+test('accepts compact person skeletons and strips them from non-person tracks', () => {
+  const pose = [
+    [0, 0.0, 1.65, 0.02, 0.95],
+    [11, -0.22, 1.42, 0.01, 0.91],
+    [12, 0.22, 1.43, -0.01, 0.92],
+    [23, -0.14, 0.92, 0.0, 0.96],
+    [24, 0.14, 0.92, 0.0, 0.96],
+    [27, -0.12, 0.04, 0.02, 0.89],
+    [28, 0.12, 0.04, 0.02, 0.90]
+  ];
+  const message = parseClientMessage(JSON.stringify({
+    type: 'track_batch',
+    tracks: [
+      { id: 'p1', label: 'person', position: [1, 0, 2], poseJoints: pose },
+      { id: 'c1', label: 'car', position: [2, 0, 4], poseJoints: pose }
+    ]
+  }));
+  assert.equal(message.tracks[0].poseJoints.length, pose.length);
+  assert.deepEqual(message.tracks[0].poseJoints[0], pose[0]);
+  assert.deepEqual(message.tracks[1].poseJoints, []);
+});
+
+test('rejects malformed or duplicate person skeleton joints', () => {
+  assert.throws(() => parseClientMessage(JSON.stringify({
+    type: 'track_batch',
+    tracks: [{ id: 'p1', label: 'person', position: [0, 0, 0], poseJoints: [[99, 0, 1, 0, 1]] }]
+  })), /invalid\/duplicate landmark index/);
+  assert.throws(() => parseClientMessage(JSON.stringify({
+    type: 'track_batch',
+    tracks: [{ id: 'p1', label: 'person', position: [0, 0, 0], poseJoints: [[11, 0, 1, 0, 1], [11, 0, 1, 0, 1]] }]
+  })), /invalid\/duplicate landmark index/);
 });
 
 test('clamps physically invalid extents instead of accepting absurd renderer geometry', () => {
