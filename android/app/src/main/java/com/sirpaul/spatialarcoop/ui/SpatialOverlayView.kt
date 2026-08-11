@@ -13,6 +13,9 @@ import kotlin.math.min
 
 
 data class ProjectedCuboid(val points: List<FloatArray>)
+data class ProjectedJoint(val index: Int, val x: Float, val y: Float, val confidence: Float)
+data class ProjectedSkeleton(val joints: List<ProjectedJoint>)
+data class ProjectedPose(val joints: List<ProjectedJoint>)
 
 data class ProjectedTrack(
     val key: String,
@@ -27,6 +30,7 @@ data class ProjectedTrack(
     val sourceId: String,
     val bounds: RectF? = null,
     val cuboid: ProjectedCuboid? = null,
+    val skeleton: ProjectedSkeleton? = null,
     val offscreenDx: Float = 1f,
     val offscreenDy: Float = 0f
 )
@@ -50,11 +54,28 @@ class SpatialOverlayView @JvmOverloads constructor(
         style = Paint.Style.STROKE
         strokeWidth = 2.2f * density
         color = Color.rgb(213, 154, 74)
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
     }
     private val thinStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.1f * density
         color = Color.argb(180, 213, 154, 74)
+    }
+    private val skeletonJoint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.rgb(213, 154, 74)
+    }
+    private val localPoseStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.3f * density
+        color = Color.rgb(120, 149, 178)
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val localPoseJoint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.rgb(120, 149, 178)
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -75,11 +96,12 @@ class SpatialOverlayView @JvmOverloads constructor(
     }
     private val boxStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 2f * density
-        color = Color.rgb(120, 149, 178)
+        strokeWidth = 1.5f * density
+        color = Color.argb(160, 120, 149, 178)
     }
     @Volatile private var tracks: List<ProjectedTrack> = emptyList()
     @Volatile private var boxes: List<ProjectedBox> = emptyList()
+    @Volatile private var localPoses: List<ProjectedPose> = emptyList()
     @Volatile private var scan = ScanOverlayState()
     @Volatile private var showScan = false
 
@@ -93,6 +115,11 @@ class SpatialOverlayView @JvmOverloads constructor(
         postInvalidateOnAnimation()
     }
 
+    fun updateLocalPoses(values: List<ProjectedPose>) {
+        localPoses = values
+        postInvalidateOnAnimation()
+    }
+
     fun updateScanState(value: ScanOverlayState, visible: Boolean = true) {
         scan = value
         showScan = visible
@@ -102,6 +129,7 @@ class SpatialOverlayView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         boxes.forEach { drawDetectionBox(canvas, it) }
+        localPoses.forEach { drawLocalPose(canvas, it) }
         tracks.forEach { track -> if (track.onScreen) drawTrack(canvas, track) else drawOffscreen(canvas, track) }
         if (showScan) drawScanCard(canvas)
         drawReticle(canvas)
@@ -111,11 +139,13 @@ class SpatialOverlayView @JvmOverloads constructor(
         val ageAlpha = (255 - (track.ageMs / 10).toInt()).coerceIn(78, 255)
         stroke.alpha = ageAlpha
         thinStroke.alpha = (ageAlpha * 0.76f).toInt()
+        skeletonJoint.alpha = ageAlpha
         fill.alpha = (ageAlpha * 0.14f).toInt()
 
         val radius = (12f + track.uncertaintyMeters.coerceIn(0f, 3f) * 8f) * density
         val feetY = track.y
         val markerTop = when {
+            track.skeleton != null -> drawSkeleton(canvas, track.skeleton, stroke, skeletonJoint)
             track.cuboid != null -> drawCuboid(canvas, track.cuboid)
             track.bounds != null -> {
                 canvas.drawRoundRect(track.bounds, 7f * density, 7f * density, fill)
@@ -131,7 +161,11 @@ class SpatialOverlayView @JvmOverloads constructor(
         canvas.drawCircle(track.x, feetY, 4.5f * density, stroke)
 
         val stableId = track.key.substringAfterLast(':').take(8)
-        val title = "${track.label} · $stableId"
+        val title = if (track.skeleton != null && track.label.equals("person", true)) {
+            "person pose · $stableId"
+        } else {
+            "${track.label} · $stableId"
+        }
         val detail = "%.1f m   %.0f%%   %d ms".format(track.distanceMeters, track.confidence * 100f, track.ageMs)
         val panelWidth = maxOf(text.measureText(title), subText.measureText(detail)) + 18f * density
         val left = (track.x - panelWidth / 2f).coerceIn(6f * density, width - panelWidth - 6f * density)
@@ -142,6 +176,34 @@ class SpatialOverlayView @JvmOverloads constructor(
         canvas.drawText(detail, rect.left + 9f * density, rect.top + 31f * density, subText)
     }
 
+    private fun drawLocalPose(canvas: Canvas, pose: ProjectedPose) {
+        drawSkeleton(canvas, ProjectedSkeleton(pose.joints), localPoseStroke, localPoseJoint)
+    }
+
+    private fun drawSkeleton(
+        canvas: Canvas,
+        skeleton: ProjectedSkeleton,
+        linePaint: Paint,
+        jointPaint: Paint
+    ): Float {
+        val byIndex = skeleton.joints
+            .filter { it.confidence >= MIN_RENDER_JOINT_CONFIDENCE && it.x.isFinite() && it.y.isFinite() }
+            .associateBy { it.index }
+        if (byIndex.size < MIN_RENDER_JOINTS) return height * 0.5f
+
+        SKELETON_EDGES.forEach { edge ->
+            val a = byIndex[edge[0]] ?: return@forEach
+            val b = byIndex[edge[1]] ?: return@forEach
+            canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
+        }
+        byIndex.values.forEach { joint ->
+            canvas.drawCircle(joint.x, joint.y, 3.2f * density, jointPaint)
+        }
+        val head = byIndex[0]
+        if (head != null) canvas.drawCircle(head.x, head.y, 8.5f * density, linePaint)
+        return byIndex.values.minOf { it.y } - 9f * density
+    }
+
     private fun drawCuboid(canvas: Canvas, cuboid: ProjectedCuboid): Float {
         if (cuboid.points.size != 8) return height * 0.5f
         CUBOID_EDGES.forEach { edge ->
@@ -149,8 +211,6 @@ class SpatialOverlayView @JvmOverloads constructor(
             val b = cuboid.points[edge[1]]
             canvas.drawLine(a[0], a[1], b[0], b[1], stroke)
         }
-        // Lightly indicate the ground footprint; vertical/top edges remain transparent so the
-        // camera view is not obscured even through a wall.
         val groundPath = Path().apply {
             val first = cuboid.points[0]
             moveTo(first[0], first[1])
@@ -270,5 +330,16 @@ class SpatialOverlayView @JvmOverloads constructor(
             intArrayOf(4, 5), intArrayOf(5, 6), intArrayOf(6, 7), intArrayOf(7, 4),
             intArrayOf(0, 4), intArrayOf(1, 5), intArrayOf(2, 6), intArrayOf(3, 7)
         )
+        private val SKELETON_EDGES = arrayOf(
+            intArrayOf(11, 12),
+            intArrayOf(11, 13), intArrayOf(13, 15),
+            intArrayOf(12, 14), intArrayOf(14, 16),
+            intArrayOf(11, 23), intArrayOf(12, 24), intArrayOf(23, 24),
+            intArrayOf(23, 25), intArrayOf(25, 27), intArrayOf(27, 31),
+            intArrayOf(24, 26), intArrayOf(26, 28), intArrayOf(28, 32),
+            intArrayOf(0, 11), intArrayOf(0, 12)
+        )
+        private const val MIN_RENDER_JOINT_CONFIDENCE = 0.28f
+        private const val MIN_RENDER_JOINTS = 6
     }
 }
