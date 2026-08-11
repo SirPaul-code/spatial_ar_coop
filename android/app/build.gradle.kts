@@ -36,8 +36,8 @@ android {
         applicationId = "com.sirpaul.spatialarcoop"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "1.0.6"
+        versionCode = 8
+        versionName = "1.0.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${defaultServerUrl.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
@@ -82,6 +82,7 @@ android {
 
     androidResources {
         noCompress += "tflite"
+        noCompress += "task"
     }
 
     testOptions {
@@ -89,10 +90,25 @@ android {
     }
 }
 
-val modelFile = layout.projectDirectory.file("src/main/assets/efficientdet-lite2.tflite").asFile
-val modelUrl = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite"
-val expectedModelBytes = 7_515_971L
-val expectedModelSha256 = "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896"
+data class VerifiedModel(
+    val assetName: String,
+    val url: String,
+    val bytes: Long,
+    val sha256: String
+)
+
+val objectDetectorModel = VerifiedModel(
+    assetName = "efficientdet-lite2.tflite",
+    url = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite",
+    bytes = 7_515_971L,
+    sha256 = "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896"
+)
+val poseLandmarkerModel = VerifiedModel(
+    assetName = "pose_landmarker_full.task",
+    url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+    bytes = 9_398_198L,
+    sha256 = "5134a3aad27a58b93da0088d431f366da362b44e3ccfbe3462b3827a839011b1"
+)
 
 fun sha256(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
@@ -107,32 +123,38 @@ fun sha256(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
-tasks.register("downloadObjectDetectorModel") {
+fun registerVerifiedModelTask(taskName: String, model: VerifiedModel) = tasks.register(taskName) {
+    val modelFile = layout.projectDirectory.file("src/main/assets/${model.assetName}").asFile
     outputs.file(modelFile)
     doLast {
         if (
             modelFile.exists() &&
-            modelFile.length() == expectedModelBytes &&
-            sha256(modelFile) == expectedModelSha256
+            modelFile.length() == model.bytes &&
+            sha256(modelFile) == model.sha256
         ) return@doLast
         modelFile.parentFile.mkdirs()
         val temporary = modelFile.resolveSibling("${modelFile.name}.download")
         temporary.delete()
-        URL(modelUrl).openStream().use { input -> temporary.outputStream().use { input.copyTo(it) } }
+        URL(model.url).openStream().use { input -> temporary.outputStream().use { input.copyTo(it) } }
         val actualBytes = temporary.length()
         val actualSha256 = sha256(temporary)
-        check(actualBytes == expectedModelBytes) {
-            "Downloaded model size $actualBytes did not match expected $expectedModelBytes"
+        check(actualBytes == model.bytes) {
+            "Downloaded ${model.assetName} size $actualBytes did not match expected ${model.bytes}"
         }
-        check(actualSha256 == expectedModelSha256) {
-            "Downloaded model checksum mismatch: expected $expectedModelSha256, got $actualSha256"
+        check(actualSha256 == model.sha256) {
+            "Downloaded ${model.assetName} checksum mismatch: expected ${model.sha256}, got $actualSha256"
         }
         if (modelFile.exists()) modelFile.delete()
-        check(temporary.renameTo(modelFile)) { "Could not move downloaded model into assets" }
+        check(temporary.renameTo(modelFile)) { "Could not move downloaded ${model.assetName} into assets" }
     }
 }
 
-tasks.named("preBuild").configure { dependsOn("downloadObjectDetectorModel") }
+val downloadObjectDetectorModel = registerVerifiedModelTask("downloadObjectDetectorModel", objectDetectorModel)
+val downloadPoseLandmarkerModel = registerVerifiedModelTask("downloadPoseLandmarkerModel", poseLandmarkerModel)
+
+tasks.named("preBuild").configure {
+    dependsOn(downloadObjectDetectorModel, downloadPoseLandmarkerModel)
+}
 
 dependencies {
     implementation("com.google.ar:core:1.54.0")

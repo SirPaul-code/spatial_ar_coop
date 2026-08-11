@@ -1,5 +1,17 @@
 # Android release notes
 
+## 1.0.7
+
+- Add MediaPipe Pose Landmarker Full for temporally confirmed `person` detections while keeping EfficientDet-Lite2 as the object detector and person identity gate.
+- Use the same captured camera image for person detection and pose inference, then associate each returned pose to the corresponding confirmed person identity in image space.
+- Use visible ankle/foot landmarks as the preferred person ground-contact image point before spatialization, reducing root jitter caused by a changing person bounding-box bottom edge.
+- Convert selected body landmarks into a compact shared-site skeleton relative to the existing AR person root. Pose landmarks shape the articulation; Cloud-Anchor/site localization remains authoritative for the person's absolute physical position.
+- Share only compact root-relative joint data (`poseJoints`), never camera images or video. The server validates at most 24 unique MediaPipe landmark indices and strips pose data from non-person tracks.
+- Smooth person joint offsets temporally and retain the last valid skeleton for a brief pose miss before falling back automatically to the existing person 3D cuboid.
+- Render a blue local stick figure on the detecting phone and an amber shared-site stick figure on remote localized phones. A remote person without a usable pose remains visible as the existing 3D cuboid.
+- Add pose count to Live AR diagnostics so field tests can distinguish person detection, pose inference, spatialization, active sharing and server acknowledgement.
+- Package the official verified Google `pose_landmarker_full/float16/1` model reproducibly during the Android build together with the existing verified EfficientDet-Lite2 model.
+
 ## 1.0.6
 
 - Upgrade the on-device detector to the verified EfficientDet-Lite2 int8 model for a higher-precision COCO front end on current Samsung devices.

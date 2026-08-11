@@ -40,6 +40,7 @@ import com.sirpaul.spatialarcoop.ar.CloudAnchorCoordinator
 import com.sirpaul.spatialarcoop.ar.DisplayRotationHelper
 import com.sirpaul.spatialarcoop.ar.PointCloudRecorder
 import com.sirpaul.spatialarcoop.ar.PoseMath
+import com.sirpaul.spatialarcoop.ar.PoseSkeletonBuilder
 import com.sirpaul.spatialarcoop.ar.RemoteTrackStore
 import com.sirpaul.spatialarcoop.ar.SpatialEstimator
 import com.sirpaul.spatialarcoop.data.AnchorStatus
@@ -54,6 +55,9 @@ import com.sirpaul.spatialarcoop.ui.FieldTheme
 import com.sirpaul.spatialarcoop.ui.OffscreenIndicatorMath
 import com.sirpaul.spatialarcoop.ui.ProjectedBox
 import com.sirpaul.spatialarcoop.ui.ProjectedCuboid
+import com.sirpaul.spatialarcoop.ui.ProjectedJoint
+import com.sirpaul.spatialarcoop.ui.ProjectedPose
+import com.sirpaul.spatialarcoop.ui.ProjectedSkeleton
 import com.sirpaul.spatialarcoop.ui.ProjectedTrack
 import com.sirpaul.spatialarcoop.ui.ScanOverlayState
 import com.sirpaul.spatialarcoop.ui.SpatialOverlayView
@@ -112,6 +116,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var latestInferenceMs = 0L
     private var latestLocalTrackCount = 0
     private var latestSpatializedCount = 0
+    private var latestPoseCount = 0
     private var latestSentTrackCount = 0
     @Volatile private var lastAckAccepted = -1
     @Volatile private var lastAckSequence = -1L
@@ -678,6 +683,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             captureDetectorFrame(frame)
             pendingDetection.get()?.let { pending ->
                 overlay.updateLocalBoxes(projectDetectionBoxes(frame, pending.detections))
+                overlay.updateLocalPoses(projectDetectionPoses(frame, pending.detections))
             }
         }
 
@@ -816,6 +822,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     rejected[reason] = (rejected[reason] ?: 0) + 1
                     null
                 } else {
+                    val poseJoints = detection.captureGeometry?.let { geometry ->
+                        PoseSkeletonBuilder.build(detection, estimate.sitePosition, geometry)
+                    }.orEmpty()
                     SpatialObservation(
                         label = detection.label,
                         confidence = detection.confidence,
@@ -825,7 +834,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         associationKey = detection.temporalId,
                         extentMeters = estimate.extentMeters,
                         yawRadians = estimate.yawRadians,
-                        requiredHits = estimate.requiredHits
+                        requiredHits = estimate.requiredHits,
+                        poseJoints = poseJoints
                     )
                 }
             }
@@ -853,6 +863,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 }
             }
             overlay.updateLocalBoxes(projectDetectionBoxes(frame, pending.detections))
+            overlay.updateLocalPoses(projectDetectionPoses(frame, pending.detections))
         }
 
         val now = System.currentTimeMillis()
@@ -914,6 +925,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             logger = spatialApp.logger,
             onResult = { values, inferenceMs ->
                 latestDetectionCount = values.size
+                latestPoseCount = values.count { detection ->
+                    detection.label.equals("person", true) && detection.poseLandmarks.size >= 8
+                }
                 latestInferenceMs = inferenceMs
                 pendingDetection.set(PendingDetection(values, inferenceMs))
             },
@@ -929,11 +943,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         latestSpatializedCount = 0
         latestSentTrackCount = 0
         latestDetectionCount = 0
+        latestPoseCount = 0
         latestInferenceMs = 0
         lastAckAccepted = -1
         lastAckSequence = -1L
         lastAckAtMs = 0L
-        if (::overlay.isInitialized) overlay.updateLocalBoxes(emptyList())
+        if (::overlay.isInitialized) {
+            overlay.updateLocalBoxes(emptyList())
+            overlay.updateLocalPoses(emptyList())
+        }
     }
 
     private fun setReporting(enabled: Boolean) {
@@ -1044,6 +1062,27 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
     }
 
+
+    private fun projectDetectionPoses(frame: Frame, detections: List<Detection2D>): List<ProjectedPose> {
+        return detections.mapNotNull { detection ->
+            if (!detection.label.equals("person", true) || detection.poseLandmarks.size < 6) return@mapNotNull null
+            val input = FloatArray(detection.poseLandmarks.size * 2)
+            detection.poseLandmarks.forEachIndexed { index, joint ->
+                input[index * 2] = joint.x
+                input[index * 2 + 1] = joint.y
+            }
+            val output = FloatArray(input.size)
+            runCatching {
+                frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, input, Coordinates2d.VIEW, output)
+                ProjectedPose(
+                    detection.poseLandmarks.mapIndexed { index, joint ->
+                        ProjectedJoint(joint.index, output[index * 2], output[index * 2 + 1], joint.confidence)
+                    }
+                )
+            }.getOrNull()
+        }
+    }
+
     private fun handleRequests(frame: Frame, cameraSite: FloatArray, worldFromSite: FloatArray, map: MapDefinition) {
         if (requestHost.getAndSet(false) && mode == ArMode.MAP) {
             cloudAnchors?.host(frame.camera.pose, worldFromSite, map, forced = true)
@@ -1131,6 +1170,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
                 val direction = OffscreenIndicatorMath.direction(cameraPoint)
                 val onScreen = screen?.onScreen == true
+                val skeleton = if (onScreen && track.label.equals("person", true) && track.poseJoints.isNotEmpty()) {
+                    projectTrackSkeleton(track, worldFromSite)
+                } else null
                 ProjectedTrack(
                     key = track.key,
                     label = track.label,
@@ -1142,13 +1184,32 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     uncertaintyMeters = track.uncertaintyMeters,
                     ageMs = (now - track.serverReceivedAtMs).coerceAtLeast(0L),
                     sourceId = track.sourceId,
-                    cuboid = if (onScreen && track.sourceId != "marker") projectTrackCuboid(track, worldFromSite) else null,
+                    cuboid = if (onScreen && skeleton == null && track.sourceId != "marker") projectTrackCuboid(track, worldFromSite) else null,
+                    skeleton = skeleton,
                     offscreenDx = direction.dx,
                     offscreenDy = direction.dy
                 )
             }
             .toList()
         overlay.updateTracks(projected)
+    }
+
+
+    private fun projectTrackSkeleton(track: SpatialTrack, worldFromSite: FloatArray): ProjectedSkeleton? {
+        if (!track.label.equals("person", true) || track.poseJoints.size < 6) return null
+        val joints = track.poseJoints.mapNotNull { joint ->
+            if (joint.offsetMeters.size < 3) return@mapNotNull null
+            val site = floatArrayOf(
+                track.position[0] + joint.offsetMeters[0],
+                track.position[1] + joint.offsetMeters[1],
+                track.position[2] + joint.offsetMeters[2]
+            )
+            val world = PoseMath.transformPoint(worldFromSite, site)
+            val projected = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                ?: return@mapNotNull null
+            ProjectedJoint(joint.index, projected.x, projected.y, joint.confidence)
+        }
+        return joints.takeIf { it.size >= 6 }?.let(::ProjectedSkeleton)
     }
 
     private fun projectTrackCuboid(track: SpatialTrack, worldFromSite: FloatArray): ProjectedCuboid? {
@@ -1234,7 +1295,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     ArMode.LIVE -> if (worldFromSite == null) {
                         val room = if (realtimeConnected) "room connected" else "room reconnecting"
                         val resolver = localizationDetail.ifBlank { "resolving saved Cloud Anchors" }
-                        "Detector active · $latestDetectionCount visible · $bufferedRemoteTracks remote buffered · $room · $resolver"
+                        "Detector active · $latestDetectionCount visible · $latestPoseCount pose · $bufferedRemoteTracks remote buffered · $room · $resolver"
                     } else {
                         val ack = when {
                             !realtimeConnected -> "server offline"
@@ -1242,7 +1303,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                             latestSentTrackCount > 0 -> "server awaiting ack"
                             else -> "server connected"
                         }
-                        "$latestDetectionCount detected · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack"
+                        "$latestDetectionCount detected · $latestPoseCount pose · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack · $bufferedRemoteTracks remote · ${latestInferenceMs} ms"
                     }
                     ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks"
                 }

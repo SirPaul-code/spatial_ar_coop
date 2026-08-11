@@ -3,19 +3,31 @@ package com.sirpaul.spatialarcoop.vision
 import android.content.Context
 import android.graphics.RectF
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.sirpaul.spatialarcoop.util.FileLogger
 import java.io.Closeable
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
+
 
 data class CaptureGeometry(
     val siteFromCamera: FloatArray?,
     val focalLength: FloatArray,
     val principalPoint: FloatArray
+)
+
+data class PoseLandmark2D(
+    val index: Int,
+    /** Raw ARCore CPU-image pixel coordinate, not display-rotated coordinate. */
+    val x: Float,
+    val y: Float,
+    val confidence: Float
 )
 
 data class Detection2D(
@@ -28,7 +40,9 @@ data class Detection2D(
     val rawImageHeight: Int,
     val temporalId: String? = null,
     val temporallyConfirmed: Boolean = true,
-    val captureGeometry: CaptureGeometry? = null
+    val captureGeometry: CaptureGeometry? = null,
+    /** Selected MediaPipe pose landmarks in raw CPU-image pixels for confirmed people. */
+    val poseLandmarks: List<PoseLandmark2D> = emptyList()
 )
 
 class ObjectDetectorEngine(
@@ -44,6 +58,7 @@ class ObjectDetectorEngine(
     private val temporalTracker = TemporalDetectionTracker(threshold)
     @Volatile private var closed = false
     private var detector: ObjectDetector? = null
+    private var poseLandmarker: PoseLandmarker? = null
 
     fun submit(
         frame: YuvFrame,
@@ -58,47 +73,54 @@ class ObjectDetectorEngine(
                 val rawBitmap = YuvFrameConverter.toBitmap(frame)
                 val upright = YuvFrameConverter.rotate(rawBitmap, rotationDegrees)
                 val image = BitmapImageBuilder(upright).build()
-                val result = try {
-                    detector().detect(image)
-                } finally {
-                    image.close()
-                    if (upright !== rawBitmap) upright.recycle()
-                    rawBitmap.recycle()
-                }
+                try {
+                    val result = detector().detect(image)
+                    val rawCandidates = result.detections().mapNotNull { detection ->
+                        val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
+                        val label = category.categoryName().lowercase()
+                        if (label !in ALLOWED_LABELS) return@mapNotNull null
 
-                val rawCandidates = result.detections().mapNotNull { detection ->
-                    val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
-                    val label = category.categoryName().lowercase()
-                    if (label !in ALLOWED_LABELS) return@mapNotNull null
+                        val box = detection.boundingBox()
+                        val corners = arrayOf(
+                            YuvFrameConverter.rotatedToRaw(box.left, box.top, frame.width, frame.height, rotationDegrees),
+                            YuvFrameConverter.rotatedToRaw(box.right, box.top, frame.width, frame.height, rotationDegrees),
+                            YuvFrameConverter.rotatedToRaw(box.right, box.bottom, frame.width, frame.height, rotationDegrees),
+                            YuvFrameConverter.rotatedToRaw(box.left, box.bottom, frame.width, frame.height, rotationDegrees)
+                        )
+                        DetectionCandidate2D(
+                            label = label,
+                            confidence = category.score(),
+                            left = corners.minOf { it[0] },
+                            top = corners.minOf { it[1] },
+                            right = corners.maxOf { it[0] },
+                            bottom = corners.maxOf { it[1] }
+                        )
+                    }
 
-                    val box = detection.boundingBox()
-                    val corners = arrayOf(
-                        YuvFrameConverter.rotatedToRaw(box.left, box.top, frame.width, frame.height, rotationDegrees),
-                        YuvFrameConverter.rotatedToRaw(box.right, box.top, frame.width, frame.height, rotationDegrees),
-                        YuvFrameConverter.rotatedToRaw(box.right, box.bottom, frame.width, frame.height, rotationDegrees),
-                        YuvFrameConverter.rotatedToRaw(box.left, box.bottom, frame.width, frame.height, rotationDegrees)
-                    )
-                    DetectionCandidate2D(
-                        label = label,
-                        confidence = category.score(),
-                        left = corners.minOf { it[0] },
-                        top = corners.minOf { it[1] },
-                        right = corners.maxOf { it[0] },
-                        bottom = corners.maxOf { it[1] }
-                    )
-                }
+                    val candidates = suppressOverlaps(rawCandidates)
+                    val tracked = temporalTracker.update(candidates, capturedAtMs)
+                    val confirmed = tracked.filter { it.confirmed }
+                    val poseByTemporalId = if (confirmed.any { it.label == "person" }) {
+                        detectPersonPoses(
+                            image = image,
+                            uprightWidth = upright.width,
+                            uprightHeight = upright.height,
+                            rawWidth = frame.width,
+                            rawHeight = frame.height,
+                            rotationDegrees = rotationDegrees,
+                            people = confirmed.filter { it.label == "person" }
+                        )
+                    } else emptyMap()
 
-                val candidates = suppressOverlaps(rawCandidates)
-                val tracked = temporalTracker.update(candidates, capturedAtMs)
-                val detections = tracked.asSequence()
-                    .filter { it.confirmed }
-                    .map { detection ->
+                    val detections = confirmed.map { detection ->
                         val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
+                        val pose = poseByTemporalId[detection.temporalId].orEmpty()
+                        val contact = if (detection.label == "person") poseGroundContact(pose) else null
                         Detection2D(
                             label = detection.label,
                             confidence = detection.confidence,
                             rawBoundingBox = rawBox,
-                            rawBottomCenter = floatArrayOf(
+                            rawBottomCenter = contact ?: floatArrayOf(
                                 rawBox.centerX(),
                                 rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
                             ),
@@ -107,11 +129,16 @@ class ObjectDetectorEngine(
                             rawImageHeight = frame.height,
                             temporalId = detection.temporalId,
                             temporallyConfirmed = true,
-                            captureGeometry = captureGeometry
+                            captureGeometry = captureGeometry,
+                            poseLandmarks = pose
                         )
                     }
-                    .toList()
-                onResult(detections, (System.nanoTime() - start) / 1_000_000L)
+                    onResult(detections, (System.nanoTime() - start) / 1_000_000L)
+                } finally {
+                    image.close()
+                    if (upright !== rawBitmap) upright.recycle()
+                    rawBitmap.recycle()
+                }
             } catch (error: Throwable) {
                 logger.error("Object detection failed", error)
                 onError(error.message ?: error.javaClass.simpleName)
@@ -120,6 +147,53 @@ class ObjectDetectorEngine(
             }
         }
         return true
+    }
+
+    private fun detectPersonPoses(
+        image: MPImage,
+        uprightWidth: Int,
+        uprightHeight: Int,
+        rawWidth: Int,
+        rawHeight: Int,
+        rotationDegrees: Int,
+        people: List<TrackedDetection2D>
+    ): Map<String, List<PoseLandmark2D>> {
+        return runCatching {
+            val poseCandidates = poseLandmarker().detect(image).landmarks().mapNotNull { landmarks ->
+                val rawLandmarks = landmarks.mapIndexedNotNull { index, landmark ->
+                    val x = landmark.x() * uprightWidth
+                    val y = landmark.y() * uprightHeight
+                    if (!x.isFinite() || !y.isFinite()) return@mapIndexedNotNull null
+                    val raw = YuvFrameConverter.rotatedToRaw(x, y, rawWidth, rawHeight, rotationDegrees)
+                    val visibility = landmark.visibility().orElse(1f)
+                    val presence = landmark.presence().orElse(1f)
+                    PoseLandmark2D(
+                        index = index,
+                        x = raw[0],
+                        y = raw[1],
+                        confidence = min(visibility, presence).coerceIn(0f, 1f)
+                    )
+                }
+                PoseCandidate.from(rawLandmarks)
+            }.toMutableList()
+
+            buildMap {
+                people.sortedByDescending { it.confidence }.forEach { person ->
+                    val best = poseCandidates
+                        .map { candidate -> candidate to poseAssociationScore(person, candidate) }
+                        .maxByOrNull { it.second }
+                        ?.takeIf { it.second >= MIN_POSE_ASSOCIATION_SCORE }
+                        ?.first
+                    if (best != null) {
+                        poseCandidates.remove(best)
+                        put(person.temporalId, best.landmarks.filter { it.index in SHARED_POSE_INDICES })
+                    }
+                }
+            }
+        }.onFailure { error ->
+            // Pose is an enhancement. A pose failure must never take object detection or sharing down.
+            logger.warn("Pose landmark detection failed", mapOf("error" to (error.message ?: error.javaClass.simpleName)))
+        }.getOrDefault(emptyMap())
     }
 
     private fun detector(): ObjectDetector {
@@ -150,6 +224,42 @@ class ObjectDetectorEngine(
                 )
             )
         }
+    }
+
+    private fun poseLandmarker(): PoseLandmarker {
+        poseLandmarker?.let { return it }
+        val baseOptions = BaseOptions.builder()
+            .setModelAssetPath("pose_landmarker_full.task")
+            .setDelegate(Delegate.CPU)
+            .build()
+        val options = PoseLandmarker.PoseLandmarkerOptions.builder()
+            .setBaseOptions(baseOptions)
+            .setRunningMode(RunningMode.IMAGE)
+            .setNumPoses(MAX_POSES)
+            .setMinPoseDetectionConfidence(POSE_DETECTION_CONFIDENCE)
+            .setMinPosePresenceConfidence(POSE_PRESENCE_CONFIDENCE)
+            .setMinTrackingConfidence(POSE_TRACKING_CONFIDENCE)
+            .build()
+        return PoseLandmarker.createFromOptions(appContext, options).also {
+            poseLandmarker = it
+            logger.info(
+                "Pose landmarker initialized",
+                mapOf(
+                    "model" to "Pose Landmarker Full float16",
+                    "maxPoses" to MAX_POSES,
+                    "sharedJoints" to SHARED_POSE_INDICES.size
+                )
+            )
+        }
+    }
+
+
+    private fun poseGroundContact(pose: List<PoseLandmark2D>): FloatArray? {
+        val feet = pose.filter { it.index in POSE_GROUND_INDICES && it.confidence >= POSE_GROUND_CONFIDENCE }
+        if (feet.size < 2) return null
+        val sortedX = feet.map { it.x }.sorted()
+        val sortedY = feet.map { it.y }.sorted()
+        return floatArrayOf(sortedX[sortedX.size / 2], sortedY[sortedY.size / 2])
     }
 
     private fun suppressOverlaps(values: List<DetectionCandidate2D>): List<DetectionCandidate2D> {
@@ -183,6 +293,20 @@ class ObjectDetectorEngine(
         )
     }
 
+    private fun poseAssociationScore(person: TrackedDetection2D, pose: PoseCandidate): Float {
+        val left = maxOf(person.left, pose.left)
+        val top = maxOf(person.top, pose.top)
+        val right = minOf(person.right, pose.right)
+        val bottom = minOf(person.bottom, pose.bottom)
+        val intersection = (right - left).coerceAtLeast(0f) * (bottom - top).coerceAtLeast(0f)
+        val personArea = ((person.right - person.left).coerceAtLeast(1f) * (person.bottom - person.top).coerceAtLeast(1f))
+        val poseArea = ((pose.right - pose.left).coerceAtLeast(1f) * (pose.bottom - pose.top).coerceAtLeast(1f))
+        val union = personArea + poseArea - intersection
+        val iou = if (union > 0f) intersection / union else 0f
+        val centerInside = pose.centerX in person.left..person.right && pose.centerY in person.top..person.bottom
+        return iou + if (centerInside) 0.24f else 0f
+    }
+
     private fun nmsThreshold(label: String): Float = when (label) {
         "person", "car" -> 0.35f
         "bird" -> 0.55f
@@ -194,18 +318,55 @@ class ObjectDetectorEngine(
         closed = true
         temporalTracker.clear()
         executor.execute {
+            poseLandmarker?.close()
+            poseLandmarker = null
             detector?.close()
             detector = null
         }
         executor.shutdown()
     }
 
+    private data class PoseCandidate(
+        val landmarks: List<PoseLandmark2D>,
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float
+    ) {
+        val centerX: Float get() = (left + right) * 0.5f
+        val centerY: Float get() = (top + bottom) * 0.5f
+
+        companion object {
+            fun from(values: List<PoseLandmark2D>): PoseCandidate? {
+                val visible = values.filter { it.confidence >= POSE_BOX_CONFIDENCE }
+                if (visible.size < MIN_POSE_BOX_JOINTS) return null
+                return PoseCandidate(
+                    landmarks = values,
+                    left = visible.minOf { it.x },
+                    top = visible.minOf { it.y },
+                    right = visible.maxOf { it.x },
+                    bottom = visible.maxOf { it.y }
+                )
+            }
+        }
+    }
+
     companion object {
         private val ALLOWED_LABELS = linkedSetOf("person", "car", "bird", "dog", "cat")
         private val CONTAINMENT_SUPPRESSED_LABELS = setOf("person", "car")
+        private val SHARED_POSE_INDICES = setOf(0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 31, 32)
+        private val POSE_GROUND_INDICES = setOf(27, 28, 31, 32)
         private const val CONTAINMENT_THRESHOLD = 0.72f
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
         private const val BOTTOM_CENTER_INSET = 0.04f
         private const val MAX_RESULTS = 40
+        private const val MAX_POSES = 4
+        private const val POSE_DETECTION_CONFIDENCE = 0.48f
+        private const val POSE_PRESENCE_CONFIDENCE = 0.45f
+        private const val POSE_TRACKING_CONFIDENCE = 0.50f
+        private const val POSE_BOX_CONFIDENCE = 0.28f
+        private const val POSE_GROUND_CONFIDENCE = 0.42f
+        private const val MIN_POSE_BOX_JOINTS = 8
+        private const val MIN_POSE_ASSOCIATION_SCORE = 0.12f
     }
 }
