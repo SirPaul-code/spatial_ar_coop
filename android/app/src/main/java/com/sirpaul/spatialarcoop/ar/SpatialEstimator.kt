@@ -4,7 +4,6 @@ import com.google.ar.core.Coordinates2d
 import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
-import com.google.ar.core.Point
 import com.google.ar.core.TrackingState
 import com.sirpaul.spatialarcoop.vision.Detection2D
 import kotlin.math.abs
@@ -29,12 +28,26 @@ object SpatialEstimator {
         frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
 
+        // A dynamic track represents the object's contact point (feet/wheels). If mapping found a
+        // shared ground plane, this is substantially more stable than accepting a valid feature
+        // point on the background behind the object silhouette.
+        val groundContact = groundY?.let {
+            intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it)
+        }
+        if (groundContact != null) {
+            return EstimatedPosition(groundContact, 0.38f, "ground-ray-primary")
+        }
+
+        // Without a known ground plane, accept actual depth or a tracked upward-facing horizontal
+        // plane. Arbitrary feature points are deliberately excluded: on moving objects they often
+        // belong to the wall/tree/background behind the bbox and create distant ghost tracks.
         val bestHit = frame.hitTest(view[0], view[1])
             .filter { hit ->
                 when (val trackable = hit.trackable) {
                     is DepthPoint -> true
-                    is Plane -> trackable.trackingState == TrackingState.TRACKING && trackable.isPoseInPolygon(hit.hitPose)
-                    is Point -> trackable.trackingState == TrackingState.TRACKING
+                    is Plane -> trackable.trackingState == TrackingState.TRACKING &&
+                        trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                        trackable.isPoseInPolygon(hit.hitPose)
                     else -> false
                 }
             }
@@ -43,29 +56,16 @@ object SpatialEstimator {
         if (bestHit != null) {
             val site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
             val (uncertainty, method) = when (bestHit.trackable) {
-                is DepthPoint -> 0.25f to "depth"
-                is Plane -> 0.32f to "plane"
-                else -> 0.55f to "feature-point"
-            }
-            // Moving targets often create a depth hit on the target itself. Ground projection is
-            // more stable for feet/wheels when both estimates agree reasonably well.
-            val ground = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
-            if (ground != null && PoseMath.distance(site, ground) < 1.2f) {
-                return EstimatedPosition(
-                    sitePosition = floatArrayOf(site[0] * 0.45f + ground[0] * 0.55f, groundY, site[2] * 0.45f + ground[2] * 0.55f),
-                    uncertaintyMeters = uncertainty,
-                    method = "$method+ground"
-                )
+                is DepthPoint -> 0.28f to "depth"
+                is Plane -> 0.40f to "horizontal-plane"
+                else -> 0.75f to "hit"
             }
             return EstimatedPosition(site, uncertainty, method)
         }
 
-        val fallback = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
-        if (fallback != null) return EstimatedPosition(fallback, 0.65f, "ground-ray")
-
         // Last-resort monocular estimate. It is intentionally marked with much larger uncertainty
-        // than Depth/plane/ground hits, but keeps obvious people/cars/birds shareable when ARCore
-        // has no hit at the moving object's contact point.
+        // than ground/depth/plane estimates, but keeps clear objects shareable when ARCore has no
+        // geometry at the target contact point.
         return estimateFromBoundingBoxSize(frame, detection, siteFromWorld)
     }
 
@@ -93,15 +93,14 @@ object SpatialEstimator {
         detection: Detection2D,
         siteFromWorld: FloatArray
     ): EstimatedPosition? {
-        val physicalHeightMeters = when (detection.label.lowercase()) {
-            "person" -> 1.70f
-            "car" -> 1.50f
-            "bird" -> 0.40f
-            "dog" -> 0.65f
-            "cat" -> 0.38f
-            else -> 0.60f
+        val (physicalExtentMeters, pixelExtent) = when (detection.label.lowercase()) {
+            "person" -> 1.70f to detection.rawBoundingBox.height()
+            "car" -> 1.82f to detection.rawBoundingBox.width()
+            "bird" -> 0.42f to maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
+            "dog" -> 0.75f to maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
+            "cat" -> 0.45f to maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
+            else -> 0.60f to maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
         }
-        val pixelExtent = maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
         if (!pixelExtent.isFinite() || pixelExtent < 6f) return null
 
         val intrinsics = frame.camera.imageIntrinsics
@@ -109,11 +108,13 @@ object SpatialEstimator {
         val principal = intrinsics.principalPoint
         if (focal[0] <= 0f || focal[1] <= 0f) return null
         val focalPixels = (focal[0] + focal[1]) * 0.5f
-        val opticalDepth = (focalPixels * physicalHeightMeters / pixelExtent).coerceIn(0.45f, 55f)
+        val opticalDepth = (focalPixels * physicalExtentMeters / pixelExtent).coerceIn(0.45f, 55f)
         if (!opticalDepth.isFinite()) return null
 
-        val centerX = detection.rawBoundingBox.centerX()
-        val centerY = detection.rawBoundingBox.centerY()
+        // Track position is a contact point, so project the bbox bottom-center rather than its
+        // visual center. The class-size estimate supplies only the approximate range along the ray.
+        val centerX = detection.rawBottomCenter[0]
+        val centerY = detection.rawBottomCenter[1]
         val cameraDirection = PoseMath.normalize(
             floatArrayOf(
                 (centerX - principal[0]) / focal[0],
@@ -131,7 +132,7 @@ object SpatialEstimator {
             siteOrigin[1] + siteDirection[1] * rayLength,
             siteOrigin[2] + siteDirection[2] * rayLength
         )
-        val uncertainty = (0.75f + opticalDepth * 0.28f).coerceIn(0.9f, 10f)
+        val uncertainty = (0.85f + opticalDepth * 0.22f).coerceIn(1.0f, 9f)
         return EstimatedPosition(site, uncertainty, "monocular-class-size")
     }
 
@@ -169,7 +170,6 @@ object SpatialEstimator {
     private fun priority(trackable: Any): Int = when (trackable) {
         is DepthPoint -> 0
         is Plane -> 1
-        is Point -> 2
-        else -> 3
+        else -> 2
     }
 }
