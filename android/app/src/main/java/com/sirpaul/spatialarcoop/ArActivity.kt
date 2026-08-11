@@ -126,6 +126,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private lateinit var localTracker: DetectionTracker
     private var detector: ObjectDetectorEngine? = null
     @Volatile private var reporting = false
+    @Volatile private var latestDetectionCount = 0
     private var realtime: RealtimeClient? = null
     private var cloudAnchors: CloudAnchorCoordinator? = null
     private var pointRecorder: PointCloudRecorder? = null
@@ -200,9 +201,15 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             logger = spatialApp.logger,
             listener = this
         )
-        if (mode == ArMode.SENSOR) {
+        if (mode == ArMode.SENSOR || mode == ArMode.LIVE) {
+            // Live AR is cooperative by default: every participant detects and shares what its
+            // camera sees. There is no hidden "reporting" opt-in that can silently disable the
+            // core feature. Spatial publishing still waits for successful shared localization.
             reporting = true
             ensureDetector()
+            if (mode == ArMode.LIVE) {
+                spatialApp.logger.info("Live automatic detection enabled", mapOf("mapId" to mapId))
+            }
         }
         if (mode == ArMode.MAP) {
             val (chunks, points) = spatialApp.database.chunkCounts(mapId)
@@ -269,7 +276,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 actions.addView(action("More") { showMapSetupMenu() })
             }
             ArMode.LIVE -> {
-                reportButton = action("Start reporting") { setReporting(!reporting) }.also(actions::addView)
+                // Detection/sharing is automatic in Live AR. Keep the bottom bar focused on
+                // navigation/recovery instead of exposing an implementation-mode toggle.
                 actions.addView(action("More") { showLiveMenu() })
             }
             ArMode.SENSOR, ArMode.VIEWER -> {
@@ -672,6 +680,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             return
         }
 
+        // 2D inference is local and does not require the shared worldFromSite transform. Run it
+        // while Cloud Anchors are still resolving so the user immediately sees detector boxes and
+        // we can distinguish "detector works" from "shared localization is not ready yet".
+        if ((mode == ArMode.LIVE || mode == ArMode.SENSOR) && reporting) {
+            captureDetectorFrame(frame)
+            pendingDetection.get()?.let { pending ->
+                overlay.updateLocalBoxes(projectDetectionBoxes(frame, pending.detections))
+            }
+        }
+
         var map = currentMap() ?: return
         val hostedBefore = map.anchors.any { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
 
@@ -843,26 +861,27 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             latestLocalTrackCount = tracks.size
             lastTrackPublishAtMs = now
         }
-        if (now - lastDetectionCaptureAtMs >= DETECTION_INTERVAL_MS) {
-            val image = try {
-                frame.acquireCameraImage()
-            } catch (_: NotYetAvailableException) {
-                null
+    }
+
+    private fun captureDetectorFrame(frame: Frame) {
+        val now = System.currentTimeMillis()
+        if (now - lastDetectionCaptureAtMs < DETECTION_INTERVAL_MS) return
+        val image = try {
+            frame.acquireCameraImage()
+        } catch (_: NotYetAvailableException) {
+            null
+        } ?: return
+        try {
+            val yuv = YuvFrame.copyOf(image)
+            val cameraId = session?.cameraConfig?.cameraId
+            val rotation = if (cameraId == null) {
+                0
+            } else {
+                runCatching { displayRotation.cameraSensorToDisplayRotation(cameraId) }.getOrDefault(0)
             }
-            if (image != null) {
-                try {
-                    val yuv = YuvFrame.copyOf(image)
-                    val cameraId = session?.cameraConfig?.cameraId
-                    val rotation = if (cameraId == null) {
-                        0
-                    } else {
-                        runCatching { displayRotation.cameraSensorToDisplayRotation(cameraId) }.getOrDefault(0)
-                    }
-                    if (detector?.submit(yuv, rotation, now) == true) lastDetectionCaptureAtMs = now
-                } finally {
-                    image.close()
-                }
-            }
+            if (detector?.submit(yuv, rotation, now) == true) lastDetectionCaptureAtMs = now
+        } finally {
+            image.close()
         }
     }
 
@@ -872,7 +891,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             context = this,
             threshold = spatialApp.preferences.detectorThreshold,
             logger = spatialApp.logger,
-            onResult = { values, inferenceMs -> pendingDetection.set(PendingDetection(values, inferenceMs)) },
+            onResult = { values, inferenceMs ->
+                latestDetectionCount = values.size
+                latestInferenceMs = inferenceMs
+                pendingDetection.set(PendingDetection(values, inferenceMs))
+            },
             onError = { message -> showDetail("Detector error: $message") }
         )
     }
@@ -882,6 +905,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         detector?.close()
         detector = null
         latestLocalTrackCount = 0
+        latestDetectionCount = 0
         latestInferenceMs = 0
         if (::overlay.isInitialized) overlay.updateLocalBoxes(emptyList())
     }
@@ -1163,11 +1187,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                     }
                     ArMode.SENSOR -> "$latestLocalTrackCount tracks · ${latestInferenceMs} ms inference"
                     ArMode.LIVE -> if (worldFromSite == null) {
-                        "Move slowly while the app resolves a saved Cloud Anchor"
-                    } else if (reporting) {
-                        "$latestLocalTrackCount local tracks · reporting to this place"
+                        "Detector active · $latestDetectionCount visible object(s) · resolving shared location"
                     } else {
-                        "Observing shared tracks · tap Start reporting to contribute detections"
+                        "$latestDetectionCount detected · $latestLocalTrackCount spatial track(s) · sharing automatically"
                     }
                     ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks"
                 }
@@ -1203,12 +1225,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         runOnUiThread {
             networkText.text = when {
                 connected && mode == ArMode.MAP -> "Server connected · map sync is automatic"
+                connected && mode == ArMode.LIVE -> "Server connected · automatic object sharing active"
                 connected -> "Server connected · live sharing active"
                 mode == ArMode.MAP -> "Server offline · scan is saved locally · upload retry automatic"
                 else -> "Server reconnecting · shared tracks temporarily unavailable"
             }
             networkText.setTextColor(if (connected) FieldTheme.statusBlue else FieldTheme.accent)
-            if (connected && mode == ArMode.LIVE) realtime?.sendStatus(if (reporting) "reporting" else "observing")
+            if (connected && mode == ArMode.LIVE) realtime?.sendStatus("detecting", "automatic object detection and sharing enabled")
         }
     }
 
@@ -1248,7 +1271,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val SCAN_HUD_INTERVAL_MS = 500L
         private const val MAP_CACHE_INTERVAL_MS = 500L
         private const val HUD_INTERVAL_MS = 350L
-        private const val RESOLVE_RETRY_MS = 15_000L
+        private const val RESOLVE_RETRY_MS = 5_000L
         private const val AUTO_GROUND_INTERVAL_MS = 1_000L
         private const val PERMISSION_SETTLE_DELAY_MS = 450L
         private const val ARCORE_RETRY_SETTLE_DELAY_MS = 550L

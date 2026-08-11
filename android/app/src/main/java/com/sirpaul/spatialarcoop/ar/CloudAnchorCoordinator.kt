@@ -18,6 +18,7 @@ import com.sirpaul.spatialarcoop.util.FileLogger
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class CloudAnchorCoordinator(
@@ -33,6 +34,8 @@ class CloudAnchorCoordinator(
     private val reference = AtomicReference<Reference?>(null)
     private val hosting = AtomicBoolean(false)
     private val resolving = AtomicBoolean(false)
+    private val resolveGeneration = AtomicInteger(0)
+    @Volatile private var resolveStartedAtMs = 0L
     private val hostFutures = CopyOnWriteArrayList<HostCloudAnchorFuture>()
     private val resolveFutures = CopyOnWriteArrayList<ResolveCloudAnchorFuture>()
     private val ownedAnchors = CopyOnWriteArrayList<Anchor>()
@@ -61,50 +64,108 @@ class CloudAnchorCoordinator(
             onState("Cloud Anchors are not configured in this APK")
             return
         }
-        if (hasReference || !resolving.compareAndSet(false, true)) return
+        if (hasReference) return
+
+        val now = System.currentTimeMillis()
+        if (resolving.get()) {
+            if (now - resolveStartedAtMs <= RESOLVE_BATCH_TIMEOUT_MS) return
+            logger.warn(
+                "Cloud Anchor resolve batch timed out",
+                mapOf("mapId" to mapId, "elapsedMs" to (now - resolveStartedAtMs), "pending" to resolveFutures.size)
+            )
+            cancelResolveBatch()
+            onState("Saved-anchor lookup timed out · retrying automatically")
+        }
+        if (!resolving.compareAndSet(false, true)) return
+
         val candidates = map.anchors
             .filter { it.status == AnchorStatus.HOSTED && it.cloudAnchorId.isNotBlank() }
             .sortedWith(
                 compareByDescending<AnchorDefinition> { it.id == map.rootAnchorId }
                     .thenByDescending { it.updatedAtMs }
             )
+            .take(MAX_CONCURRENT_RESOLVES)
         if (candidates.isEmpty()) {
             resolving.set(false)
             onState("Map has no hosted anchors yet")
             return
         }
-        resolveNext(candidates, 0)
-    }
 
-    private fun resolveNext(candidates: List<AnchorDefinition>, index: Int) {
-        if (index >= candidates.size) {
-            resolving.set(false)
-            onState("Could not localize against any saved anchor")
-            return
-        }
-        val definition = candidates[index]
-        onState("Resolving anchor ${index + 1}/${candidates.size}")
-        logger.info("Resolving Cloud Anchor", mapOf("mapId" to mapId, "anchorId" to definition.id))
-        var pending: ResolveCloudAnchorFuture? = null
-        val future = session.resolveCloudAnchorAsync(definition.cloudAnchorId) { anchor, state ->
-            pending?.let(resolveFutures::remove)
-            if (state == CloudAnchorState.SUCCESS && anchor != null) {
-                ownedAnchors += anchor
-                reference.set(Reference(anchor, definition))
-                resolving.set(false)
-                logger.info("Cloud Anchor resolved", mapOf("mapId" to mapId, "anchorId" to definition.id))
-                onState("Localized with ${definition.id}")
-            } else {
+        resolveStartedAtMs = now
+        val generation = resolveGeneration.incrementAndGet()
+        val remaining = AtomicInteger(candidates.size)
+        onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")
+        logger.info(
+            "Cloud Anchor resolve batch started",
+            mapOf("mapId" to mapId, "anchors" to candidates.size, "rootAnchorId" to map.rootAnchorId)
+        )
+
+        candidates.forEachIndexed { index, definition ->
+            logger.info(
+                "Resolving Cloud Anchor",
+                mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to (index + 1), "total" to candidates.size)
+            )
+            var pending: ResolveCloudAnchorFuture? = null
+            val future = session.resolveCloudAnchorAsync(definition.cloudAnchorId) { anchor, state ->
+                pending?.let(resolveFutures::remove)
+                if (generation != resolveGeneration.get() || reference.get() != null) {
+                    anchor?.detach()
+                    return@resolveCloudAnchorAsync
+                }
+
+                if (state == CloudAnchorState.SUCCESS && anchor != null) {
+                    if (reference.compareAndSet(null, Reference(anchor, definition))) {
+                        ownedAnchors += anchor
+                        resolving.set(false)
+                        resolveStartedAtMs = 0L
+                        // Invalidate/cancel every other candidate from this batch. First valid
+                        // shared reference wins; all remaining callbacks become stale by generation.
+                        resolveGeneration.incrementAndGet()
+                        val others = resolveFutures.toList()
+                        resolveFutures.clear()
+                        others.filter { it !== pending }.forEach { runCatching { it.cancel() } }
+                        logger.info(
+                            "Cloud Anchor resolved",
+                            mapOf("mapId" to mapId, "anchorId" to definition.id, "candidate" to (index + 1), "total" to candidates.size)
+                        )
+                        onState("Localized · matched saved anchor ${index + 1}/${candidates.size}")
+                    } else {
+                        anchor.detach()
+                    }
+                    return@resolveCloudAnchorAsync
+                }
+
                 anchor?.detach()
+                val left = remaining.decrementAndGet()
                 logger.warn(
                     "Cloud Anchor resolve failed",
-                    mapOf("mapId" to mapId, "anchorId" to definition.id, "state" to state.name)
+                    mapOf(
+                        "mapId" to mapId,
+                        "anchorId" to definition.id,
+                        "candidate" to (index + 1),
+                        "total" to candidates.size,
+                        "state" to state.name,
+                        "remaining" to left
+                    )
                 )
-                resolveNext(candidates, index + 1)
+                if (left <= 0 && generation == resolveGeneration.get() && reference.get() == null) {
+                    resolving.set(false)
+                    resolveStartedAtMs = 0L
+                    resolveFutures.clear()
+                    onState("No saved anchor matched yet · retrying automatically")
+                }
             }
+            pending = future
+            resolveFutures += future
         }
-        pending = future
-        resolveFutures += future
+    }
+
+    private fun cancelResolveBatch() {
+        resolveGeneration.incrementAndGet()
+        resolveFutures.forEach { runCatching { it.cancel() } }
+        resolveFutures.clear()
+        resolving.set(false)
+        resolveStartedAtMs = 0L
     }
 
     fun featureQuality(cameraPose: Pose): FeatureQuality = runCatching {
@@ -265,9 +326,7 @@ class CloudAnchorCoordinator(
     }
 
     fun resetReference() {
-        resolveFutures.forEach { runCatching { it.cancel() } }
-        resolveFutures.clear()
-        resolving.set(false)
+        cancelResolveBatch()
         reference.getAndSet(null)?.let { current ->
             ownedAnchors.remove(current.anchor)
             runCatching { current.anchor.detach() }
@@ -276,10 +335,9 @@ class CloudAnchorCoordinator(
 
     fun close() {
         hostFutures.forEach { runCatching { it.cancel() } }
-        resolveFutures.forEach { runCatching { it.cancel() } }
+        cancelResolveBatch()
         ownedAnchors.forEach { runCatching { it.detach() } }
         hostFutures.clear()
-        resolveFutures.clear()
         ownedAnchors.clear()
         reference.set(null)
     }
@@ -287,5 +345,7 @@ class CloudAnchorCoordinator(
     companion object {
         private const val AUTO_HOST_COOLDOWN_MS = 8_000L
         private const val RETRY_RADIUS_METERS = 4f
+        private const val MAX_CONCURRENT_RESOLVES = 4
+        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L
     }
 }

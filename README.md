@@ -12,7 +12,7 @@ Camera inference runs on the phone. The server receives map metadata, sparse dia
 
 - Native Kotlin Android app; no Unity runtime.
 - **Guided map setup**: automatic shared origin for new maps, local-first sparse point-cloud capture, automatic Cloud Anchor placement/recovery, opportunistic floor detection, clear readiness/progress and resumable uploads.
-- **Live AR**: all participants observe remote tracks; each phone can independently enable/disable object reporting.
+- **Live AR**: every localized participant automatically runs on-device detection, publishes compact tracks and observes everyone else's shared tracks.
 - QR-first private place sharing with server identity verification and isolated per-map keys.
 - MediaPipe EfficientDet-Lite0 detection for `person`, `car`, `bird`, `dog` and `cat` with ARCore depth/hit/ground-plane spatial estimation.
 - Shared-site localization with Cloud Anchors plus a manual shared-origin fallback for builds without Cloud Anchor credentials.
@@ -159,7 +159,7 @@ Advanced mapping recovery actions are under **More** and are explained in [FIELD
 4. The place appears under **Places on this phone**; no owner/admin token is required.
 5. Tap **Live AR**.
 6. Move slowly while the app resolves a saved Cloud Anchor. The header explicitly shows localizing/localized and server connection state.
-7. The phone receives shared tracks once localized/connected. Tap **Start reporting** only if this phone should also run local object detection and publish tracks.
+7. Object detection starts automatically. Local detector boxes appear even while shared localization is still resolving; once localized, compact 3D tracks are published automatically to the place.
 
 **Paste invite** remains available for links sent through chat/email.
 
