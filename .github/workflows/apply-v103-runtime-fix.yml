@@ -1,0 +1,617 @@
+name: Apply v1.0.3 runtime fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-v103-runtime-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/v103-tracking-localization
+      - name: Apply source fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > android/app/src/main/java/com/sirpaul/spatialarcoop/vision/DetectionTracker.kt <<'EOF'
+          package com.sirpaul.spatialarcoop.vision
+
+          import com.sirpaul.spatialarcoop.data.SpatialTrack
+          import kotlin.math.max
+          import kotlin.math.sqrt
+
+          data class SpatialObservation(
+              val label: String,
+              val confidence: Float,
+              val position: FloatArray,
+              val observedAtMs: Long,
+              val uncertaintyMeters: Float = 0.35f,
+              /** Normalized source-image box [left, top, right, bottom], when available. */
+              val imageBox: FloatArray? = null
+          )
+
+          /**
+           * Lightweight multi-object tracker in the shared site frame.
+           *
+           * Identity is associated primarily by class + 2D image continuity when a source-image box
+           * is available. 3D distance remains a secondary signal. This is deliberate: depth/ground
+           * estimates for moving objects can jump while the image box is still clearly the same target.
+           */
+          class DetectionTracker(private val sourceId: String) {
+              private data class State(
+                  val id: String,
+                  var label: String,
+                  var confidence: Float,
+                  var position: FloatArray,
+                  var velocity: FloatArray,
+                  var uncertaintyMeters: Float,
+                  var lastSeenAtMs: Long,
+                  var imageBox: FloatArray?
+              )
+
+              private val states = linkedMapOf<String, State>()
+              private var nextId = 1L
+
+              @Synchronized
+              fun update(observations: List<SpatialObservation>, nowMs: Long = System.currentTimeMillis()): List<SpatialTrack> {
+                  expire(nowMs)
+                  val unmatched = states.values.toMutableSet()
+                  observations.sortedByDescending { it.confidence }.forEach { observation ->
+                      val candidate = unmatched
+                          .asSequence()
+                          .filter { it.label == observation.label }
+                          .mapNotNull { state -> associationScore(state, observation)?.let { state to it } }
+                          .minByOrNull { it.second }
+                          ?.first
+                      if (candidate == null) {
+                          val id = "t${nextId++}"
+                          states[id] = State(
+                              id = id,
+                              label = observation.label,
+                              confidence = observation.confidence,
+                              position = observation.position.copyOf(),
+                              velocity = floatArrayOf(0f, 0f, 0f),
+                              uncertaintyMeters = observation.uncertaintyMeters,
+                              lastSeenAtMs = observation.observedAtMs,
+                              imageBox = observation.imageBox?.copyOf()
+                          )
+                      } else {
+                          unmatched.remove(candidate)
+                          applyObservation(candidate, observation)
+                      }
+                  }
+                  expire(nowMs)
+                  return states.values.map { toPublicTrack(it, nowMs) }
+              }
+
+              @Synchronized
+              fun current(nowMs: Long = System.currentTimeMillis()): List<SpatialTrack> {
+                  expire(nowMs)
+                  return states.values.map { toPublicTrack(it, nowMs) }
+              }
+
+              @Synchronized
+              fun clear() {
+                  states.clear()
+              }
+
+              private fun associationScore(state: State, observation: SpatialObservation): Float? {
+                  val oldBox = validBox(state.imageBox)
+                  val newBox = validBox(observation.imageBox)
+                  val spatialDistance = predictedDistance(state, observation)
+                  if (oldBox != null && newBox != null) {
+                      val iou = boxIou(oldBox, newBox)
+                      val centerDistance = boxCenterDistance(oldBox, newBox)
+                      if (iou < MIN_IMAGE_IOU && centerDistance > MAX_IMAGE_CENTER_DISTANCE) return null
+                      // 2D continuity dominates identity. 3D only breaks ties and must not create a
+                      // new ID merely because one depth sample landed on the background.
+                      val spatialPenalty = (spatialDistance / max(associationRadius(state, observation), 0.5f)).coerceAtMost(3f)
+                      return (1f - iou) * 0.55f + centerDistance * 1.15f + spatialPenalty * 0.10f
+                  }
+                  val radius = associationRadius(state, observation)
+                  if (spatialDistance > radius) return null
+                  return spatialDistance / max(radius, 0.1f)
+              }
+
+              private fun applyObservation(state: State, observation: SpatialObservation) {
+                  val dt = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f).coerceAtMost(1.5f)
+                  val predicted = predictedPosition(state, observation.observedAtMs)
+                  val residual = FloatArray(3) { index -> observation.position[index] - predicted[index] }
+                  val residualDistance = vectorLength(residual)
+                  val visualContinuity = strongVisualMatch(state.imageBox, observation.imageBox)
+                  val jumpGate = spatialJumpGate(state, observation, dt)
+
+                  if (visualContinuity && residualDistance > jumpGate) {
+                      // Same image target, implausible 3D jump: keep the ID and move only gently
+                      // toward the new measurement. This rejects background/depth spikes without
+                      // freezing the track forever if the previous estimate itself was poor.
+                      state.position = FloatArray(3) { index -> predicted[index] + residual[index] * OUTLIER_POSITION_ALPHA }
+                      state.velocity = FloatArray(3) { index -> state.velocity[index] * OUTLIER_VELOCITY_DECAY }
+                      state.uncertaintyMeters = max(
+                          max(state.uncertaintyMeters, observation.uncertaintyMeters),
+                          (residualDistance * 0.22f).coerceAtMost(5f)
+                      )
+                  } else {
+                      state.position = FloatArray(3) { index -> predicted[index] + POSITION_ALPHA * residual[index] }
+                      state.velocity = FloatArray(3) { index ->
+                          val updated = state.velocity[index] + VELOCITY_BETA / dt * residual[index]
+                          updated.coerceIn(-MAX_SPEED_METERS_PER_SECOND, MAX_SPEED_METERS_PER_SECOND)
+                      }
+                      state.uncertaintyMeters = state.uncertaintyMeters * 0.4f + observation.uncertaintyMeters * 0.6f
+                  }
+                  state.confidence = state.confidence * 0.35f + observation.confidence * 0.65f
+                  state.lastSeenAtMs = observation.observedAtMs
+                  state.imageBox = observation.imageBox?.copyOf() ?: state.imageBox
+              }
+
+              private fun spatialJumpGate(state: State, observation: SpatialObservation, dt: Float): Float {
+                  val uncertainty = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceIn(0f, 2.2f)
+                  return (1.15f + uncertainty * 1.15f + dt * 3.0f).coerceIn(1.2f, 4.5f)
+              }
+
+              private fun strongVisualMatch(firstValue: FloatArray?, secondValue: FloatArray?): Boolean {
+                  val first = validBox(firstValue) ?: return false
+                  val second = validBox(secondValue) ?: return false
+                  return boxIou(first, second) >= STRONG_IMAGE_IOU || boxCenterDistance(first, second) <= STRONG_CENTER_DISTANCE
+              }
+
+              private fun predictedPosition(state: State, atMs: Long): FloatArray {
+                  val dt = ((atMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f).coerceAtMost(MAX_PREDICTION_SECONDS)
+                  return FloatArray(3) { index -> state.position[index] + state.velocity[index] * dt }
+              }
+
+              private fun predictedDistance(state: State, observation: SpatialObservation): Float {
+                  val predicted = predictedPosition(state, observation.observedAtMs)
+                  var squared = 0f
+                  for (index in 0..2) {
+                      val delta = observation.position[index] - predicted[index]
+                      squared += delta * delta
+                  }
+                  return sqrt(squared)
+              }
+
+              private fun associationRadius(state: State, observation: SpatialObservation): Float {
+                  val ageSeconds = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f)
+                  val base = if (observation.label == "bird") BIRD_ASSOCIATION_METERS else BASE_ASSOCIATION_METERS
+                  return (base + ageSeconds * 1.1f + state.uncertaintyMeters + observation.uncertaintyMeters)
+                      .coerceAtMost(4f)
+              }
+
+              private fun validBox(value: FloatArray?): FloatArray? = value?.takeIf {
+                  it.size == 4 && it.all(Float::isFinite) && it[2] > it[0] && it[3] > it[1]
+              }
+
+              private fun boxIou(a: FloatArray, b: FloatArray): Float {
+                  val left = maxOf(a[0], b[0])
+                  val top = maxOf(a[1], b[1])
+                  val right = minOf(a[2], b[2])
+                  val bottom = minOf(a[3], b[3])
+                  val intersection = maxOf(0f, right - left) * maxOf(0f, bottom - top)
+                  val areaA = maxOf(0f, a[2] - a[0]) * maxOf(0f, a[3] - a[1])
+                  val areaB = maxOf(0f, b[2] - b[0]) * maxOf(0f, b[3] - b[1])
+                  val union = areaA + areaB - intersection
+                  return if (union <= 1e-6f) 0f else intersection / union
+              }
+
+              private fun boxCenterDistance(a: FloatArray, b: FloatArray): Float {
+                  val ax = (a[0] + a[2]) * 0.5f
+                  val ay = (a[1] + a[3]) * 0.5f
+                  val bx = (b[0] + b[2]) * 0.5f
+                  val by = (b[1] + b[3]) * 0.5f
+                  val dx = ax - bx
+                  val dy = ay - by
+                  return sqrt(dx * dx + dy * dy)
+              }
+
+              private fun vectorLength(value: FloatArray): Float =
+                  sqrt(value.fold(0f) { sum, component -> sum + component * component })
+
+              private fun expire(nowMs: Long) {
+                  states.entries.removeIf { nowMs - it.value.lastSeenAtMs > TRACK_TIMEOUT_MS }
+              }
+
+              private fun toPublicTrack(state: State, nowMs: Long): SpatialTrack {
+                  val ageMs = (nowMs - state.lastSeenAtMs).coerceAtLeast(0L)
+                  val confidenceDecay = (1f - (ageMs.toFloat() / TRACK_TIMEOUT_MS) * 0.55f).coerceIn(0.35f, 1f)
+                  return SpatialTrack(
+                      key = "$sourceId:${state.id}",
+                      id = state.id,
+                      sourceId = sourceId,
+                      label = state.label,
+                      confidence = state.confidence * confidenceDecay,
+                      position = predictedPosition(state, nowMs),
+                      velocity = state.velocity.copyOf(),
+                      uncertaintyMeters = state.uncertaintyMeters + (ageMs / 1000f) * 0.12f,
+                      observedAtMs = state.lastSeenAtMs
+                  )
+              }
+
+              companion object {
+                  private const val POSITION_ALPHA = 0.62f
+                  private const val VELOCITY_BETA = 0.18f
+                  private const val OUTLIER_POSITION_ALPHA = 0.10f
+                  private const val OUTLIER_VELOCITY_DECAY = 0.55f
+                  private const val BASE_ASSOCIATION_METERS = 0.9f
+                  private const val BIRD_ASSOCIATION_METERS = 0.55f
+                  private const val MIN_IMAGE_IOU = 0.06f
+                  private const val MAX_IMAGE_CENTER_DISTANCE = 0.26f
+                  private const val STRONG_IMAGE_IOU = 0.20f
+                  private const val STRONG_CENTER_DISTANCE = 0.12f
+                  private const val MAX_SPEED_METERS_PER_SECOND = 12f
+                  private const val MAX_PREDICTION_SECONDS = 1.0f
+                  private const val TRACK_TIMEOUT_MS = 1_500L
+              }
+          }
+          EOF
+
+          cat > android/app/src/main/java/com/sirpaul/spatialarcoop/ar/SpatialEstimator.kt <<'EOF'
+          package com.sirpaul.spatialarcoop.ar
+
+          import com.google.ar.core.Coordinates2d
+          import com.google.ar.core.DepthPoint
+          import com.google.ar.core.Frame
+          import com.google.ar.core.Plane
+          import com.google.ar.core.Point
+          import com.google.ar.core.TrackingState
+          import com.sirpaul.spatialarcoop.vision.Detection2D
+          import kotlin.math.abs
+          import kotlin.math.max
+
+          data class EstimatedPosition(
+              val sitePosition: FloatArray,
+              val uncertaintyMeters: Float,
+              val method: String
+          )
+
+          /**
+           * Estimates a moving target's contact position in site coordinates.
+           *
+           * A class-size monocular estimate is used as a plausibility reference. ARCore depth/plane
+           * and saved-ground intersections are accepted when they agree with that rough range. This
+           * prevents a bottom-center ray from suddenly snapping from the visible person/car to a
+           * background feature tens of metres away.
+           */
+          object SpatialEstimator {
+              fun estimate(
+                  frame: Frame,
+                  detection: Detection2D,
+                  worldFromSite: FloatArray,
+                  groundY: Float?
+              ): EstimatedPosition? {
+                  if (frame.camera.trackingState != TrackingState.TRACKING) return null
+                  val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
+                  val siteOrigin = PoseMath.transformPoint(siteFromWorld, frame.camera.pose.translation)
+                  val monocular = estimateFromBoundingBoxSize(frame, detection, siteFromWorld, groundY)
+
+                  val view = FloatArray(2)
+                  frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, detection.rawBottomCenter, Coordinates2d.VIEW, view)
+                  val bestHit = frame.hitTest(view[0], view[1])
+                      .filter { hit ->
+                          when (val trackable = hit.trackable) {
+                              is DepthPoint -> true
+                              is Plane -> trackable.trackingState == TrackingState.TRACKING && trackable.isPoseInPolygon(hit.hitPose)
+                              is Point -> trackable.trackingState == TrackingState.TRACKING
+                              else -> false
+                          }
+                      }
+                      .minWithOrNull(compareBy({ priority(it.trackable) }, { it.distance }))
+
+                  val hit = bestHit?.let { result ->
+                      val site = PoseMath.transformPoint(siteFromWorld, result.hitPose.translation)
+                      val (uncertainty, method) = when (result.trackable) {
+                          is DepthPoint -> 0.28f to "depth"
+                          is Plane -> 0.38f to "plane"
+                          else -> 0.75f to "feature-point"
+                      }
+                      EstimatedPosition(site, uncertainty, method)
+                  }
+
+                  val ground = groundY?.let { y ->
+                      intersectGround(frame, detection.rawBottomCenter, siteFromWorld, y)?.let {
+                          EstimatedPosition(it, 0.55f, "ground-ray")
+                      }
+                  }
+
+                  // For the classes used by this project the shared track represents the physical
+                  // contact point (feet/wheels/chicken on ground). Prefer a plausible ground ray.
+                  if (ground != null && plausibleRange(siteOrigin, ground, monocular)) {
+                      if (hit != null && plausibleRange(siteOrigin, hit, monocular) && PoseMath.distance(hit.sitePosition, ground.sitePosition) < 1.6f) {
+                          return EstimatedPosition(
+                              sitePosition = floatArrayOf(
+                                  hit.sitePosition[0] * 0.35f + ground.sitePosition[0] * 0.65f,
+                                  ground.sitePosition[1],
+                                  hit.sitePosition[2] * 0.35f + ground.sitePosition[2] * 0.65f
+                              ),
+                              uncertaintyMeters = max(hit.uncertaintyMeters, ground.uncertaintyMeters),
+                              method = "${hit.method}+ground"
+                          )
+                      }
+                      return ground
+                  }
+
+                  if (hit != null && plausibleRange(siteOrigin, hit, monocular)) {
+                      val position = if (groundY != null) {
+                          floatArrayOf(hit.sitePosition[0], groundY, hit.sitePosition[2])
+                      } else {
+                          hit.sitePosition
+                      }
+                      return EstimatedPosition(position, hit.uncertaintyMeters, hit.method)
+                  }
+
+                  // A stable coarse range is better than publishing a confidently wrong 20 m hit.
+                  if (monocular != null) return monocular
+
+                  // No class-size estimate was possible. Keep a bounded ground result only as the
+                  // last fallback and mark it very uncertain.
+                  if (ground != null && PoseMath.distance(siteOrigin, ground.sitePosition) <= MAX_UNCHECKED_GROUND_RANGE_METERS) {
+                      return ground.copy(uncertaintyMeters = 2.5f, method = "ground-ray-unchecked")
+                  }
+                  return null
+              }
+
+              fun centerGroundPoint(frame: Frame, worldFromSite: FloatArray, groundY: Float?): FloatArray? {
+                  val dimensions = frame.camera.imageIntrinsics.imageDimensions
+                  return if (groundY != null) {
+                      intersectGround(
+                          frame,
+                          floatArrayOf(dimensions[0] * 0.5f, dimensions[1] * 0.58f),
+                          PoseMath.rigidInverse(worldFromSite),
+                          groundY
+                      )
+                  } else {
+                      val view = floatArrayOf(0.5f * dimensions[0], 0.58f * dimensions[1])
+                      val output = FloatArray(2)
+                      frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, view, Coordinates2d.VIEW, output)
+                      frame.hitTest(output[0], output[1]).firstOrNull()?.hitPose?.translation?.let {
+                          PoseMath.transformPoint(PoseMath.rigidInverse(worldFromSite), it)
+                      }
+                  }
+              }
+
+              private fun plausibleRange(origin: FloatArray, candidate: EstimatedPosition, reference: EstimatedPosition?): Boolean {
+                  val candidateRange = PoseMath.distance(origin, candidate.sitePosition)
+                  if (!candidateRange.isFinite() || candidateRange !in 0.25f..MAX_TARGET_RANGE_METERS) return false
+                  if (reference == null) return candidateRange <= MAX_UNCHECKED_HIT_RANGE_METERS
+                  val referenceRange = PoseMath.distance(origin, reference.sitePosition)
+                  if (!referenceRange.isFinite() || referenceRange <= 0.2f) return true
+                  val tolerance = max(1.8f, referenceRange * 0.60f)
+                  return abs(candidateRange - referenceRange) <= tolerance
+              }
+
+              private fun estimateFromBoundingBoxSize(
+                  frame: Frame,
+                  detection: Detection2D,
+                  siteFromWorld: FloatArray,
+                  groundY: Float?
+              ): EstimatedPosition? {
+                  val physicalExtentMeters = when (detection.label.lowercase()) {
+                      "person" -> 1.70f
+                      "car" -> 1.82f
+                      "bird" -> 0.42f
+                      "dog" -> 0.70f
+                      "cat" -> 0.42f
+                      else -> 0.65f
+                  }
+                  // max(width,height) remains usable after sensor/display 90 degree rotation.
+                  val pixelExtent = maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
+                  if (!pixelExtent.isFinite() || pixelExtent < 8f) return null
+
+                  val intrinsics = frame.camera.imageIntrinsics
+                  val focal = intrinsics.focalLength
+                  val principal = intrinsics.principalPoint
+                  if (focal[0] <= 0f || focal[1] <= 0f) return null
+                  val focalPixels = (focal[0] + focal[1]) * 0.5f
+                  val opticalDepth = (focalPixels * physicalExtentMeters / pixelExtent).coerceIn(0.45f, MAX_TARGET_RANGE_METERS)
+                  if (!opticalDepth.isFinite()) return null
+
+                  val imagePixel = detection.rawBottomCenter
+                  val cameraDirection = PoseMath.normalize(
+                      floatArrayOf(
+                          (imagePixel[0] - principal[0]) / focal[0],
+                          -(imagePixel[1] - principal[1]) / focal[1],
+                          -1f
+                      )
+                  )
+                  val worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose)
+                  val worldDirection = PoseMath.transformDirection(worldFromCamera, cameraDirection)
+                  val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromWorld, worldDirection))
+                  val siteOrigin = PoseMath.transformPoint(siteFromWorld, frame.camera.pose.translation)
+                  val rayLength = (opticalDepth / abs(cameraDirection[2]).coerceAtLeast(0.20f)).coerceIn(0.45f, MAX_TARGET_RANGE_METERS)
+                  val position = floatArrayOf(
+                      siteOrigin[0] + siteDirection[0] * rayLength,
+                      siteOrigin[1] + siteDirection[1] * rayLength,
+                      siteOrigin[2] + siteDirection[2] * rayLength
+                  )
+                  if (groundY != null) position[1] = groundY
+                  val uncertainty = (0.65f + opticalDepth * 0.18f).coerceIn(0.8f, 6f)
+                  return EstimatedPosition(position, uncertainty, "monocular-class-size")
+              }
+
+              private fun intersectGround(
+                  frame: Frame,
+                  imagePixel: FloatArray,
+                  siteFromWorld: FloatArray,
+                  groundY: Float
+              ): FloatArray? {
+                  val intrinsics = frame.camera.imageIntrinsics
+                  val focal = intrinsics.focalLength
+                  val principal = intrinsics.principalPoint
+                  if (focal[0] <= 0f || focal[1] <= 0f) return null
+                  val cameraDirection = PoseMath.normalize(
+                      floatArrayOf(
+                          (imagePixel[0] - principal[0]) / focal[0],
+                          -(imagePixel[1] - principal[1]) / focal[1],
+                          -1f
+                      )
+                  )
+                  val worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose)
+                  val worldDirection = PoseMath.transformDirection(worldFromCamera, cameraDirection)
+                  val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromWorld, worldDirection))
+                  if (abs(siteDirection[1]) < 0.02f) return null
+                  val siteOrigin = PoseMath.transformPoint(siteFromWorld, frame.camera.pose.translation)
+                  val distance = (groundY - siteOrigin[1]) / siteDirection[1]
+                  if (!distance.isFinite() || distance !in 0.15f..MAX_TARGET_RANGE_METERS) return null
+                  return floatArrayOf(
+                      siteOrigin[0] + siteDirection[0] * distance,
+                      groundY,
+                      siteOrigin[2] + siteDirection[2] * distance
+                  )
+              }
+
+              private fun priority(trackable: Any): Int = when (trackable) {
+                  is DepthPoint -> 0
+                  is Plane -> 1
+                  is Point -> 2
+                  else -> 3
+              }
+
+              private const val MAX_TARGET_RANGE_METERS = 35f
+              private const val MAX_UNCHECKED_HIT_RANGE_METERS = 18f
+              private const val MAX_UNCHECKED_GROUND_RANGE_METERS = 18f
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f"expected block not found in {path}: {old[:100]!r}")
+              text2 = text.replace(old, new, 1)
+              p.write_text(text2)
+
+          # Feed normalized 2D source boxes into the tracker and stop mirroring local spatial tracks
+          # into the remote overlay; the server still receives the tracks normally.
+          ar = 'android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt'
+          replace_once(ar,
+          '''                        uncertaintyMeters = estimate.uncertaintyMeters\n                    )''',
+          '''                        uncertaintyMeters = estimate.uncertaintyMeters,\n                        imageBox = floatArrayOf(\n                            detection.rawBoundingBox.left / detection.rawImageWidth.coerceAtLeast(1),\n                            detection.rawBoundingBox.top / detection.rawImageHeight.coerceAtLeast(1),\n                            detection.rawBoundingBox.right / detection.rawImageWidth.coerceAtLeast(1),\n                            detection.rawBoundingBox.bottom / detection.rawImageHeight.coerceAtLeast(1)\n                        )\n                    )''')
+          text = Path(ar).read_text()
+          needle = '            remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)\n'
+          count = text.count(needle)
+          if count != 2:
+              raise SystemExit(f'expected exactly 2 local remoteTracks mirrors, found {count}')
+          Path(ar).write_text(text.replace(needle, ''))
+          replace_once(ar,
+          '''                connected -> "Server connected · live sharing active"''',
+          '''                connected -> "Server connected · room joined"''')
+
+          # Do not echo this phone's own WebSocket track batches back into its remote overlay.
+          rt = 'android/app/src/main/java/com/sirpaul/spatialarcoop/net/RealtimeClient.kt'
+          replace_once(rt,
+          '''                val tracks = parseTracks(json.optJSONArray("tracks"), null)\n                listener.onTracks(tracks, replaceSnapshot = true)''',
+          '''                val tracks = parseTracks(json.optJSONArray("tracks"), null)\n                    .filterNot { it.sourceId == clientId }\n                listener.onTracks(tracks, replaceSnapshot = true)''')
+          replace_once(rt,
+          '''                val source = json.optString("sourceId", "unknown")\n                listener.onTracks(parseTracks(json.optJSONArray("tracks"), source))''',
+          '''                val source = json.optString("sourceId", "unknown")\n                if (source != clientId) {\n                    listener.onTracks(parseTracks(json.optJSONArray("tracks"), source))\n                }''')
+
+          # Let Cloud Anchor futures finish. The previous 12 s self-cancel could restart a valid
+          # resolve batch every time ArActivity retried at 15 s.
+          ca = 'android/app/src/main/java/com/sirpaul/spatialarcoop/ar/CloudAnchorCoordinator.kt'
+          replace_once(ca,
+          '''        if (resolving.get()) {\n            if (now - resolveStartedAtMs <= RESOLVE_BATCH_TIMEOUT_MS) return\n            logger.warn(\n                "Cloud Anchor resolve batch timed out",\n                mapOf("mapId" to mapId, "elapsedMs" to (now - resolveStartedAtMs), "pending" to resolveFutures.size)\n            )\n            cancelResolveBatch()\n            onState("Saved-anchor lookup timed out · retrying automatically")\n        }\n        if (!resolving.compareAndSet(false, true)) return''',
+          '''        if (resolving.get()) {\n            // Do not impose an application-level timeout on ARCore visual localization. A valid\n            // async resolve may need more than a few seconds of camera motion before it matches.\n            if (now - resolveStartedAtMs > RESOLVE_SLOW_NOTICE_MS) {\n                onState("Still matching saved Cloud Anchors · keep moving slowly around the mapped area")\n            }\n            return\n        }\n        if (!resolving.compareAndSet(false, true)) return''')
+          replace_once(ca,
+          '''        val remaining = AtomicInteger(candidates.size)\n        onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")''',
+          '''        val remaining = AtomicInteger(candidates.size)\n        val failures = CopyOnWriteArrayList<String>()\n        onState("Trying ${candidates.size} saved Cloud Anchors · move slowly and look around")''')
+          replace_once(ca,
+          '''                anchor?.detach()\n                val left = remaining.decrementAndGet()''',
+          '''                anchor?.detach()\n                failures += "${definition.id}:${state.name}"\n                val left = remaining.decrementAndGet()''')
+          replace_once(ca,
+          '''                    resolveFutures.clear()\n                    onState("No saved anchor matched yet · retrying automatically")''',
+          '''                    resolveFutures.clear()\n                    val summary = failures.joinToString(", ").take(420)\n                    onState("Localization failed · $summary · retrying automatically")''')
+          replace_once(ca,
+          '''        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L''',
+          '''        private const val RESOLVE_SLOW_NOTICE_MS = 25_000L''')
+
+          # Restore normal confidence for person/car while preserving a lower bird threshold.
+          od = 'android/app/src/main/java/com/sirpaul/spatialarcoop/vision/ObjectDetectorEngine.kt'
+          replace_once(od,
+          '''                    val effectiveThreshold = minOf(threshold, classScoreThreshold(label))''',
+          '''                    val effectiveThreshold = if (label == "bird") minOf(threshold, BIRD_SCORE_THRESHOLD) else threshold''')
+          replace_once(od,
+          '''                    "generalThreshold" to minOf(threshold, GENERAL_SCORE_THRESHOLD),''',
+          '''                    "generalThreshold" to threshold,''')
+          replace_once(od,
+          '''    private fun classScoreThreshold(label: String): Float = when (label) {\n        "bird" -> BIRD_SCORE_THRESHOLD\n        else -> GENERAL_SCORE_THRESHOLD\n    }\n\n''',
+          '''''')
+          replace_once(od,
+          '''        private const val BIRD_SCORE_THRESHOLD = 0.25f\n        private const val GENERAL_SCORE_THRESHOLD = 0.35f''',
+          '''        private const val BIRD_SCORE_THRESHOLD = 0.30f''')
+
+          # v1.0.3 identifies this physical-device correction unambiguously.
+          gradle = 'android/app/build.gradle.kts'
+          replace_once(gradle, 'versionCode = 3', 'versionCode = 4')
+          replace_once(gradle, 'versionName = "1.0.2"', 'versionName = "1.0.3"')
+          PY
+
+          cat >> android/app/src/test/java/com/sirpaul/spatialarcoop/vision/DetectionTrackerTest.kt.tmp <<'EOF'
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/test/java/com/sirpaul/spatialarcoop/vision/DetectionTrackerTest.kt')
+          text = p.read_text()
+          insert = r'''
+
+              @Test fun sameImageTargetKeepsIdAcrossLargeDepthSpike() {
+                  val tracker = DetectionTracker("phone-a")
+                  val t0 = 50_000L
+                  fun person(z: Float, at: Long, box: FloatArray) = SpatialObservation(
+                      label = "person",
+                      confidence = 0.82f,
+                      position = floatArrayOf(0f, 0f, z),
+                      observedAtMs = at,
+                      uncertaintyMeters = 0.8f,
+                      imageBox = box
+                  )
+                  val box1 = floatArrayOf(0.30f, 0.15f, 0.58f, 0.92f)
+                  val box2 = floatArrayOf(0.31f, 0.16f, 0.59f, 0.93f)
+                  val first = tracker.update(listOf(person(4f, t0, box1)), t0).single()
+                  val second = tracker.update(listOf(person(19f, t0 + 150, box2)), t0 + 150).single()
+                  assertEquals(first.key, second.key)
+                  assertTrue("a single bad depth sample must not teleport the track to 19 m", second.position[2] < 8f)
+              }
+
+              @Test fun visuallySeparatedSameClassTargetsRemainDistinct() {
+                  val tracker = DetectionTracker("phone-a")
+                  val t0 = 60_000L
+                  val left = SpatialObservation("bird", 0.8f, floatArrayOf(-0.5f, 0f, 3f), t0, 0.5f, floatArrayOf(0.10f, 0.45f, 0.28f, 0.75f))
+                  val right = SpatialObservation("bird", 0.8f, floatArrayOf(0.5f, 0f, 3f), t0, 0.5f, floatArrayOf(0.70f, 0.45f, 0.88f, 0.75f))
+                  val first = tracker.update(listOf(left, right), t0)
+                  assertEquals(2, first.size)
+                  val next = tracker.update(
+                      listOf(
+                          left.copy(position = floatArrayOf(-0.45f, 0f, 3.1f), observedAtMs = t0 + 150),
+                          right.copy(position = floatArrayOf(0.45f, 0f, 3.1f), observedAtMs = t0 + 150)
+                      ),
+                      t0 + 150
+                  )
+                  assertEquals(first.map { it.key }.toSet(), next.map { it.key }.toSet())
+              }
+          '''
+          marker = '\n}\n'
+          if not text.endswith(marker):
+              raise SystemExit('unexpected DetectionTrackerTest ending')
+          p.write_text(text[:-len(marker)] + insert + marker)
+          PY
+
+          rm -f android/app/src/test/java/com/sirpaul/spatialarcoop/vision/DetectionTrackerTest.kt.tmp
+          git rm .github/workflows/apply-v103-runtime-fix.yml
+          git diff --check
+      - name: Commit patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add android .github/workflows/apply-v103-runtime-fix.yml
+          git commit -m 'fix: stabilize live tracks and let Cloud Anchor resolve finish'
+          git push origin HEAD:fix/v103-tracking-localization
