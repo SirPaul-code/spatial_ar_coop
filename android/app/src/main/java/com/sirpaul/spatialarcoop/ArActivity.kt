@@ -69,6 +69,7 @@ import javax.microedition.khronos.opengles.GL10
 
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener {
     private data class PendingDetection(val detections: List<Detection2D>, val inferenceMs: Long)
+    private enum class ArSessionProfile { STANDARD, COMPATIBILITY }
 
     private lateinit var mapId: String
     private lateinit var mode: ArMode
@@ -83,11 +84,18 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private lateinit var arErrorText: TextView
     private var reportButton: Button? = null
     private var finishSetupButton: Button? = null
+    private var retryArButton: Button? = null
 
     @Volatile private var session: Session? = null
     private val arState = ArSessionStateMachine()
     private val closing = AtomicBoolean(false)
+    private val arStartScheduled = AtomicBoolean(false)
+    private val cameraPermissionRequestInFlight = AtomicBoolean(false)
+    private val sessionCloseInFlight = AtomicBoolean(false)
+    @Volatile private var activityResumed = false
     @Volatile private var glResumed = false
+    @Volatile private var arProfile = ArSessionProfile.STANDARD
+    private var compatibilityFallbackUsed = false
     private var installRequested = false
     private var textureBound = false
     private var viewportWidth = 1
@@ -134,12 +142,20 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var viewProjectionMatrix = PoseMath.identity()
 
     private val cameraPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) resumeArSession() else {
+        cameraPermissionRequestInFlight.set(false)
+        if (granted) {
+            // Do not call Session.resume() from the permission-result dispatch itself. On some
+            // Android 16/Samsung builds that callback can race the Activity's next onResume and
+            // camera-service settling. Schedule exactly one normal lifecycle start instead.
+            showDetail("Camera permission granted · starting AR…")
+            scheduleArStart(PERMISSION_SETTLE_DELAY_MS)
+        } else {
             spatialApp.logger.warn("Camera permission denied")
             showDetail("Camera permission is required")
             finish()
         }
     }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -280,7 +296,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             gravity = Gravity.CENTER
             setPadding(0, dp(12), 0, 0)
         }
-        errorActions.addView(action("Retry AR") { retryArSession() })
+        retryArButton = action("Retry AR") { retryArSession() }.also(errorActions::addView)
         errorActions.addView(action("Back") { finishSafely() })
         errorActions.addView(action("Diagnostics") { Diagnostics.shareLogs(this, spatialApp.logger) })
         arErrorPanel.addView(errorActions)
@@ -303,19 +319,36 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     override fun onResume() {
         super.onResume()
         if (closing.get()) return
+        activityResumed = true
         displayRotation.onResume()
-        resumeArSession()
+        scheduleArStart()
     }
 
-    private fun createConfiguredSession(): Session {
+    private fun createConfiguredSession(profile: ArSessionProfile): Session {
         val created = Session(this)
         try {
             val config = Config(created).apply {
-                updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                focusMode = Config.FocusMode.AUTO
                 cloudAnchorMode = if (BuildConfig.CLOUD_ANCHORS_CONFIGURED) Config.CloudAnchorMode.ENABLED else Config.CloudAnchorMode.DISABLED
-                depthMode = if (created.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
+                when (profile) {
+                    ArSessionProfile.STANDARD -> {
+                        updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                        planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+                        focusMode = Config.FocusMode.AUTO
+                        depthMode = if (created.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+                            Config.DepthMode.AUTOMATIC
+                        } else {
+                            Config.DepthMode.DISABLED
+                        }
+                    }
+                    ArSessionProfile.COMPATIBILITY -> {
+                        // Keep Cloud Anchors, which are required for shared localization, but remove
+                        // optional camera/depth features that have caused resume-time failures on
+                        // some current Samsung/Android combinations. The detector can still fall
+                        // back to hit/ground estimation when Depth is disabled.
+                        planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
+                        depthMode = Config.DepthMode.DISABLED
+                    }
+                }
             }
             created.configure(config)
             cloudAnchors = CloudAnchorCoordinator(
@@ -327,6 +360,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 onState = ::showDetail
             )
             session = created
+            spatialApp.logger.info(
+                "ARCore session configured",
+                mapOf("mapId" to mapId, "profile" to profile.name, "cloudAnchors" to BuildConfig.CLOUD_ANCHORS_CONFIGURED)
+            )
             return created
         } catch (error: Throwable) {
             runCatching { created.close() }
@@ -334,12 +371,30 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
     }
 
-    private fun resumeArSession() {
-        if (closing.get()) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+    private fun scheduleArStart(delayMs: Long = 0L) {
+        if (closing.get() || !activityResumed) return
+        if (!arStartScheduled.compareAndSet(false, true)) return
+        glSurface.postDelayed({
+            arStartScheduled.set(false)
+            if (!closing.get() && activityResumed) resumeArSession(explicitRetry = false)
+        }, delayMs.coerceAtLeast(0L))
+    }
+
+    private fun resumeArSession(explicitRetry: Boolean = false) {
+        if (closing.get() || !activityResumed) return
+        if (sessionCloseInFlight.get()) {
+            showDetail("Cleaning up the previous AR session…")
             return
         }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            if (cameraPermissionRequestInFlight.compareAndSet(false, true)) {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+            return
+        }
+        // If a permission request has just completed, let its callback own the delayed start. This
+        // prevents onResume + ActivityResult from racing two Session.resume() calls.
+        if (cameraPermissionRequestInFlight.get()) return
         try {
             when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
                 ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
@@ -350,8 +405,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 ArCoreApk.InstallStatus.INSTALLED -> Unit
                 null -> error("ARCore installation check returned no status")
             }
-            if (!arState.beginStart()) return
-            val active = session ?: createConfiguredSession()
+            val accepted = if (explicitRetry) arState.beginRetryStart() else arState.beginStart()
+            if (!accepted) return
+            val active = session ?: createConfiguredSession(arProfile)
             active.resume()
             textureBound = false
             if (!arState.markRunning()) {
@@ -359,6 +415,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 return
             }
             hideArFailure()
+            retryArButton?.isEnabled = true
             resumeGlIfNeeded()
             showDetail(
                 when (mode) {
@@ -373,9 +430,14 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     }
 
     private fun retryArSession() {
-        if (closing.get() || arState.current() != ArSessionState.FAILED) return
+        if (closing.get() || !activityResumed || arState.current() != ArSessionState.FAILED) return
+        if (sessionCloseInFlight.get()) {
+            retryArButton?.isEnabled = false
+            showDetail("Cleaning up the previous AR session · retry will be available when it is closed")
+            return
+        }
         hideArFailure()
-        resumeArSession()
+        resumeArSession(explicitRetry = true)
     }
 
     private fun resumeGlIfNeeded() {
@@ -397,6 +459,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         session = null
         val failedCoordinator = cloudAnchors
         cloudAnchors = null
+        val profileAtFailure = arProfile
         val availability = runCatching { ArCoreApk.getInstance().checkAvailability(this).name }.getOrDefault("unknown")
         val arcoreVersion = runCatching { packageManager.getPackageInfo("com.google.ar.core", 0).versionName }.getOrNull()
         spatialApp.logger.error(
@@ -407,6 +470,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 "exception" to error.javaClass.name,
                 "message" to error.message,
                 "arState" to arState.current().name,
+                "profile" to profileAtFailure.name,
                 "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
                 "android" to "${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
                 "arcoreAvailability" to availability,
@@ -418,16 +482,44 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             pauseGlIfNeeded()
             failedCoordinator?.close()
             runCatching { failedSession?.pause() }
-            closeSessionAsync(failedSession)
+            val autoCompatibility = error is FatalException &&
+                phase == "resume" &&
+                profileAtFailure == ArSessionProfile.STANDARD &&
+                !compatibilityFallbackUsed
+
+            retryArButton?.isEnabled = false
             showArFailure(error)
+            if (autoCompatibility) {
+                detailText.text = "ARCore returned an internal camera/session error · cleaning up before one compatibility retry"
+            } else if (failedSession != null) {
+                detailText.text = "Cleaning up the failed AR session…"
+            }
+
+            closeSessionAsync(failedSession) {
+                if (closing.get()) return@closeSessionAsync
+                if (autoCompatibility && activityResumed) {
+                    compatibilityFallbackUsed = true
+                    arProfile = ArSessionProfile.COMPATIBILITY
+                    arErrorPanel.visibility = View.GONE
+                    detailText.text = "Retrying AR with a compatibility camera profile · Cloud Anchors stay enabled"
+                    glSurface.postDelayed({
+                        if (!closing.get() && activityResumed && arState.current() == ArSessionState.FAILED) {
+                            retryArSession()
+                        }
+                    }, ARCORE_RETRY_SETTLE_DELAY_MS)
+                } else {
+                    retryArButton?.isEnabled = true
+                    showArFailure(error)
+                }
+            }
         }
     }
 
     private fun showArFailure(error: Throwable) {
         val category = when (error) {
-            is FatalException -> "Google Play Services for AR returned an internal session error. A fresh session is required."
+            is FatalException -> "Google Play Services for AR returned an internal session error. The failed native session has been discarded."
             is CameraNotAvailableException -> "The camera is unavailable to ARCore. Close other camera users and retry."
-            is SessionPausedException -> "The AR session became paused unexpectedly. A fresh session will be created."
+            is SessionPausedException -> "The AR session became paused unexpectedly. A fresh session is required."
             is SecurityException -> "Camera access was rejected by Android. Check camera permission and retry."
             is IllegalStateException -> "ARCore rejected the current lifecycle state. Retry creates a clean session."
             else -> when (error.javaClass.simpleName) {
@@ -439,22 +531,50 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 else -> "AR session could not start (${error.javaClass.simpleName})."
             }
         }
-        arErrorText.text = "AR session could not start\n\n$category"
+        arErrorText.text = "AR session could not start
+
+$category"
         arErrorPanel.visibility = View.VISIBLE
+        retryArButton?.isEnabled = !sessionCloseInFlight.get()
         stateText.text = "${currentMap()?.name ?: mapId} · AR unavailable"
-        detailText.text = "Retry AR or share diagnostics for the complete error."
+        if (!sessionCloseInFlight.get()) {
+            detailText.text = if (arProfile == ArSessionProfile.COMPATIBILITY) {
+                "Compatibility profile also failed · Retry AR or share diagnostics"
+            } else {
+                "Retry AR or share diagnostics for the complete error"
+            }
+        }
     }
 
     private fun hideArFailure() {
         runOnUiThread { arErrorPanel.visibility = View.GONE }
     }
 
-    private fun closeSessionAsync(value: Session?) {
-        if (value == null) return
-        Thread({ runCatching { value.close() } }, "spatial-arcore-close").start()
+    private fun closeSessionAsync(value: Session?, onClosed: () -> Unit = {}) {
+        if (value == null) {
+            onClosed()
+            return
+        }
+        if (!sessionCloseInFlight.compareAndSet(false, true)) {
+            spatialApp.logger.warn("ARCore close already in progress", mapOf("mapId" to mapId))
+            return
+        }
+        Thread({
+            val failure = runCatching { value.close() }.exceptionOrNull()
+            runOnUiThread {
+                sessionCloseInFlight.set(false)
+                if (failure != null) {
+                    spatialApp.logger.warn("ARCore session close failed", mapOf("mapId" to mapId, "error" to failure.message))
+                } else {
+                    spatialApp.logger.info("ARCore session closed", mapOf("mapId" to mapId))
+                }
+                onClosed()
+            }
+        }, "spatial-arcore-close").start()
     }
 
     override fun onPause() {
+        activityResumed = false
         if (!closing.get()) {
             arState.beginPause()
             pauseGlIfNeeded()
@@ -475,7 +595,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             if (finishActivity && !isFinishing) finish()
             return
         }
+        activityResumed = false
+        arStartScheduled.set(false)
         arState.beginClosing()
+        retryArButton?.isEnabled = false
         spatialApp.logger.info("AR teardown begin", mapOf("mapId" to mapId, "mode" to mode.name))
         pauseGlIfNeeded()
         runCatching { displayRotation.onPause() }
@@ -940,10 +1063,42 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 distanceMeters = PoseMath.distance(cameraSite, track.position),
                 uncertaintyMeters = track.uncertaintyMeters,
                 ageMs = (now - track.serverReceivedAtMs).coerceAtLeast(0L),
-                sourceId = track.sourceId
+                sourceId = track.sourceId,
+                bounds = projectTrackBounds(track, worldFromSite)
             )
         }
         overlay.updateTracks(projected)
+    }
+
+    /**
+     * Project a class-sized, viewer-facing AR box from the shared 3D ground/contact position.
+     * The source phone still shows the detector's raw image bounding box; this box is the stable
+     * spatial representation that every localized participant can render from their own viewpoint.
+     */
+    private fun projectTrackBounds(track: SpatialTrack, worldFromSite: FloatArray): RectF? {
+        val (heightMeters, aspect) = when (track.label.lowercase()) {
+            "person" -> 1.72f to 0.40f
+            "car" -> 1.50f to 1.85f
+            // EfficientDet/COCO reports chickens as bird. A ~45 cm field box works well for the
+            // chicken-sized targets this project is intended to visualize.
+            "bird" -> 0.45f to 1.05f
+            "dog" -> 0.70f to 1.25f
+            "cat" -> 0.42f to 1.05f
+            else -> 0.65f to 0.85f
+        }
+        val topSite = floatArrayOf(track.position[0], track.position[1] + heightMeters, track.position[2])
+        val feetWorld = PoseMath.transformPoint(worldFromSite, track.position)
+        val topWorld = PoseMath.transformPoint(worldFromSite, topSite)
+        val feet = PoseMath.projectToScreen(viewProjectionMatrix, feetWorld, viewportWidth, viewportHeight) ?: return null
+        val top = PoseMath.projectToScreen(viewProjectionMatrix, topWorld, viewportWidth, viewportHeight) ?: return null
+        val rawHeight = kotlin.math.abs(feet.y - top.y)
+        if (!rawHeight.isFinite() || rawHeight < 1f) return null
+        val pixelHeight = rawHeight.coerceIn(14f, viewportHeight * 0.92f)
+        val pixelWidth = (pixelHeight * aspect).coerceIn(12f, viewportWidth * 0.92f)
+        val centerX = (feet.x + top.x) * 0.5f
+        val topY = minOf(feet.y, top.y)
+        val bottomY = maxOf(feet.y, top.y)
+        return RectF(centerX - pixelWidth / 2f, topY, centerX + pixelWidth / 2f, bottomY)
     }
 
     private fun publishClientPose(frame: Frame, siteFromWorld: FloatArray) {
@@ -1073,6 +1228,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val HUD_INTERVAL_MS = 350L
         private const val RESOLVE_RETRY_MS = 15_000L
         private const val AUTO_GROUND_INTERVAL_MS = 1_000L
+        private const val PERMISSION_SETTLE_DELAY_MS = 450L
+        private const val ARCORE_RETRY_SETTLE_DELAY_MS = 550L
         private const val MIN_SETUP_CHUNKS = 2
         private const val MIN_SETUP_POINTS = 1_000
     }
