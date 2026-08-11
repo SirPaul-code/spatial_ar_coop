@@ -1,5 +1,15 @@
 # Android release notes
 
+## 1.0.5
+
+- Add temporal image-space association before spatial tracking. Weak detections may maintain an existing object, but only stronger class-specific detections may create a new identity.
+- Lower the detector candidate floor for difficult `bird`/chicken views while requiring temporal confirmation before any detection can become a shared 3D track.
+- Smooth detector boxes over time and keep short confidence dips/partial occlusion from immediately destroying an object's local identity.
+- Prefer saved-ground contact projection for people, cars, birds, dogs and cats instead of allowing target/background Depth hits to redefine the shared position frame-to-frame.
+- Reject near-horizon ground rays and physically implausible class scale/range combinations instead of publishing large 3D jumps.
+- Harden the spatial tracker with measurement outlier rejection, conservative identity re-acquisition, adaptive correction, stationary deadband and bounded 300 ms motion prediction so stale velocity cannot keep drifting a marker.
+- Keep WebSocket protocol/server behavior unchanged; 1.0.5 is a client-side perception/tracking stability pass on top of the field-verified v1.0.4 shared localization and synchronization path.
+
 ## 1.0.4
 
 - Preserve the last valid shared transform after a successful Cloud Anchor resolve through temporary anchor tracking pauses.

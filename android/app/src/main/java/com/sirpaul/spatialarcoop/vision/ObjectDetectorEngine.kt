@@ -12,6 +12,12 @@ import java.io.Closeable
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+data class CaptureGeometry(
+    val worldFromCamera: FloatArray,
+    val focalLength: FloatArray,
+    val principalPoint: FloatArray
+)
+
 data class Detection2D(
     val label: String,
     val confidence: Float,
@@ -19,7 +25,10 @@ data class Detection2D(
     val rawBottomCenter: FloatArray,
     val capturedAtMs: Long,
     val rawImageWidth: Int,
-    val rawImageHeight: Int
+    val rawImageHeight: Int,
+    val temporalId: String? = null,
+    val temporallyConfirmed: Boolean = true,
+    val captureGeometry: CaptureGeometry? = null
 )
 
 class ObjectDetectorEngine(
@@ -32,10 +41,16 @@ class ObjectDetectorEngine(
     private val appContext = context.applicationContext
     private val executor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "spatial-object-detector") }
     private val busy = AtomicBoolean(false)
+    private val temporalTracker = TemporalDetectionTracker(threshold)
     @Volatile private var closed = false
     private var detector: ObjectDetector? = null
 
-    fun submit(frame: YuvFrame, rotationDegrees: Int, capturedAtMs: Long): Boolean {
+    fun submit(
+        frame: YuvFrame,
+        rotationDegrees: Int,
+        capturedAtMs: Long,
+        captureGeometry: CaptureGeometry? = null
+    ): Boolean {
         if (closed || !busy.compareAndSet(false, true)) return false
         executor.execute {
             try {
@@ -50,42 +65,54 @@ class ObjectDetectorEngine(
                     if (upright !== rawBitmap) upright.recycle()
                     rawBitmap.recycle()
                 }
-                val candidates = result.detections().mapNotNull { detection ->
+
+                val rawCandidates = result.detections().mapNotNull { detection ->
                     val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
                     val label = category.categoryName().lowercase()
                     if (label !in ALLOWED_LABELS) return@mapNotNull null
-                    // Chickens are represented by EfficientDet/COCO as "bird". Small birds are
-                    // substantially harder than people/cars, so keep the user's normal threshold
-                    // for other classes while allowing a modestly lower bird floor for recall.
-                    val effectiveThreshold = if (label == "bird") minOf(threshold, BIRD_SCORE_THRESHOLD) else maxOf(threshold, GENERAL_SCORE_THRESHOLD)
-                    if (category.score() < effectiveThreshold) return@mapNotNull null
+
                     val box = detection.boundingBox()
-                    val bottomCenterRotated = floatArrayOf(box.centerX(), box.bottom - box.height() * 0.04f)
-                    val rawBottomCenter = YuvFrameConverter.rotatedToRaw(
-                        bottomCenterRotated[0], bottomCenterRotated[1], frame.width, frame.height, rotationDegrees
-                    )
                     val corners = arrayOf(
                         YuvFrameConverter.rotatedToRaw(box.left, box.top, frame.width, frame.height, rotationDegrees),
                         YuvFrameConverter.rotatedToRaw(box.right, box.top, frame.width, frame.height, rotationDegrees),
                         YuvFrameConverter.rotatedToRaw(box.right, box.bottom, frame.width, frame.height, rotationDegrees),
                         YuvFrameConverter.rotatedToRaw(box.left, box.bottom, frame.width, frame.height, rotationDegrees)
                     )
-                    Detection2D(
+                    DetectionCandidate2D(
                         label = label,
                         confidence = category.score(),
-                        rawBoundingBox = RectF(
-                            corners.minOf { it[0] },
-                            corners.minOf { it[1] },
-                            corners.maxOf { it[0] },
-                            corners.maxOf { it[1] }
-                        ),
-                        rawBottomCenter = rawBottomCenter,
-                        capturedAtMs = capturedAtMs,
-                        rawImageWidth = frame.width,
-                        rawImageHeight = frame.height
+                        left = corners.minOf { it[0] },
+                        top = corners.minOf { it[1] },
+                        right = corners.maxOf { it[0] },
+                        bottom = corners.maxOf { it[1] }
                     )
                 }
-                val detections = suppressOverlaps(candidates)
+
+                val candidates = suppressOverlaps(rawCandidates)
+                val tracked = temporalTracker.update(candidates, capturedAtMs)
+                // One-frame hypotheses remain internal. The visible/local pipeline only receives an
+                // object after the image-space tracker has confirmed the same identity twice.
+                val detections = tracked.asSequence()
+                    .filter { it.confirmed }
+                    .map { detection ->
+                        val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
+                        Detection2D(
+                            label = detection.label,
+                            confidence = detection.confidence,
+                            rawBoundingBox = rawBox,
+                            rawBottomCenter = floatArrayOf(
+                                rawBox.centerX(),
+                                rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
+                            ),
+                            capturedAtMs = capturedAtMs,
+                            rawImageWidth = frame.width,
+                            rawImageHeight = frame.height,
+                            temporalId = detection.temporalId,
+                            temporallyConfirmed = true,
+                            captureGeometry = captureGeometry
+                        )
+                    }
+                    .toList()
                 onResult(detections, (System.nanoTime() - start) / 1_000_000L)
             } catch (error: Throwable) {
                 logger.error("Object detection failed", error)
@@ -99,6 +126,8 @@ class ObjectDetectorEngine(
 
     private fun detector(): ObjectDetector {
         detector?.let { return it }
+        // Keep the model floor low. Class-specific high/low hysteresis in TemporalDetectionTracker
+        // decides which candidates may create a new identity and which may only maintain one.
         val modelThreshold = minOf(threshold, MIN_MODEL_SCORE_THRESHOLD)
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath("efficientdet-lite0.tflite")
@@ -107,6 +136,7 @@ class ObjectDetectorEngine(
         val options = ObjectDetector.ObjectDetectorOptions.builder()
             .setBaseOptions(baseOptions)
             .setScoreThreshold(modelThreshold)
+            .setCategoryAllowlist(ALLOWED_LABELS.toList())
             .setMaxResults(MAX_RESULTS)
             .setRunningMode(RunningMode.IMAGE)
             .build()
@@ -115,41 +145,51 @@ class ObjectDetectorEngine(
             logger.info(
                 "Object detector initialized",
                 mapOf(
-                    "threshold" to threshold,
-                    "birdThreshold" to minOf(threshold, BIRD_SCORE_THRESHOLD),
-                    "generalThreshold" to maxOf(threshold, GENERAL_SCORE_THRESHOLD),
-                    "maxResults" to MAX_RESULTS,
-                    "labels" to ALLOWED_LABELS.joinToString()
+                    "userThreshold" to threshold,
+                    "modelFloor" to modelThreshold,
+                    "temporalHysteresis" to true,
+                    "categoryAllowlist" to ALLOWED_LABELS.joinToString(),
+                    "maxResults" to MAX_RESULTS
                 )
             )
         }
     }
 
-    private fun suppressOverlaps(values: List<Detection2D>): List<Detection2D> {
-        val kept = mutableListOf<Detection2D>()
+    private fun suppressOverlaps(values: List<DetectionCandidate2D>): List<DetectionCandidate2D> {
+        val kept = mutableListOf<DetectionCandidate2D>()
         values.sortedByDescending { it.confidence }.forEach { candidate ->
             val duplicate = kept.any { existing ->
-                existing.label == candidate.label && intersectionOverUnion(existing.rawBoundingBox, candidate.rawBoundingBox) >= NMS_IOU_THRESHOLD
+                existing.label == candidate.label &&
+                    intersectionOverUnion(existing, candidate) >= nmsThreshold(candidate.label)
             }
             if (!duplicate) kept += candidate
         }
         return kept
     }
 
-    private fun intersectionOverUnion(a: RectF, b: RectF): Float {
+    private fun nmsThreshold(label: String): Float = when (label) {
+        // Large person/car boxes produced the most visible stacked duplicates in field footage.
+        // Birds stay looser because several real chickens commonly occupy adjacent image regions.
+        "person", "car" -> 0.35f
+        "bird" -> 0.55f
+        else -> 0.45f
+    }
+
+    private fun intersectionOverUnion(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
         val left = maxOf(a.left, b.left)
         val top = maxOf(a.top, b.top)
         val right = minOf(a.right, b.right)
         val bottom = minOf(a.bottom, b.bottom)
         val intersection = (right - left).coerceAtLeast(0f) * (bottom - top).coerceAtLeast(0f)
         if (intersection <= 0f) return 0f
-        val union = a.width() * a.height() + b.width() * b.height() - intersection
+        val union = a.area + b.area - intersection
         return if (union > 0f) intersection / union else 0f
     }
 
     override fun close() {
         if (closed) return
         closed = true
+        temporalTracker.clear()
         executor.execute {
             detector?.close()
             detector = null
@@ -157,17 +197,10 @@ class ObjectDetectorEngine(
         executor.shutdown()
     }
 
-    private fun classScoreThreshold(label: String): Float = when (label) {
-        "bird" -> BIRD_SCORE_THRESHOLD
-        else -> GENERAL_SCORE_THRESHOLD
-    }
-
     companion object {
-        private val ALLOWED_LABELS = setOf("person", "car", "bird", "dog", "cat")
-        private const val MIN_MODEL_SCORE_THRESHOLD = 0.25f
-        private const val BIRD_SCORE_THRESHOLD = 0.25f
-        private const val GENERAL_SCORE_THRESHOLD = 0.45f
-        private const val NMS_IOU_THRESHOLD = 0.55f
-        private const val MAX_RESULTS = 24
+        private val ALLOWED_LABELS = linkedSetOf("person", "car", "bird", "dog", "cat")
+        private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
+        private const val BOTTOM_CENTER_INSET = 0.04f
+        private const val MAX_RESULTS = 48
     }
 }
