@@ -1,6 +1,7 @@
 package com.sirpaul.spatialarcoop
 
 import android.app.Application
+import com.sirpaul.spatialarcoop.ar.SamsungArCoreSensorKeepalive
 import com.sirpaul.spatialarcoop.data.AppDatabase
 import com.sirpaul.spatialarcoop.data.AppPreferences
 import com.sirpaul.spatialarcoop.data.ScanRecovery
@@ -15,9 +16,14 @@ class SpatialArApplication : Application() {
     private val recoveryExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "spatial-recovery").apply { isDaemon = true }
     }
+    private var samsungArCoreSensorKeepalive: SamsungArCoreSensorKeepalive? = null
 
     override fun onCreate() {
         super.onCreate()
+        // ARCore 1.54 has an upstream Samsung/Android 16 Session.resume() regression where native
+        // uncalibrated IMU registration can fail. Install the narrowly-scoped lifecycle workaround
+        // before any AR Activity can create or resume an ARCore Session.
+        samsungArCoreSensorKeepalive = SamsungArCoreSensorKeepalive.installIfNeeded(this, logger)
         recoveryExecutor.execute {
             runCatching { ScanRecovery.reconcile(this, database, logger) }
                 .onSuccess { summary ->
