@@ -531,11 +531,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 else -> "AR session could not start (${error.javaClass.simpleName})."
             }
         }
-        arErrorText.text = "AR session could not start
-
-$category"
+        arErrorText.text = "AR session could not start\n\n$category"
         arErrorPanel.visibility = View.VISIBLE
-        retryArButton?.isEnabled = !sessionCloseInFlight.get()
         stateText.text = "${currentMap()?.name ?: mapId} · AR unavailable"
         if (!sessionCloseInFlight.get()) {
             detailText.text = if (arProfile == ArSessionProfile.COMPATIBILITY) {
