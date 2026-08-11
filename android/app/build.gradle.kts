@@ -107,7 +107,7 @@ val poseLandmarkerModel = VerifiedModel(
     assetName = "pose_landmarker_full.task",
     url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
     bytes = 9_398_198L,
-    sha256 = "4eaa5eb7a98365221087693fcc286334cf0858e2eb6e15b506aa4a7ecdcec4ad"
+    sha256 = "5134a3aad27a58b93da0088d431f366da362b44e3ccfbe3462b3827a839011b1"
 )
 
 fun sha256(file: File): String {
