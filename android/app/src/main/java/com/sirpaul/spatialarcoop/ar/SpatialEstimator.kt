@@ -28,6 +28,18 @@ object SpatialEstimator {
         frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
 
+        // The shared track position represents the object's contact point (feet/wheels). When map
+        // setup has a saved ground plane, the bbox bottom-center ray is therefore the most stable
+        // semantic measurement. A depth hit inside a moving silhouette can otherwise belong to
+        // background geometry behind the person/car and create a plausible but wildly distant
+        // 3D point, which fragments one real object into many tracker IDs.
+        val groundContact = groundY?.let {
+            intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it)
+        }
+        if (groundContact != null) {
+            return EstimatedPosition(groundContact, 0.38f, "ground-ray-primary")
+        }
+
         val bestHit = frame.hitTest(view[0], view[1])
             .filter { hit ->
                 when (val trackable = hit.trackable) {
@@ -43,25 +55,12 @@ object SpatialEstimator {
         if (bestHit != null) {
             val site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
             val (uncertainty, method) = when (bestHit.trackable) {
-                is DepthPoint -> 0.25f to "depth"
-                is Plane -> 0.32f to "plane"
-                else -> 0.55f to "feature-point"
-            }
-            // Moving targets often create a depth hit on the target itself. Ground projection is
-            // more stable for feet/wheels when both estimates agree reasonably well.
-            val ground = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
-            if (ground != null && PoseMath.distance(site, ground) < 1.2f) {
-                return EstimatedPosition(
-                    sitePosition = floatArrayOf(site[0] * 0.45f + ground[0] * 0.55f, groundY, site[2] * 0.45f + ground[2] * 0.55f),
-                    uncertaintyMeters = uncertainty,
-                    method = "$method+ground"
-                )
+                is DepthPoint -> 0.28f to "depth"
+                is Plane -> 0.40f to "horizontal-plane"
+                else -> 0.75f to "hit"
             }
             return EstimatedPosition(site, uncertainty, method)
         }
-
-        val fallback = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
-        if (fallback != null) return EstimatedPosition(fallback, 0.65f, "ground-ray")
 
         // Last-resort monocular estimate. It is intentionally marked with much larger uncertainty
         // than Depth/plane/ground hits, but keeps obvious people/cars/birds shareable when ARCore
