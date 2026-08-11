@@ -19,6 +19,19 @@ jobs:
         with:
           ref: feat/person-pose-v107
           fetch-depth: 0
+      - name: Align current HUD text for deterministic patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt")
+          text = path.read_text()
+          old = '"$latestDetectionCount detected · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack"'
+          new = '"$latestDetectionCount detected · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack · $bufferedRemoteTracks remote · ${latestInferenceMs} ms"'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"live HUD precondition: expected 1, found {count}")
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Apply deterministic source patch
         run: python3 tools/apply_pose_v107.py
       - name: Remove one-shot helper
