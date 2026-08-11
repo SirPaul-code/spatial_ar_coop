@@ -129,6 +129,36 @@ data class ScanChunkRecord(
     val createdAtMs: Long
 )
 
+/**
+ * One body joint relative to a SpatialTrack ground-contact root in shared-site meters.
+ * The MediaPipe landmark index is retained so every client uses the same skeleton topology.
+ */
+data class PoseJoint(
+    val index: Int,
+    val offsetMeters: FloatArray,
+    val confidence: Float
+) {
+    fun toJson(): JSONArray = JSONArray()
+        .put(index)
+        .put(offsetMeters.getOrElse(0) { 0f }.toDouble())
+        .put(offsetMeters.getOrElse(1) { 0f }.toDouble())
+        .put(offsetMeters.getOrElse(2) { 0f }.toDouble())
+        .put(confidence.toDouble())
+
+    companion object {
+        fun fromJson(value: JSONArray): PoseJoint? {
+            if (value.length() != 5) return null
+            val index = value.optInt(0, -1)
+            if (index !in 0..32) return null
+            val offset = FloatArray(3) { component -> value.optDouble(component + 1, Double.NaN).toFloat() }
+            if (offset.any { !it.isFinite() || it !in -4f..4f }) return null
+            val confidence = value.optDouble(4, Double.NaN).toFloat()
+            if (!confidence.isFinite()) return null
+            return PoseJoint(index, offset, confidence.coerceIn(0f, 1f))
+        }
+    }
+}
+
 data class SpatialTrack(
     val key: String,
     val id: String,
@@ -144,6 +174,8 @@ data class SpatialTrack(
     val extentMeters: FloatArray = defaultTrackExtent(label),
     /** Rotation around shared-site +Y. Zero means the object's depth axis follows site +Z. */
     val yawRadians: Float = 0f,
+    /** Optional compact person skeleton; each joint is relative to position in shared-site meters. */
+    val poseJoints: List<PoseJoint> = emptyList(),
     val serverReceivedAtMs: Long = System.currentTimeMillis()
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -156,6 +188,9 @@ data class SpatialTrack(
         .put("observedAtMs", observedAtMs)
         .put("extentMeters", JSONArray(extentMeters.map { it.toDouble() }))
         .put("yawRadians", yawRadians)
+        .apply {
+            if (poseJoints.isNotEmpty()) put("poseJoints", JSONArray(poseJoints.map(PoseJoint::toJson)))
+        }
 
     companion object {
         fun fromJson(json: JSONObject, sourceOverride: String? = null): SpatialTrack {
@@ -163,6 +198,14 @@ data class SpatialTrack(
             val id = json.optString("id", "unknown")
             val label = json.optString("label", "unknown")
             val parsedExtent = json.optionalFloatArray("extentMeters", 3)
+            val poseJson = json.optJSONArray("poseJoints")
+            val poseJoints = buildList {
+                if (poseJson != null) {
+                    for (index in 0 until minOf(poseJson.length(), MAX_POSE_JOINTS)) {
+                        poseJson.optJSONArray(index)?.let(PoseJoint::fromJson)?.let(::add)
+                    }
+                }
+            }
             return SpatialTrack(
                 key = json.optString("key", "$sourceId:$id"),
                 id = id,
@@ -176,9 +219,12 @@ data class SpatialTrack(
                 extentMeters = parsedExtent?.takeIf { values -> values.all { it.isFinite() && it > 0f } }
                     ?: defaultTrackExtent(label),
                 yawRadians = json.optDouble("yawRadians", 0.0).toFloat().takeIf(Float::isFinite) ?: 0f,
+                poseJoints = if (label.equals("person", true)) poseJoints else emptyList(),
                 serverReceivedAtMs = System.currentTimeMillis()
             )
         }
+
+        private const val MAX_POSE_JOINTS = 24
     }
 }
 
