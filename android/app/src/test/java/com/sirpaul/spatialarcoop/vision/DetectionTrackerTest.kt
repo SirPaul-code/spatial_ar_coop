@@ -15,12 +15,13 @@ class DetectionTrackerTest {
         uncertaintyMeters = 0.18f
     )
 
-    private fun car(x: Float, z: Float, at: Long) = SpatialObservation(
+    private fun car(x: Float, z: Float, at: Long, associationKey: String? = null) = SpatialObservation(
         label = "car",
         confidence = 0.82f,
         position = floatArrayOf(x, 0f, z),
         observedAtMs = at,
-        uncertaintyMeters = 0.28f
+        uncertaintyMeters = 0.28f,
+        associationKey = associationKey
     )
 
     @Test fun oneFrameHypothesisIsNotPublished() {
@@ -86,6 +87,23 @@ class DetectionTrackerTest {
         assertEquals(1, afterBadDepth.size)
         assertEquals(stable.key, afterBadDepth.single().key)
         assertTrue("rejected measurement must not teleport the car", afterBadDepth.single().position[0] < 1.5f)
+    }
+
+    @Test fun temporalIdentityKeepsOneCarTrackAcrossRepeatedHugeOutliers() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 45_000L
+        assertTrue(tracker.update(listOf(car(0f, 7f, t0, "d-car")), t0).isEmpty())
+        val stable = tracker.update(listOf(car(0.05f, 7.02f, t0 + 140, "d-car")), t0 + 140).single()
+
+        repeat(4) { index ->
+            val at = t0 + 280L + index * 140L
+            val track = tracker.update(
+                listOf(car(8f + index, 13f + index, at, "d-car")),
+                at
+            ).single()
+            assertEquals(stable.key, track.key)
+            assertTrue("bad 3D samples must not walk the marker away", track.position[0] < 1.5f)
+        }
     }
 
     @Test fun stationaryJitterDoesNotTurnIntoVelocityDrift() {
