@@ -1,0 +1,31 @@
+name: v106 root preference patch
+
+on:
+  push:
+    branches:
+      - fix/perception-v106
+    paths:
+      - tools/v106_patch2.py
+      - .github/workflows/v106-patch2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/perception-v106
+          fetch-depth: 0
+      - name: Apply guarded source patch
+        run: python3 tools/v106_patch2.py
+      - name: Commit normal source
+        run: |
+          git config user.name "Pavol Duplinsky"
+          git config user.email "79102860+SirPaul-code@users.noreply.github.com"
+          git add android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt android/app/src/main/java/com/sirpaul/spatialarcoop/ar/CloudAnchorCoordinator.kt
+          git diff --cached --check
+          git commit -m "fix(android): prefer root localization without blocking backups"
+          git push origin HEAD:fix/perception-v106
