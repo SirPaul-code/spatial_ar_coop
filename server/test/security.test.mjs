@@ -15,7 +15,25 @@ async function createMap(base, token, id) {
   return response.json();
 }
 
-test('server identity is stable and map keys isolate and revoke map access', async () => {
+function waitForSocketOpen(socket, timeoutMs = 2500) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('WebSocket open timed out')), timeoutMs);
+    socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+    socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('WebSocket failed before open')); }, { once: true });
+  });
+}
+
+function waitForSocketClose(socket, timeoutMs = 2500) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('WebSocket close timed out')), timeoutMs);
+    socket.addEventListener('close', (event) => {
+      clearTimeout(timer);
+      resolve({ code: event.code, reason: event.reason });
+    }, { once: true });
+  });
+}
+
+test('server identity is stable and map keys isolate, render QR and revoke map access', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spatial-security-'));
   const adminToken = 'admin-secret-for-tests';
   let firstServerId;
@@ -59,6 +77,18 @@ test('server identity is stable and map keys isolate and revoke map access', asy
     assert.equal(inviteBody.invite.mapKey, alpha.accessKey);
     assert.match(inviteBody.invite.deepLink, /^spatialar:\/\/join\?/);
 
+    const qr = await fetch(`${base}/api/v1/maps/alpha/invite-qr.svg`, {
+      headers: { Authorization: `Bearer ${alpha.accessKey}` }
+    });
+    assert.equal(qr.status, 200);
+    assert.match(qr.headers.get('content-type') ?? '', /^image\/svg\+xml/);
+    assert.match(await qr.text(), /<svg[\s>]/i);
+
+    const crossQr = await fetch(`${base}/api/v1/maps/beta/invite-qr.svg`, {
+      headers: { Authorization: `Bearer ${alpha.accessKey}` }
+    });
+    assert.equal(crossQr.status, 404);
+
     const deniedSocket = new WebSocket(`ws://127.0.0.1:${address.port}/ws?mapId=beta&clientId=bad&role=viewer&token=${encodeURIComponent(alpha.accessKey)}`);
     const rejected = await new Promise((resolve) => {
       const timer = setTimeout(() => resolve(false), 2500);
@@ -67,6 +97,10 @@ test('server identity is stable and map keys isolate and revoke map access', asy
       deniedSocket.addEventListener('close', () => { clearTimeout(timer); resolve(true); }, { once: true });
     });
     assert.equal(rejected, true);
+
+    const activeAlpha = new WebSocket(`ws://127.0.0.1:${address.port}/ws?mapId=alpha&clientId=active-alpha&role=viewer&token=${encodeURIComponent(alpha.accessKey)}`);
+    await waitForSocketOpen(activeAlpha);
+    const closePromise = waitForSocketClose(activeAlpha);
 
     const rotatedResponse = await fetch(`${base}/api/v1/maps/alpha/rotate-key`, {
       method: 'POST',
@@ -77,6 +111,9 @@ test('server identity is stable and map keys isolate and revoke map access', asy
     const newAlphaKey = rotated.invite.mapKey;
     assert.match(newAlphaKey, /^sar_map_/);
     assert.notEqual(newAlphaKey, alpha.accessKey);
+
+    const closed = await closePromise;
+    assert.equal(closed.code, 4003);
 
     const oldKeyRead = await fetch(`${base}/api/v1/maps/alpha`, {
       headers: { Authorization: `Bearer ${alpha.accessKey}` }
