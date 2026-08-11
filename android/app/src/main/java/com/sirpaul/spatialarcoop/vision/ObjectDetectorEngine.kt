@@ -126,8 +126,6 @@ class ObjectDetectorEngine(
 
     private fun detector(): ObjectDetector {
         detector?.let { return it }
-        // Keep the model floor low. Class-specific high/low hysteresis in TemporalDetectionTracker
-        // decides which candidates may create a new identity and which may only maintain one.
         val modelThreshold = minOf(threshold, MIN_MODEL_SCORE_THRESHOLD)
         val baseOptions = BaseOptions.builder()
             .setModelAssetPath("efficientdet-lite0.tflite")
@@ -159,31 +157,37 @@ class ObjectDetectorEngine(
         val kept = mutableListOf<DetectionCandidate2D>()
         values.sortedByDescending { it.confidence }.forEach { candidate ->
             val duplicate = kept.any { existing ->
-                existing.label == candidate.label &&
-                    intersectionOverUnion(existing, candidate) >= nmsThreshold(candidate.label)
+                if (existing.label != candidate.label) return@any false
+                val overlap = overlapMetrics(existing, candidate)
+                overlap.iou >= nmsThreshold(candidate.label) ||
+                    (candidate.label in CONTAINMENT_SUPPRESSED_LABELS && overlap.smallerCoverage >= CONTAINMENT_THRESHOLD)
             }
             if (!duplicate) kept += candidate
         }
         return kept
     }
 
-    private fun nmsThreshold(label: String): Float = when (label) {
-        // Large person/car boxes produced the most visible stacked duplicates in field footage.
-        // Birds stay looser because several real chickens commonly occupy adjacent image regions.
-        "person", "car" -> 0.35f
-        "bird" -> 0.55f
-        else -> 0.45f
-    }
+    private data class OverlapMetrics(val iou: Float, val smallerCoverage: Float)
 
-    private fun intersectionOverUnion(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
+    private fun overlapMetrics(a: DetectionCandidate2D, b: DetectionCandidate2D): OverlapMetrics {
         val left = maxOf(a.left, b.left)
         val top = maxOf(a.top, b.top)
         val right = minOf(a.right, b.right)
         val bottom = minOf(a.bottom, b.bottom)
         val intersection = (right - left).coerceAtLeast(0f) * (bottom - top).coerceAtLeast(0f)
-        if (intersection <= 0f) return 0f
+        if (intersection <= 0f) return OverlapMetrics(0f, 0f)
         val union = a.area + b.area - intersection
-        return if (union > 0f) intersection / union else 0f
+        val smaller = minOf(a.area, b.area).coerceAtLeast(1f)
+        return OverlapMetrics(
+            iou = if (union > 0f) intersection / union else 0f,
+            smallerCoverage = intersection / smaller
+        )
+    }
+
+    private fun nmsThreshold(label: String): Float = when (label) {
+        "person", "car" -> 0.35f
+        "bird" -> 0.55f
+        else -> 0.45f
     }
 
     override fun close() {
@@ -199,6 +203,8 @@ class ObjectDetectorEngine(
 
     companion object {
         private val ALLOWED_LABELS = linkedSetOf("person", "car", "bird", "dog", "cat")
+        private val CONTAINMENT_SUPPRESSED_LABELS = setOf("person", "car")
+        private const val CONTAINMENT_THRESHOLD = 0.72f
         private const val MIN_MODEL_SCORE_THRESHOLD = 0.10f
         private const val BOTTOM_CENTER_INSET = 0.04f
         private const val MAX_RESULTS = 48
