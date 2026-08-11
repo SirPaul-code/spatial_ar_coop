@@ -186,7 +186,9 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     }
 
     private fun spawnThreshold(label: String): Float = when (label) {
-        "bird" -> maxOf(userThreshold, BIRD_SPAWN_THRESHOLD)
+        // Keep chicken acquisition below the generic preference, but never allow the old 10-15%
+        // weak path to create a bird. Low scores only maintain an already acquired bird.
+        "bird" -> maxOf(BIRD_SPAWN_THRESHOLD, minOf(userThreshold, BIRD_USER_THRESHOLD_CAP))
         "person" -> maxOf(userThreshold, PERSON_SPAWN_THRESHOLD)
         "car" -> maxOf(userThreshold, CAR_SPAWN_THRESHOLD)
         else -> maxOf(userThreshold, OTHER_SPAWN_THRESHOLD)
@@ -210,6 +212,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
 
     companion object {
         private const val BIRD_SPAWN_THRESHOLD = 0.24f
+        private const val BIRD_USER_THRESHOLD_CAP = 0.28f
         private const val PERSON_SPAWN_THRESHOLD = 0.60f
         private const val CAR_SPAWN_THRESHOLD = 0.52f
         private const val OTHER_SPAWN_THRESHOLD = 0.50f
