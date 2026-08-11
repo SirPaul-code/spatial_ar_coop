@@ -2,8 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseClientMessage, ProtocolError, validateClientIdentity } from '../src/protocol.mjs';
 
-test('validates client identity', () => {
-  assert.deepEqual(validateClientIdentity({ mapId: 'yard-1', clientId: 'phone_a', role: 'sensor' }), { mapId: 'yard-1', clientId: 'phone_a', role: 'sensor' });
+test('validates client identity including unified participant role', () => {
+  assert.deepEqual(
+    validateClientIdentity({ mapId: 'yard-1', clientId: 'phone_a', role: 'participant' }),
+    { mapId: 'yard-1', clientId: 'phone_a', role: 'participant' }
+  );
+  assert.deepEqual(
+    validateClientIdentity({ mapId: 'yard-1', clientId: 'legacy_sensor', role: 'sensor' }),
+    { mapId: 'yard-1', clientId: 'legacy_sensor', role: 'sensor' }
+  );
   assert.throws(() => validateClientIdentity({ mapId: '../etc', clientId: 'x', role: 'viewer' }), ProtocolError);
 });
 
@@ -15,6 +22,15 @@ test('normalizes track batches', () => {
   assert.equal(message.tracks[0].label, 'person');
   assert.equal(message.tracks[0].confidence, 1);
   assert.deepEqual(message.tracks[0].velocity, [0, 0, 0]);
+});
+
+test('preserves normalized client pose type', () => {
+  const message = parseClientMessage(JSON.stringify({
+    type: 'client_pose',
+    pose: { position: [1, 2, 3], rotation: [0, 0, 0, 1], tracking: 'TRACKING' }
+  }));
+  assert.equal(message.type, 'client_pose');
+  assert.deepEqual(message.pose.position, [1, 2, 3]);
 });
 
 test('rejects malformed vectors and unsupported types', () => {
