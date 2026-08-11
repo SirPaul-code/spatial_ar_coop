@@ -154,11 +154,17 @@ class RealtimeClient(
         }
     }
 
+    /**
+     * Publish the complete set of currently-active tracks for this source phone. The explicit
+     * replaceSource flag lets new servers immediately expire IDs that disappeared from the local
+     * tracker while remaining backward compatible with older servers/clients.
+     */
     fun sendTracks(sequence: Long, tracks: Collection<SpatialTrack>): Boolean {
         val payload = JSONObject()
             .put("type", "track_batch")
             .put("sequence", sequence)
             .put("sentAtMs", System.currentTimeMillis())
+            .put("replaceSource", true)
             .put("tracks", JSONArray(tracks.map(SpatialTrack::toJson)))
         return socket?.send(payload.toString()) == true
     }
