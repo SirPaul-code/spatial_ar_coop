@@ -14,14 +14,14 @@ class RemoteTrackStore {
     }
 
     /**
-     * Replace only one participant's active tracks. This is used by the reporting phone itself so
-     * a locally-expired bird/person disappears on the same render frame without waiting for the
-     * server round trip. Remote reporters continue to use update + explicit tracks_expired events.
+     * ArActivity calls this for the local reporting source. The source phone already draws the
+     * detector's image-space bounding boxes, so its own spatial tracks must not also live in the
+     * remote overlay store. The values are still published to the server by ArActivity; other
+     * participants receive them through update().
      */
+    @Suppress("UNUSED_PARAMETER")
     fun replaceSource(sourceId: String, values: Collection<SpatialTrack>) {
-        val incoming = values.associateBy { it.key }
-        tracks.entries.removeIf { (_, track) -> track.sourceId == sourceId && track.key !in incoming }
-        values.forEach { incomingTrack -> tracks[incomingTrack.key] = incomingTrack }
+        tracks.entries.removeIf { (_, track) -> track.sourceId == sourceId }
     }
 
     fun update(values: Collection<SpatialTrack>) {
