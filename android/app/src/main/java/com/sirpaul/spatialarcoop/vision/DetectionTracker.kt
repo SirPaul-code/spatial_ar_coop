@@ -159,7 +159,8 @@ class DetectionTracker(private val sourceId: String) {
                 observation.extentMeters[index] * 0.22f
         }
         val motionYaw = if (observation.label == "car" && magnitude(velocity) > CAR_YAW_FROM_SPEED_METERS_PER_SECOND) {
-            atan2(velocity[0], velocity[2])
+            // Renderer convention: local +Z has shared-site bearing -yaw.
+            -atan2(velocity[0], velocity[2])
         } else null
         state.yawRadians = blendAngle(state.yawRadians, motionYaw ?: observation.yawRadians, 0.16f)
         // A later high-quality ground/plane measurement may reduce the confirmation requirement of
