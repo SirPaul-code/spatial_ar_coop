@@ -25,7 +25,9 @@ data class ProjectedTrack(
     val distanceMeters: Float,
     val uncertaintyMeters: Float,
     val ageMs: Long,
-    val sourceId: String
+    val sourceId: String,
+    /** Viewer-facing box projected from the shared 3D track dimensions. */
+    val bounds: RectF? = null
 )
 
 data class ProjectedBox(val label: String, val confidence: Float, val rectangle: RectF)
@@ -46,34 +48,35 @@ class SpatialOverlayView @JvmOverloads constructor(
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2.2f * density
-        color = Color.rgb(255, 78, 78)
+        color = Color.rgb(213, 154, 74)
     }
     private val thinStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.1f * density
-        color = Color.argb(170, 255, 110, 90)
+        color = Color.argb(180, 213, 154, 74)
     }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(52, 255, 60, 60)
+        color = Color.argb(42, 213, 154, 74)
     }
     private val panel = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(205, 12, 16, 22)
+        color = Color.argb(218, 23, 24, 26)
     }
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
+        color = Color.rgb(242, 239, 232)
         textSize = 13f * density
         typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
     }
     private val subText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(210, 220, 226, 236)
+        color = Color.argb(220, 185, 179, 169)
         textSize = 10.5f * density
     }
+    /** Raw detector boxes from this phone only. Shared tracks use the amber spatial box. */
     private val boxStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
-        color = Color.rgb(90, 220, 255)
+        color = Color.rgb(120, 149, 178)
     }
     private val history = ConcurrentHashMap<String, ArrayDeque<Pair<Float, Float>>>()
     @Volatile private var tracks: List<ProjectedTrack> = emptyList()
@@ -90,7 +93,7 @@ class SpatialOverlayView @JvmOverloads constructor(
             val previous = points.lastOrNull()
             if (previous == null || kotlin.math.hypot(value.x - previous.first, value.y - previous.second) > 2f * density) {
                 points.addLast(value.x to value.y)
-                while (points.size > 10) points.removeFirst()
+                while (points.size > 12) points.removeFirst()
             }
         }
         postInvalidateOnAnimation()
@@ -109,6 +112,8 @@ class SpatialOverlayView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        // Source-camera detector boxes are drawn first. The stable spatial track box then remains
+        // visible on this phone and every other localized participant between detector frames.
         boxes.forEach { drawDetectionBox(canvas, it) }
         tracks.forEach { track -> if (track.onScreen) drawTrack(canvas, track) else drawOffscreen(canvas, track) }
         if (showScan) drawScanCard(canvas)
@@ -116,18 +121,24 @@ class SpatialOverlayView @JvmOverloads constructor(
     }
 
     private fun drawTrack(canvas: Canvas, track: ProjectedTrack) {
-        val ageAlpha = (255 - (track.ageMs / 8).toInt()).coerceIn(70, 255)
+        val ageAlpha = (255 - (track.ageMs / 10).toInt()).coerceIn(72, 255)
         stroke.alpha = ageAlpha
         thinStroke.alpha = (ageAlpha * 0.72f).toInt()
-        fill.alpha = (ageAlpha * 0.22f).toInt()
+        fill.alpha = (ageAlpha * 0.20f).toInt()
 
-        val radius = (18f + track.uncertaintyMeters.coerceIn(0f, 3f) * 12f) * density
+        val radius = (15f + track.uncertaintyMeters.coerceIn(0f, 3f) * 10f) * density
         val feetY = track.y
-        val markerTop = drawClassGeometry(canvas, track, feetY)
+        val markerTop = track.bounds?.let { bounds ->
+            canvas.drawRoundRect(bounds, 7f * density, 7f * density, fill)
+            canvas.drawRoundRect(bounds, 7f * density, 7f * density, stroke)
+            // Corner ticks make the shared box legible without filling the camera view.
+            val tick = min(bounds.width(), bounds.height()).coerceAtMost(22f * density) * 0.35f
+            drawCornerTicks(canvas, bounds, tick)
+            bounds.top
+        } ?: drawClassGeometry(canvas, track, feetY)
+
         canvas.drawCircle(track.x, feetY, radius, thinStroke)
-        canvas.drawCircle(track.x, feetY, 5f * density, stroke)
-        canvas.drawLine(track.x - radius, feetY, track.x + radius, feetY, thinStroke)
-        canvas.drawLine(track.x, feetY - radius, track.x, feetY + radius, thinStroke)
+        canvas.drawCircle(track.x, feetY, 4.5f * density, stroke)
 
         val trail = history[track.key]
         if (trail != null && trail.size > 1) {
@@ -138,17 +149,28 @@ class SpatialOverlayView @JvmOverloads constructor(
             canvas.drawPath(path, thinStroke)
         }
 
-        val title = track.label.uppercase()
+        val stableId = track.key.substringAfterLast(':').take(8)
+        val title = "${track.label} · $stableId"
         val detail = "%.1f m   %.0f%%   %d ms".format(track.distanceMeters, track.confidence * 100f, track.ageMs)
         val panelWidth = maxOf(text.measureText(title), subText.measureText(detail)) + 18f * density
         val left = (track.x - panelWidth / 2f).coerceIn(6f * density, width - panelWidth - 6f * density)
-        val top = markerTop - 53f * density
+        val top = (markerTop - 47f * density).coerceAtLeast(6f * density)
         val rect = RectF(left, top, left + panelWidth, top + 38f * density)
         canvas.drawRoundRect(rect, 7f * density, 7f * density, panel)
         canvas.drawText(title, rect.left + 9f * density, rect.top + 15f * density, text)
         canvas.drawText(detail, rect.left + 9f * density, rect.top + 31f * density, subText)
     }
 
+    private fun drawCornerTicks(canvas: Canvas, bounds: RectF, tick: Float) {
+        canvas.drawLine(bounds.left, bounds.top, bounds.left + tick, bounds.top, stroke)
+        canvas.drawLine(bounds.left, bounds.top, bounds.left, bounds.top + tick, stroke)
+        canvas.drawLine(bounds.right, bounds.top, bounds.right - tick, bounds.top, stroke)
+        canvas.drawLine(bounds.right, bounds.top, bounds.right, bounds.top + tick, stroke)
+        canvas.drawLine(bounds.left, bounds.bottom, bounds.left + tick, bounds.bottom, stroke)
+        canvas.drawLine(bounds.left, bounds.bottom, bounds.left, bounds.bottom - tick, stroke)
+        canvas.drawLine(bounds.right, bounds.bottom, bounds.right - tick, bounds.bottom, stroke)
+        canvas.drawLine(bounds.right, bounds.bottom, bounds.right, bounds.bottom - tick, stroke)
+    }
 
     private fun drawClassGeometry(canvas: Canvas, track: ProjectedTrack, feetY: Float): Float {
         return when (track.label.lowercase()) {
@@ -169,8 +191,6 @@ class SpatialOverlayView @JvmOverloads constructor(
                 canvas.drawRoundRect(body, 9f * density, 9f * density, stroke)
                 canvas.drawRoundRect(roof, 8f * density, 8f * density, fill)
                 canvas.drawRoundRect(roof, 8f * density, 8f * density, stroke)
-                canvas.drawCircle(track.x - 28f * density, feetY - 5f * density, 7f * density, stroke)
-                canvas.drawCircle(track.x + 28f * density, feetY - 5f * density, 7f * density, stroke)
                 top
             }
             "bird" -> {
@@ -180,8 +200,6 @@ class SpatialOverlayView @JvmOverloads constructor(
                 canvas.drawOval(body, stroke)
                 canvas.drawCircle(track.x + 19f * density, top + 12f * density, 8f * density, fill)
                 canvas.drawCircle(track.x + 19f * density, top + 12f * density, 8f * density, stroke)
-                canvas.drawLine(track.x - 8f * density, feetY - 5f * density, track.x - 8f * density, feetY, thinStroke)
-                canvas.drawLine(track.x + 5f * density, feetY - 5f * density, track.x + 5f * density, feetY, thinStroke)
                 top
             }
             else -> {
@@ -189,8 +207,6 @@ class SpatialOverlayView @JvmOverloads constructor(
                 val body = RectF(track.x - 25f * density, top + 8f * density, track.x + 25f * density, feetY - 6f * density)
                 canvas.drawOval(body, fill)
                 canvas.drawOval(body, stroke)
-                canvas.drawCircle(track.x + 22f * density, top + 13f * density, 9f * density, fill)
-                canvas.drawCircle(track.x + 22f * density, top + 13f * density, 9f * density, stroke)
                 top
             }
         }
@@ -219,8 +235,8 @@ class SpatialOverlayView @JvmOverloads constructor(
     private fun drawDetectionBox(canvas: Canvas, box: ProjectedBox) {
         canvas.drawRoundRect(box.rectangle, 8f * density, 8f * density, boxStroke)
         val label = "${box.label} %.0f%%".format(box.confidence * 100f)
-        val width = text.measureText(label) + 12f * density
-        val background = RectF(box.rectangle.left, box.rectangle.top - 24f * density, box.rectangle.left + width, box.rectangle.top)
+        val labelWidth = text.measureText(label) + 12f * density
+        val background = RectF(box.rectangle.left, box.rectangle.top - 24f * density, box.rectangle.left + labelWidth, box.rectangle.top)
         canvas.drawRoundRect(background, 5f * density, 5f * density, panel)
         canvas.drawText(label, background.left + 6f * density, background.bottom - 6f * density, text)
     }
@@ -229,12 +245,12 @@ class SpatialOverlayView @JvmOverloads constructor(
         val value = scan
         val left = 12f * density
         val top = height - 176f * density
-        val rect = RectF(left, top, left + 210f * density, top + 90f * density)
+        val rect = RectF(left, top, left + 220f * density, top + 90f * density)
         canvas.drawRoundRect(rect, 10f * density, 10f * density, panel)
-        canvas.drawText("SPATIAL MAP", rect.left + 12f * density, rect.top + 20f * density, text)
-        canvas.drawText("${value.pointCount} points / ${value.chunkCount} saved chunks", rect.left + 12f * density, rect.top + 40f * density, subText)
-        canvas.drawText("Feature quality: ${value.featureQuality}", rect.left + 12f * density, rect.top + 58f * density, subText)
-        canvas.drawText("Anchors: ${value.hostedAnchors} hosted / ${value.pendingAnchors} pending", rect.left + 12f * density, rect.top + 76f * density, subText)
+        canvas.drawText("Map setup", rect.left + 12f * density, rect.top + 20f * density, text)
+        canvas.drawText("${value.pointCount} points · ${value.chunkCount} saved chunks", rect.left + 12f * density, rect.top + 40f * density, subText)
+        canvas.drawText("Feature quality: ${value.featureQuality.lowercase()}", rect.left + 12f * density, rect.top + 58f * density, subText)
+        canvas.drawText("Anchors: ${value.hostedAnchors} hosted · ${value.pendingAnchors} pending", rect.left + 12f * density, rect.top + 76f * density, subText)
     }
 
     private fun drawReticle(canvas: Canvas) {
@@ -243,7 +259,7 @@ class SpatialOverlayView @JvmOverloads constructor(
         val reticle = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeWidth = 1.2f * density
-            color = Color.argb(175, 255, 255, 255)
+            color = Color.argb(175, 242, 239, 232)
         }
         canvas.drawCircle(x, y, 10f * density, reticle)
         canvas.drawLine(x - 16f * density, y, x - 6f * density, y, reticle)
