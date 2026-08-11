@@ -1,0 +1,34 @@
+name: Apply guided AR UX patch
+
+on:
+  push:
+    branches: [ux-auth-qr-flow]
+    paths:
+      - 'scripts/apply_guided_ar_ux.py'
+      - '.github/workflows/apply-guided-ar-ux.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ux-auth-qr-flow
+      - name: Apply deterministic AR UX patch
+        run: |
+          python3 scripts/apply_guided_ar_ux.py
+          git diff --check
+          grep -q 'Finish setup' android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
+          grep -q 'Map origin established automatically' android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
+      - name: Commit patched source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt
+          git diff --cached --quiet && exit 0
+          git commit -m 'feat(android): guide map setup and simplify live AR controls'
+          git push origin HEAD:ux-auth-qr-flow
