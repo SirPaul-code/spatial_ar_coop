@@ -104,6 +104,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var lastHudAtMs = 0L
     private var lastPoseSentAtMs = 0L
     private var lastDetectionCaptureAtMs = 0L
+    private var lastTrackPublishAtMs = 0L
     private var lastDetectorStatusAtMs = 0L
     private var latestInferenceMs = 0L
     private var latestLocalTrackCount = 0
@@ -820,9 +821,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             // participants remain untouched until their own batch/expiry events arrive.
             remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
             realtime?.sendTracks(sequence++, tracks)
+            val now = System.currentTimeMillis()
+            lastTrackPublishAtMs = now
             latestInferenceMs = pending.inferenceMs
             latestLocalTrackCount = tracks.size
-            val now = System.currentTimeMillis()
             if (now - lastDetectorStatusAtMs >= DETECTOR_STATUS_INTERVAL_MS) {
                 lastDetectorStatusAtMs = now
                 realtime?.sendStatus("detecting", "${tracks.size} tracks, ${pending.inferenceMs}ms inference")
@@ -831,6 +833,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
 
         val now = System.currentTimeMillis()
+        // Keep the filtered/predicted tracker flowing even between detector callbacks. This makes
+        // motion look continuous on every participant and guarantees that a tracker timeout is
+        // published as an empty complete-source snapshot instead of waiting for server TTL.
+        if (now - lastTrackPublishAtMs >= TRACK_PUBLISH_INTERVAL_MS) {
+            val tracks = localTracker.current(now)
+            remoteTracks.replaceSource(spatialApp.preferences.deviceId, tracks)
+            realtime?.sendTracks(sequence++, tracks)
+            latestLocalTrackCount = tracks.size
+            lastTrackPublishAtMs = now
+        }
         if (now - lastDetectionCaptureAtMs >= DETECTION_INTERVAL_MS) {
             val image = try {
                 frame.acquireCameraImage()
@@ -877,7 +889,16 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private fun setReporting(enabled: Boolean) {
         if (mode != ArMode.LIVE) return
         reporting = enabled
-        if (enabled) ensureDetector() else stopDetector()
+        if (enabled) {
+            lastTrackPublishAtMs = 0L
+            ensureDetector()
+        } else {
+            stopDetector()
+            localTracker.clear()
+            remoteTracks.replaceSource(spatialApp.preferences.deviceId, emptyList())
+            realtime?.sendTracks(sequence++, emptyList())
+            lastTrackPublishAtMs = 0L
+        }
         reportButton?.text = if (enabled) "Stop reporting" else "Start reporting"
         realtime?.sendStatus(if (enabled) "reporting" else "observing", if (enabled) "object detection enabled" else "object detection disabled")
         showDetail(if (enabled) "Reporting enabled · detections are shared with this place" else "Observing · reporting is off")
@@ -1220,6 +1241,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         const val EXTRA_MAP_ID = "map_id"
         const val EXTRA_MODE = "mode"
         private const val DETECTION_INTERVAL_MS = 120L
+        private const val TRACK_PUBLISH_INTERVAL_MS = 120L
         private const val POSE_INTERVAL_MS = 500L
         private const val DETECTOR_STATUS_INTERVAL_MS = 1_500L
         private const val FEATURE_QUALITY_INTERVAL_MS = 500L
