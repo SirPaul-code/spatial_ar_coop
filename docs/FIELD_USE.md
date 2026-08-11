@@ -86,24 +86,24 @@ On the second phone:
 
 ## 6. Live AR
 
-Tap **Live AR** on a ready place.
+Tap **Live AR** on a ready place. There is no separate reporting opt-in: every Live participant automatically runs the on-device detector, observes remote tracks, and publishes compact spatial tracks as soon as shared localization is available.
 
 The header tells you which stage you are in:
 
-- **Waiting for location / Localizing…** — ARCore is running but the phone has not yet resolved the saved shared frame. Move slowly and look around an area that was seen while mapping/hosting anchors.
-- **Localized** — this phone has a site-to-world transform and can spatially render shared tracks.
-- **Server connected · live sharing active** — REST/WS reachability is healthy.
-- **Server reconnecting · shared tracks temporarily unavailable** — local AR may keep running, but cooperative data is temporarily unavailable.
+- **Waiting for location / Localizing…** — ARCore is running but the phone has not yet resolved the saved shared frame. Move slowly and look around an area that was seen while mapping/hosting anchors. The local detector is already active during this stage, so `person`, `car`, `bird`, `dog`, and `cat` camera boxes can appear before shared localization completes.
+- **Localized** — this phone has a site-to-world transform. Local detections can now be converted to shared 3D site tracks and remote tracks can be rendered spatially.
+- **Server connected · automatic object sharing active** — REST/WS reachability is healthy and Live uses automatic cooperative detection/sharing.
+- **Server reconnecting · shared tracks temporarily unavailable** — local AR/detection may keep running, but cooperative data is temporarily unavailable.
 
-Every Live participant observes remote tracks. **Start reporting** additionally enables the local object detector and publishes this phone's compact tracks. **Stop reporting** disables detector inference but keeps observation/localization active.
+For spatial estimation the app prefers ARCore Depth/plane/feature hits and the saved ground plane. When none is usable it may use a deliberately higher-uncertainty monocular class-size estimate rather than silently dropping an otherwise clear detection.
 
-The server identifies normal Live clients as `participant`; their current status distinguishes `observing` from `reporting`.
+Cloud Anchor localization tries several hosted anchors concurrently, accepts the first successful shared reference, cancels stalled batches, and retries automatically. A participant therefore does not have to choose an anchor manually.
 
 ### The `More` menu during Live AR
 
 - **Re-localize with saved Cloud Anchors** — clears the current resolved reference and starts Cloud Anchor resolution again.
 - **Align fallback at saved origin** — shown only when Cloud Anchors are unavailable in the build; both phones must use the same physical origin and heading.
-- **Place shared test marker** — useful for checking shared coordinate alignment without object detection.
+- **Place shared test marker** — useful for checking shared coordinate alignment independently from object detection.
 - **Share diagnostics** — exports app diagnostics.
 
 ## 7. Operator dashboard
