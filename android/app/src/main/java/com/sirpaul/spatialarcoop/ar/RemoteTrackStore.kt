@@ -13,6 +13,17 @@ class RemoteTrackStore {
         update(values)
     }
 
+    /**
+     * Replace only one participant's active tracks. This is used by the reporting phone itself so
+     * a locally-expired bird/person disappears on the same render frame without waiting for the
+     * server round trip. Remote reporters continue to use update + explicit tracks_expired events.
+     */
+    fun replaceSource(sourceId: String, values: Collection<SpatialTrack>) {
+        val incoming = values.associateBy { it.key }
+        tracks.entries.removeIf { (_, track) -> track.sourceId == sourceId && track.key !in incoming }
+        values.forEach { incomingTrack -> tracks[incomingTrack.key] = incomingTrack }
+    }
+
     fun update(values: Collection<SpatialTrack>) {
         values.forEach { incoming ->
             tracks.compute(incoming.key) { _, existing ->
