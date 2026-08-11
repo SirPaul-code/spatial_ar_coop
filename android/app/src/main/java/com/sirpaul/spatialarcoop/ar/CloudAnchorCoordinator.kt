@@ -32,6 +32,7 @@ class CloudAnchorCoordinator(
     private data class Reference(val anchor: Anchor, val definition: AnchorDefinition)
 
     private val reference = AtomicReference<Reference?>(null)
+    private val lastWorldFromSite = AtomicReference<FloatArray?>(null)
     private val hosting = AtomicBoolean(false)
     private val resolving = AtomicBoolean(false)
     private val resolveGeneration = AtomicInteger(0)
@@ -42,21 +43,37 @@ class CloudAnchorCoordinator(
     private var lastHostAttemptAtMs = 0L
 
     val cloudConfigured: Boolean get() = BuildConfig.CLOUD_ANCHORS_CONFIGURED
-    val hasReference: Boolean get() = reference.get()?.anchor?.trackingState == TrackingState.TRACKING
+    val hasReference: Boolean get() = reference.get() != null
     val isHosting: Boolean get() = hosting.get()
     val isResolving: Boolean get() = resolving.get()
 
-    /** Recomputed from the tracking anchor every frame, so ARCore world-frame refinements are absorbed. */
+    /**
+     * Recompute from the live anchor while it is tracking, but keep the last successfully resolved
+     * site transform through temporary Anchor.PAUSED periods instead of dropping back to Localizing.
+     */
     fun currentWorldFromSite(): FloatArray? {
-        val current = reference.get() ?: return null
-        if (current.anchor.trackingState != TrackingState.TRACKING) return null
-        val worldFromAnchor = PoseMath.poseToMatrix(current.anchor.pose)
-        return PoseMath.multiply(worldFromAnchor, PoseMath.rigidInverse(current.definition.siteFromAnchor))
+        val current = reference.get() ?: return lastWorldFromSite.get()?.copyOf()
+        if (current.anchor.trackingState == TrackingState.TRACKING) {
+            val live = PoseMath.multiply(
+                PoseMath.poseToMatrix(current.anchor.pose),
+                PoseMath.rigidInverse(current.definition.siteFromAnchor)
+            )
+            lastWorldFromSite.set(live.copyOf())
+            return live
+        }
+        return lastWorldFromSite.get()?.copyOf()
     }
 
     fun attachHostedReference(localAnchor: Anchor, definition: AnchorDefinition) {
         ownedAnchors += localAnchor
-        reference.compareAndSet(null, Reference(localAnchor, definition))
+        if (reference.compareAndSet(null, Reference(localAnchor, definition))) {
+            lastWorldFromSite.set(
+                PoseMath.multiply(
+                    PoseMath.poseToMatrix(localAnchor.pose),
+                    PoseMath.rigidInverse(definition.siteFromAnchor)
+                )
+            )
+        }
     }
 
     fun resolveMap(map: MapDefinition) {
@@ -116,6 +133,12 @@ class CloudAnchorCoordinator(
                 if (state == CloudAnchorState.SUCCESS && anchor != null) {
                     if (reference.compareAndSet(null, Reference(anchor, definition))) {
                         ownedAnchors += anchor
+                        lastWorldFromSite.set(
+                            PoseMath.multiply(
+                                PoseMath.poseToMatrix(anchor.pose),
+                                PoseMath.rigidInverse(definition.siteFromAnchor)
+                            )
+                        )
                         resolving.set(false)
                         resolveStartedAtMs = 0L
                         // Invalidate/cancel every other candidate from this batch. First valid
@@ -299,7 +322,14 @@ class CloudAnchorCoordinator(
                 val latestMap = database.getMap(mapId)
                 if (latestMap?.rootAnchorId == null) database.updateMapRuntime(mapId, rootAnchorId = anchorId)
                 val retainedAsReference = reference.compareAndSet(null, Reference(localAnchor, definition))
-                if (!retainedAsReference) {
+                if (retainedAsReference) {
+                    lastWorldFromSite.set(
+                        PoseMath.multiply(
+                            PoseMath.poseToMatrix(localAnchor.pose),
+                            PoseMath.rigidInverse(definition.siteFromAnchor)
+                        )
+                    )
+                } else {
                     localAnchor.detach()
                     ownedAnchors.remove(localAnchor)
                 }
@@ -327,6 +357,7 @@ class CloudAnchorCoordinator(
 
     fun resetReference() {
         cancelResolveBatch()
+        lastWorldFromSite.set(null)
         reference.getAndSet(null)?.let { current ->
             ownedAnchors.remove(current.anchor)
             runCatching { current.anchor.detach() }
@@ -340,12 +371,13 @@ class CloudAnchorCoordinator(
         hostFutures.clear()
         ownedAnchors.clear()
         reference.set(null)
+        lastWorldFromSite.set(null)
     }
 
     companion object {
         private const val AUTO_HOST_COOLDOWN_MS = 8_000L
         private const val RETRY_RADIUS_METERS = 4f
         private const val MAX_CONCURRENT_RESOLVES = 4
-        private const val RESOLVE_BATCH_TIMEOUT_MS = 12_000L
+        private const val RESOLVE_BATCH_TIMEOUT_MS = 60_000L
     }
 }

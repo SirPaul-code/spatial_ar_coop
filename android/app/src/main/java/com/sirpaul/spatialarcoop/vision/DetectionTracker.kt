@@ -138,6 +138,6 @@ class DetectionTracker(private val sourceId: String) {
         private const val BIRD_ASSOCIATION_METERS = 0.45f
         private const val MAX_SPEED_METERS_PER_SECOND = 18f
         private const val MAX_PREDICTION_SECONDS = 1.5f
-        private const val TRACK_TIMEOUT_MS = 2_200L
+        private const val TRACK_TIMEOUT_MS = 1_500L
     }
 }

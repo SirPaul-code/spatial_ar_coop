@@ -1,5 +1,14 @@
 # Android release notes
 
+## 1.0.3
+
+- Preserve a successfully resolved shared transform through temporary Cloud Anchor tracking pauses.
+- Give Cloud Anchor resolution up to 60 seconds instead of cancelling every request after 12 seconds.
+- Show room connectivity and buffered remote-track count while shared localization is pending.
+- Do not render a phone's own spatial network boxes on top of its local detector boxes.
+- Remove the unstable class-size monocular range fallback that produced duplicate distant tracks.
+- Prefer ground/depth/plane evidence for moving-object 3D positions and shorten stale local-track lifetime.
+
 ## 1.0.2
 
 - Live AR now starts on-device object detection and compact track sharing automatically for every participant. There is no separate reporting opt-in in the normal Live flow.

@@ -24,11 +24,18 @@ object SpatialEstimator {
         groundY: Float?
     ): EstimatedPosition? {
         if (frame.camera.trackingState != TrackingState.TRACKING) return null
-        val image = detection.rawBottomCenter
-        val view = FloatArray(2)
-        frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, image, Coordinates2d.VIEW, view)
         val siteFromWorld = PoseMath.rigidInverse(worldFromSite)
+        val ground = groundY?.let {
+            intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it)
+        }
 
+        val view = FloatArray(2)
+        frame.transformCoordinates2d(
+            Coordinates2d.IMAGE_PIXELS,
+            detection.rawBottomCenter,
+            Coordinates2d.VIEW,
+            view
+        )
         val bestHit = frame.hitTest(view[0], view[1])
             .filter { hit ->
                 when (val trackable = hit.trackable) {
@@ -42,31 +49,59 @@ object SpatialEstimator {
 
         if (bestHit != null) {
             val site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
-            val (uncertainty, method) = when (bestHit.trackable) {
-                is DepthPoint -> 0.25f to "depth"
-                is Plane -> 0.32f to "plane"
-                else -> 0.55f to "feature-point"
+            return when (bestHit.trackable) {
+                is DepthPoint -> {
+                    if (ground != null && usesGroundContact(detection.label)) {
+                        if (PoseMath.distance(site, ground) <= 2.0f) {
+                            EstimatedPosition(
+                                sitePosition = floatArrayOf(
+                                    site[0] * 0.60f + ground[0] * 0.40f,
+                                    ground[1],
+                                    site[2] * 0.60f + ground[2] * 0.40f
+                                ),
+                                uncertaintyMeters = 0.28f,
+                                method = "depth+ground"
+                            )
+                        } else {
+                            EstimatedPosition(ground, 0.52f, "ground-ray")
+                        }
+                    } else {
+                        EstimatedPosition(site, 0.30f, "depth")
+                    }
+                }
+                is Plane -> {
+                    if (ground != null && usesGroundContact(detection.label)) {
+                        if (PoseMath.distance(site, ground) <= 1.5f) {
+                            EstimatedPosition(
+                                sitePosition = floatArrayOf(
+                                    site[0] * 0.35f + ground[0] * 0.65f,
+                                    ground[1],
+                                    site[2] * 0.35f + ground[2] * 0.65f
+                                ),
+                                uncertaintyMeters = 0.38f,
+                                method = "plane+ground"
+                            )
+                        } else {
+                            EstimatedPosition(ground, 0.55f, "ground-ray")
+                        }
+                    } else {
+                        EstimatedPosition(site, 0.45f, "plane")
+                    }
+                }
+                is Point -> {
+                    // Feature points behind moving objects caused the field-test duplicate tracks.
+                    if (usesGroundContact(detection.label)) {
+                        ground?.let { EstimatedPosition(it, 0.60f, "ground-ray") }
+                    } else {
+                        EstimatedPosition(site, 0.75f, "feature-point")
+                    }
+                }
+                else -> null
             }
-            // Moving targets often create a depth hit on the target itself. Ground projection is
-            // more stable for feet/wheels when both estimates agree reasonably well.
-            val ground = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
-            if (ground != null && PoseMath.distance(site, ground) < 1.2f) {
-                return EstimatedPosition(
-                    sitePosition = floatArrayOf(site[0] * 0.45f + ground[0] * 0.55f, groundY, site[2] * 0.45f + ground[2] * 0.55f),
-                    uncertaintyMeters = uncertainty,
-                    method = "$method+ground"
-                )
-            }
-            return EstimatedPosition(site, uncertainty, method)
         }
 
-        val fallback = groundY?.let { intersectGround(frame, detection.rawBottomCenter, siteFromWorld, it) }
-        if (fallback != null) return EstimatedPosition(fallback, 0.65f, "ground-ray")
-
-        // Last-resort monocular estimate. It is intentionally marked with much larger uncertainty
-        // than Depth/plane/ground hits, but keeps obvious people/cars/birds shareable when ARCore
-        // has no hit at the moving object's contact point.
-        return estimateFromBoundingBoxSize(frame, detection, siteFromWorld)
+        // Keep the accurate local 2D box, but do not invent a networked 3D position from class size.
+        return ground?.let { EstimatedPosition(it, 0.60f, "ground-ray") }
     }
 
     fun centerGroundPoint(frame: Frame, worldFromSite: FloatArray, groundY: Float?): FloatArray? {
@@ -88,51 +123,9 @@ object SpatialEstimator {
         }
     }
 
-    private fun estimateFromBoundingBoxSize(
-        frame: Frame,
-        detection: Detection2D,
-        siteFromWorld: FloatArray
-    ): EstimatedPosition? {
-        val physicalHeightMeters = when (detection.label.lowercase()) {
-            "person" -> 1.70f
-            "car" -> 1.50f
-            "bird" -> 0.40f
-            "dog" -> 0.65f
-            "cat" -> 0.38f
-            else -> 0.60f
-        }
-        val pixelExtent = maxOf(detection.rawBoundingBox.width(), detection.rawBoundingBox.height())
-        if (!pixelExtent.isFinite() || pixelExtent < 6f) return null
-
-        val intrinsics = frame.camera.imageIntrinsics
-        val focal = intrinsics.focalLength
-        val principal = intrinsics.principalPoint
-        if (focal[0] <= 0f || focal[1] <= 0f) return null
-        val focalPixels = (focal[0] + focal[1]) * 0.5f
-        val opticalDepth = (focalPixels * physicalHeightMeters / pixelExtent).coerceIn(0.45f, 55f)
-        if (!opticalDepth.isFinite()) return null
-
-        val centerX = detection.rawBoundingBox.centerX()
-        val centerY = detection.rawBoundingBox.centerY()
-        val cameraDirection = PoseMath.normalize(
-            floatArrayOf(
-                (centerX - principal[0]) / focal[0],
-                -(centerY - principal[1]) / focal[1],
-                -1f
-            )
-        )
-        val worldFromCamera = PoseMath.poseToMatrix(frame.camera.pose)
-        val worldDirection = PoseMath.transformDirection(worldFromCamera, cameraDirection)
-        val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromWorld, worldDirection))
-        val siteOrigin = PoseMath.transformPoint(siteFromWorld, frame.camera.pose.translation)
-        val rayLength = (opticalDepth / abs(cameraDirection[2]).coerceAtLeast(0.18f)).coerceIn(0.45f, 70f)
-        val site = floatArrayOf(
-            siteOrigin[0] + siteDirection[0] * rayLength,
-            siteOrigin[1] + siteDirection[1] * rayLength,
-            siteOrigin[2] + siteDirection[2] * rayLength
-        )
-        val uncertainty = (0.75f + opticalDepth * 0.28f).coerceIn(0.9f, 10f)
-        return EstimatedPosition(site, uncertainty, "monocular-class-size")
+    private fun usesGroundContact(label: String): Boolean = when (label.lowercase()) {
+        "person", "car", "bird", "dog", "cat" -> true
+        else -> false
     }
 
     private fun intersectGround(
@@ -158,7 +151,7 @@ object SpatialEstimator {
         if (abs(siteDirection[1]) < 0.015f) return null
         val siteOrigin = PoseMath.transformPoint(siteFromWorld, frame.camera.pose.translation)
         val distance = (groundY - siteOrigin[1]) / siteDirection[1]
-        if (!distance.isFinite() || distance !in 0.15f..100f) return null
+        if (!distance.isFinite() || distance !in 0.15f..60f) return null
         return floatArrayOf(
             siteOrigin[0] + siteDirection[0] * distance,
             groundY,
