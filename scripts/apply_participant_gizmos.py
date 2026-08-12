@@ -1,0 +1,518 @@
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:100]!r}")
+    p.write_text(text.replace(old, new, 1))
+
+
+# Realtime client: consume the client_pose broadcast that the server already emits.
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/net/RealtimeClient.kt",
+    "import kotlin.math.min\n\ninterface RealtimeListener {",
+    """import kotlin.math.min
+
+
+data class RemoteClientPose(
+    val clientId: String,
+    val role: String,
+    val position: FloatArray,
+    val rotation: FloatArray,
+    val tracking: String,
+    val atMs: Long,
+    val serverReceivedAtMs: Long
+)
+
+interface RealtimeListener {""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/net/RealtimeClient.kt",
+    "    fun onManualMarker(id: String, label: String, position: FloatArray, expiresAtMs: Long)\n    fun onPresence(clientId: String, action: String, role: String)\n",
+    """    fun onManualMarker(id: String, label: String, position: FloatArray, expiresAtMs: Long)
+    fun onClientPose(pose: RemoteClientPose) = Unit
+    fun onPresence(clientId: String, action: String, role: String)
+""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/net/RealtimeClient.kt",
+    "            \"presence\" -> listener.onPresence(\n",
+    """            \"client_pose\" -> {
+                val pose = json.optJSONObject(\"pose\") ?: return
+                val remoteClientId = pose.optString(\"clientId\")
+                if (remoteClientId.isBlank()) return
+                listener.onClientPose(
+                    RemoteClientPose(
+                        clientId = remoteClientId,
+                        role = pose.optString(\"role\", \"participant\"),
+                        position = pose.floatArray(\"position\", 3),
+                        rotation = pose.floatArray(\"rotation\", 4),
+                        tracking = pose.optString(\"tracking\", \"UNKNOWN\"),
+                        atMs = pose.optLong(\"atMs\", System.currentTimeMillis()),
+                        serverReceivedAtMs = pose.optLong(\"serverReceivedAtMs\", System.currentTimeMillis())
+                    )
+                )
+            }
+            \"presence\" -> listener.onPresence(
+""",
+)
+
+# AR activity: store fresh remote poses, project them through the shared site frame,
+# expose a direct Live toggle, and never render our own pose.
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "import com.google.ar.core.Frame\nimport com.google.ar.core.Session\n",
+    "import com.google.ar.core.Frame\nimport com.google.ar.core.Pose\nimport com.google.ar.core.Session\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "import com.sirpaul.spatialarcoop.net.RealtimeClient\nimport com.sirpaul.spatialarcoop.net.RealtimeListener\n",
+    "import com.sirpaul.spatialarcoop.net.RealtimeClient\nimport com.sirpaul.spatialarcoop.net.RealtimeListener\nimport com.sirpaul.spatialarcoop.net.RemoteClientPose\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "import com.sirpaul.spatialarcoop.ui.ProjectedPose\nimport com.sirpaul.spatialarcoop.ui.ProjectedSkeleton\n",
+    "import com.sirpaul.spatialarcoop.ui.ProjectedPose\nimport com.sirpaul.spatialarcoop.ui.ProjectedParticipant\nimport com.sirpaul.spatialarcoop.ui.ProjectedParticipantGizmo\nimport com.sirpaul.spatialarcoop.ui.ProjectedPoint\nimport com.sirpaul.spatialarcoop.ui.ProjectedSkeleton\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "import java.util.UUID\nimport java.util.concurrent.atomic.AtomicBoolean\n",
+    "import java.util.UUID\nimport java.util.concurrent.ConcurrentHashMap\nimport java.util.concurrent.atomic.AtomicBoolean\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "    private var reportButton: Button? = null\n    private var finishSetupButton: Button? = null\n",
+    "    private var reportButton: Button? = null\n    private var participantsButton: Button? = null\n    private var finishSetupButton: Button? = null\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "    private val remoteTracks = RemoteTrackStore()\n    private lateinit var localTracker: DetectionTracker\n",
+    "    private val remoteTracks = RemoteTrackStore()\n    private val remoteClientPoses = ConcurrentHashMap<String, RemoteClientPose>()\n    private lateinit var localTracker: DetectionTracker\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "    @Volatile private var reporting = false\n    @Volatile private var latestDetectionCount = 0\n",
+    "    @Volatile private var reporting = false\n    @Volatile private var showParticipants = false\n    @Volatile private var latestDetectionCount = 0\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "            ArMode.LIVE -> actions.addView(action(\"More\") { showLiveMenu() })\n",
+    """            ArMode.LIVE -> {
+                participantsButton = action(\"Clients: Off\") {
+                    setParticipantOverlayVisible(!showParticipants)
+                }.also(actions::addView)
+                actions.addView(action(\"More\") { showLiveMenu() })
+            }
+""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "        reportButton?.text = if (enabled) \"Stop reporting\" else \"Start reporting\"\n        realtime?.sendStatus(if (enabled) \"reporting\" else \"observing\", if (enabled) \"object detection enabled\" else \"object detection disabled\")\n        showDetail(if (enabled) \"Reporting enabled · detections are shared with this place\" else \"Observing · reporting is off\")\n    }\n\n    private fun showMapSetupMenu() {",
+    """        reportButton?.text = if (enabled) \"Stop reporting\" else \"Start reporting\"
+        realtime?.sendStatus(if (enabled) \"reporting\" else \"observing\", if (enabled) \"object detection enabled\" else \"object detection disabled\")
+        showDetail(if (enabled) \"Reporting enabled · detections are shared with this place\" else \"Observing · reporting is off\")
+    }
+
+    private fun setParticipantOverlayVisible(enabled: Boolean) {
+        if (mode != ArMode.LIVE) return
+        showParticipants = enabled
+        participantsButton?.text = if (enabled) \"Clients: On\" else \"Clients: Off\"
+        if (!enabled && ::overlay.isInitialized) overlay.updateParticipants(emptyList())
+        showDetail(
+            if (enabled) {
+                \"Participant gizmos on · localized phones appear through walls with direction arrows\"
+            } else {
+                \"Participant gizmos hidden · object sharing remains active\"
+            }
+        )
+    }
+
+    private fun showMapSetupMenu() {""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "            updateHud(frame, null, if (mode == ArMode.LIVE) null else instruction)\n            overlay.updateTracks(emptyList())\n            return\n",
+    "            updateHud(frame, null, if (mode == ArMode.LIVE) null else instruction)\n            overlay.updateTracks(emptyList())\n            overlay.updateParticipants(emptyList())\n            return\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "        updateProjectedTracks(cameraSite, worldFromSite)\n        publishClientPose(frame, siteFromWorld)\n",
+    "        updateProjectedTracks(cameraSite, worldFromSite)\n        updateProjectedParticipants(cameraSite, worldFromSite)\n        publishClientPose(frame, siteFromWorld)\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "        overlay.updateTracks(projected)\n    }\n\n\n    private fun projectTrackSkeleton",
+    """        overlay.updateTracks(projected)
+    }
+
+    private fun updateProjectedParticipants(cameraSite: FloatArray, worldFromSite: FloatArray) {
+        if (mode != ArMode.LIVE || !showParticipants) {
+            overlay.updateParticipants(emptyList())
+            return
+        }
+        val now = System.currentTimeMillis()
+        val localClientId = spatialApp.preferences.deviceId
+        val projected = buildList {
+            remoteClientPoses.values.forEach { remote ->
+                val ageMs = (now - remote.serverReceivedAtMs).coerceAtLeast(0L)
+                if (ageMs > PARTICIPANT_POSE_TTL_MS) {
+                    remoteClientPoses.remove(remote.clientId, remote)
+                    return@forEach
+                }
+                if (remote.clientId == localClientId || remote.position.size < 3 || remote.rotation.size < 4) return@forEach
+
+                val world = PoseMath.transformPoint(worldFromSite, remote.position)
+                val cameraPoint = PoseMath.transformPoint(viewMatrix, world)
+                val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                val direction = OffscreenIndicatorMath.direction(cameraPoint)
+                val onScreen = screen?.onScreen == true
+                add(
+                    ProjectedParticipant(
+                        clientId = remote.clientId,
+                        role = remote.role,
+                        x = screen?.x ?: viewportWidth * 0.5f,
+                        y = screen?.y ?: viewportHeight * 0.5f,
+                        onScreen = onScreen,
+                        distanceMeters = PoseMath.distance(cameraSite, remote.position),
+                        ageMs = ageMs,
+                        tracking = remote.tracking,
+                        offscreenDx = direction.dx,
+                        offscreenDy = direction.dy,
+                        gizmo = if (onScreen) projectParticipantGizmo(remote, worldFromSite) else null
+                    )
+                )
+            }
+        }
+        overlay.updateParticipants(projected)
+    }
+
+    private fun projectParticipantGizmo(remote: RemoteClientPose, worldFromSite: FloatArray): ProjectedParticipantGizmo? {
+        val siteFromClient = runCatching { PoseMath.poseToMatrix(Pose(remote.position, remote.rotation)) }.getOrNull()
+            ?: return null
+        val worldFromClient = PoseMath.multiply(worldFromSite, siteFromClient)
+        fun projectLocal(localPoint: FloatArray): ProjectedPoint? {
+            val world = PoseMath.transformPoint(worldFromClient, localPoint)
+            val projected = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                ?: return null
+            return ProjectedPoint(projected.x, projected.y)
+        }
+        val right = projectLocal(floatArrayOf(PARTICIPANT_GIZMO_AXIS_METERS, 0f, 0f))
+        val up = projectLocal(floatArrayOf(0f, PARTICIPANT_GIZMO_AXIS_METERS, 0f))
+        val forward = projectLocal(floatArrayOf(0f, 0f, -PARTICIPANT_GIZMO_FORWARD_METERS))
+        return if (right == null && up == null && forward == null) null else {
+            ProjectedParticipantGizmo(right = right, up = up, forward = forward)
+        }
+    }
+
+
+    private fun projectTrackSkeleton""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "        realtime?.close()\n        realtime = null\n        cloudAnchors?.close()\n",
+    """        realtime?.close()
+        realtime = null
+        remoteClientPoses.clear()
+        if (::overlay.isInitialized) overlay.updateParticipants(emptyList())
+        cloudAnchors?.close()
+""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "    override fun onConnectionState(connected: Boolean, detail: String) {\n        realtimeConnected = connected\n        runOnUiThread {\n",
+    """    override fun onConnectionState(connected: Boolean, detail: String) {
+        realtimeConnected = connected
+        if (!connected) {
+            remoteClientPoses.clear()
+            if (::overlay.isInitialized) overlay.updateParticipants(emptyList())
+        }
+        runOnUiThread {
+""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "    override fun onPresence(clientId: String, action: String, role: String) {\n        spatialApp.logger.debug(\"Realtime presence\", mapOf(\"clientId\" to clientId, \"action\" to action, \"role\" to role))\n    }\n",
+    """    override fun onClientPose(pose: RemoteClientPose) {
+        if (pose.clientId.isBlank() || pose.clientId == spatialApp.preferences.deviceId) return
+        remoteClientPoses[pose.clientId] = pose
+    }
+
+    override fun onPresence(clientId: String, action: String, role: String) {
+        if (action == \"left\") remoteClientPoses.remove(clientId)
+        spatialApp.logger.debug(\"Realtime presence\", mapOf(\"clientId\" to clientId, \"action\" to action, \"role\" to role))
+    }
+""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt",
+    "        private const val POSE_INTERVAL_MS = 500L\n        private const val DETECTOR_STATUS_INTERVAL_MS = 1_500L\n",
+    """        private const val POSE_INTERVAL_MS = 500L
+        private const val PARTICIPANT_POSE_TTL_MS = 3_000L
+        private const val PARTICIPANT_GIZMO_AXIS_METERS = 0.35f
+        private const val PARTICIPANT_GIZMO_FORWARD_METERS = 0.55f
+        private const val DETECTOR_STATUS_INTERVAL_MS = 1_500L
+""",
+)
+
+# Overlay: through-wall phone glyph, standard RGB camera axes, and off-screen edge arrow.
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt",
+    "data class ProjectedPose(val joints: List<ProjectedJoint>)\n\ndata class ProjectedTrack(",
+    """data class ProjectedPose(val joints: List<ProjectedJoint>)
+data class ProjectedPoint(val x: Float, val y: Float)
+data class ProjectedParticipantGizmo(
+    val right: ProjectedPoint?,
+    val up: ProjectedPoint?,
+    val forward: ProjectedPoint?
+)
+data class ProjectedParticipant(
+    val clientId: String,
+    val role: String,
+    val x: Float,
+    val y: Float,
+    val onScreen: Boolean,
+    val distanceMeters: Float,
+    val ageMs: Long,
+    val tracking: String,
+    val offscreenDx: Float,
+    val offscreenDy: Float,
+    val gizmo: ProjectedParticipantGizmo? = null
+)
+
+data class ProjectedTrack(""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt",
+    """    private val boxStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f * density
+        color = Color.argb(160, 120, 149, 178)
+    }
+    @Volatile private var tracks: List<ProjectedTrack> = emptyList()
+""",
+    """    private val boxStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f * density
+        color = Color.argb(160, 120, 149, 178)
+    }
+    private val participantStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.1f * density
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.rgb(91, 213, 190)
+    }
+    private val participantFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.argb(62, 91, 213, 190)
+    }
+    private val participantAxisRight = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(235, 92, 92)
+    }
+    private val participantAxisUp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(92, 214, 126)
+    }
+    private val participantAxisForward = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(94, 145, 235)
+    }
+    @Volatile private var tracks: List<ProjectedTrack> = emptyList()
+""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt",
+    "    @Volatile private var localPoses: List<ProjectedPose> = emptyList()\n    @Volatile private var scan = ScanOverlayState()\n",
+    "    @Volatile private var localPoses: List<ProjectedPose> = emptyList()\n    @Volatile private var participants: List<ProjectedParticipant> = emptyList()\n    @Volatile private var scan = ScanOverlayState()\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt",
+    """    fun updateLocalPoses(values: List<ProjectedPose>) {
+        localPoses = values
+        postInvalidateOnAnimation()
+    }
+
+    fun updateScanState""",
+    """    fun updateLocalPoses(values: List<ProjectedPose>) {
+        localPoses = values
+        postInvalidateOnAnimation()
+    }
+
+    fun updateParticipants(values: List<ProjectedParticipant>) {
+        participants = values
+        postInvalidateOnAnimation()
+    }
+
+    fun updateScanState""",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt",
+    "        tracks.forEach { track -> if (track.onScreen) drawTrack(canvas, track) else drawOffscreen(canvas, track) }\n        if (showScan) drawScanCard(canvas)\n",
+    "        tracks.forEach { track -> if (track.onScreen) drawTrack(canvas, track) else drawOffscreen(canvas, track) }\n        participants.forEach { drawParticipant(canvas, it) }\n        if (showScan) drawScanCard(canvas)\n",
+)
+replace_once(
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt",
+    """    private fun drawDetectionBox(canvas: Canvas, box: ProjectedBox) {
+        canvas.drawRoundRect(box.rectangle, 8f * density, 8f * density, boxStroke)
+        val label = \"${box.label} %.0f%%\".format(box.confidence * 100f)
+        val labelWidth = text.measureText(label) + 12f * density
+        val background = RectF(box.rectangle.left, box.rectangle.top - 24f * density, box.rectangle.left + labelWidth, box.rectangle.top)
+        canvas.drawRoundRect(background, 5f * density, 5f * density, panel)
+        canvas.drawText(label, background.left + 6f * density, background.bottom - 6f * density, text)
+    }
+
+    private fun drawScanCard""",
+    """    private fun drawDetectionBox(canvas: Canvas, box: ProjectedBox) {
+        canvas.drawRoundRect(box.rectangle, 8f * density, 8f * density, boxStroke)
+        val label = \"${box.label} %.0f%%\".format(box.confidence * 100f)
+        val labelWidth = text.measureText(label) + 12f * density
+        val background = RectF(box.rectangle.left, box.rectangle.top - 24f * density, box.rectangle.left + labelWidth, box.rectangle.top)
+        canvas.drawRoundRect(background, 5f * density, 5f * density, panel)
+        canvas.drawText(label, background.left + 6f * density, background.bottom - 6f * density, text)
+    }
+
+    private fun drawParticipant(canvas: Canvas, participant: ProjectedParticipant) {
+        val ageAlpha = (255 - (participant.ageMs / 14L).toInt()).coerceIn(82, 255)
+        participantStroke.alpha = ageAlpha
+        participantFill.alpha = (ageAlpha * 0.24f).toInt().coerceIn(24, 96)
+        participantAxisRight.alpha = ageAlpha
+        participantAxisUp.alpha = ageAlpha
+        participantAxisForward.alpha = ageAlpha
+
+        if (!participant.onScreen) {
+            drawParticipantOffscreen(canvas, participant)
+            return
+        }
+
+        participant.gizmo?.let { gizmo ->
+            drawParticipantAxis(canvas, participant.x, participant.y, gizmo.right, participantAxisRight)
+            drawParticipantAxis(canvas, participant.x, participant.y, gizmo.up, participantAxisUp)
+            drawParticipantAxis(canvas, participant.x, participant.y, gizmo.forward, participantAxisForward)
+        }
+        drawPhoneGlyph(canvas, participant.x, participant.y)
+
+        val shortId = participant.clientId.substringAfterLast('-').takeLast(8).ifBlank { participant.clientId.takeLast(8) }
+        val title = \"phone · $shortId\"
+        val detail = \"%.1f m · %s\".format(participant.distanceMeters, participant.tracking.lowercase())
+        val panelWidth = maxOf(text.measureText(title), subText.measureText(detail)) + 18f * density
+        val left = (participant.x - panelWidth / 2f).coerceIn(6f * density, width - panelWidth - 6f * density)
+        val top = (participant.y - 66f * density).coerceAtLeast(6f * density)
+        val rect = RectF(left, top, left + panelWidth, top + 38f * density)
+        canvas.drawRoundRect(rect, 7f * density, 7f * density, panel)
+        canvas.drawText(title, rect.left + 9f * density, rect.top + 15f * density, text)
+        canvas.drawText(detail, rect.left + 9f * density, rect.top + 31f * density, subText)
+    }
+
+    private fun drawParticipantAxis(
+        canvas: Canvas,
+        originX: Float,
+        originY: Float,
+        endpoint: ProjectedPoint?,
+        paint: Paint
+    ) {
+        endpoint ?: return
+        if (!endpoint.x.isFinite() || !endpoint.y.isFinite()) return
+        canvas.drawLine(originX, originY, endpoint.x, endpoint.y, paint)
+        canvas.drawCircle(endpoint.x, endpoint.y, 2.8f * density, paint)
+    }
+
+    private fun drawParticipantOffscreen(canvas: Canvas, participant: ProjectedParticipant) {
+        val direction = OffscreenDirection(participant.offscreenDx, participant.offscreenDy)
+        val point = OffscreenIndicatorMath.edgePoint(width.toFloat(), height.toFloat(), 40f * density, direction)
+        val angle = atan2(direction.dy, direction.dx)
+        val arrow = Path().apply {
+            moveTo(point.x + kotlin.math.cos(angle) * 15f * density, point.y + kotlin.math.sin(angle) * 15f * density)
+            lineTo(point.x + kotlin.math.cos(angle + 2.55f) * 11f * density, point.y + kotlin.math.sin(angle + 2.55f) * 11f * density)
+            lineTo(point.x + kotlin.math.cos(angle - 2.55f) * 11f * density, point.y + kotlin.math.sin(angle - 2.55f) * 11f * density)
+            close()
+        }
+        canvas.drawPath(arrow, participantFill)
+        canvas.drawPath(arrow, participantStroke)
+
+        val phoneX = point.x - kotlin.math.cos(angle) * 22f * density
+        val phoneY = point.y - kotlin.math.sin(angle) * 22f * density
+        drawPhoneGlyph(canvas, phoneX, phoneY, 0.72f)
+
+        val shortId = participant.clientId.substringAfterLast('-').takeLast(6).ifBlank { participant.clientId.takeLast(6) }
+        val label = \"phone $shortId · %.1fm\".format(participant.distanceMeters)
+        val labelWidth = subText.measureText(label)
+        val labelX = (point.x - labelWidth / 2f).coerceIn(8f * density, width - labelWidth - 8f * density)
+        val labelY = (point.y - 22f * density).coerceIn(16f * density, height - 12f * density)
+        canvas.drawText(label, labelX, labelY, subText)
+    }
+
+    private fun drawPhoneGlyph(canvas: Canvas, centerX: Float, centerY: Float, scale: Float = 1f) {
+        val halfWidth = 9f * density * scale
+        val halfHeight = 15f * density * scale
+        val body = RectF(centerX - halfWidth, centerY - halfHeight, centerX + halfWidth, centerY + halfHeight)
+        canvas.drawRoundRect(body, 4f * density * scale, 4f * density * scale, participantFill)
+        canvas.drawRoundRect(body, 4f * density * scale, 4f * density * scale, participantStroke)
+        canvas.drawCircle(centerX, body.top + 3.5f * density * scale, 1.2f * density * scale, participantStroke)
+        canvas.drawLine(
+            centerX - 3f * density * scale,
+            body.bottom - 3f * density * scale,
+            centerX + 3f * density * scale,
+            body.bottom - 3f * density * scale,
+            participantStroke
+        )
+    }
+
+    private fun drawScanCard""",
+)
+
+# Version + field docs/release notes.
+replace_once(
+    "android/app/build.gradle.kts",
+    '        versionCode = 8\n        versionName = "1.0.7"\n',
+    '        versionCode = 9\n        versionName = "1.0.8"\n',
+)
+replace_once(
+    "android/RELEASE_NOTES.md",
+    "# Android release notes\n\n## 1.0.7\n",
+    """# Android release notes
+
+## 1.0.8
+
+- Add a direct **Clients: Off / Clients: On** toggle to Live AR for visualizing every other localized client in the same map.
+- Consume the existing realtime `client_pose` broadcast on Android and keep a short-lived per-client site-frame pose cache; a phone never renders its own pose and stale/disconnected clients disappear automatically.
+- Render an on-screen phone pictogram at the remote camera position plus a standard RGB camera-orientation gizmo (+X right, +Y up, -Z forward) using the remote pose quaternion.
+- Render off-screen/behind-camera participants as viewport-edge arrows with a small phone glyph, short client ID and distance. The overlay is intentionally screen-space and remains visible through physical walls.
+- Participant visualization uses only compact shared-site pose data already sent by Live AR; no remote camera image/video is transmitted.
+
+## 1.0.7
+""",
+)
+replace_once(
+    "docs/FIELD_USE.md",
+    "Cloud Anchor localization tries several hosted anchors concurrently, accepts the first successful shared reference, cancels stalled batches, and retries automatically. A participant therefore does not have to choose an anchor manually.\n\n### The `More` menu during Live AR\n",
+    """Cloud Anchor localization tries several hosted anchors concurrently, accepts the first successful shared reference, cancels stalled batches, and retries automatically. A participant therefore does not have to choose an anchor manually.
+
+**Clients: Off / Clients: On** is a direct Live AR toggle for participant visualization. When enabled, every other localized client in the same map is drawn from its shared-site camera pose as a phone pictogram with an RGB orientation gizmo. A client outside the current camera view (including behind the viewer) becomes a viewport-edge direction arrow with distance. This overlay is intentionally not depth-occluded, so the phone marker remains visible through walls. The local phone is never drawn as its own remote client, and stale/disconnected poses expire automatically.
+
+### The `More` menu during Live AR
+""",
+)
+
+checks = {
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/net/RealtimeClient.kt": ["\"client_pose\"", "RemoteClientPose", "onClientPose"],
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt": ["Clients: Off", "updateProjectedParticipants", "projectParticipantGizmo", "onClientPose"],
+    "android/app/src/main/java/com/sirpaul/spatialarcoop/ui/SpatialOverlayView.kt": ["ProjectedParticipant", "updateParticipants", "drawParticipantOffscreen", "drawPhoneGlyph"],
+    "android/app/build.gradle.kts": ['versionName = "1.0.8"'],
+}
+for path, needles in checks.items():
+    text = Path(path).read_text()
+    for needle in needles:
+        if needle not in text:
+            raise SystemExit(f"{path}: missing expected {needle}")
+
+print("participant gizmo patch applied")
