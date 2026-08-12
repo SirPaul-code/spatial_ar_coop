@@ -15,11 +15,23 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 
+
+data class RemoteClientPose(
+    val clientId: String,
+    val role: String,
+    val position: FloatArray,
+    val rotation: FloatArray,
+    val tracking: String,
+    val atMs: Long,
+    val serverReceivedAtMs: Long
+)
+
 interface RealtimeListener {
     fun onConnectionState(connected: Boolean, detail: String)
     fun onTracks(tracks: List<SpatialTrack>, replaceSnapshot: Boolean = false)
     fun onTracksExpired(trackKeys: List<String>)
     fun onManualMarker(id: String, label: String, position: FloatArray, expiresAtMs: Long)
+    fun onClientPose(pose: RemoteClientPose) = Unit
     fun onPresence(clientId: String, action: String, role: String)
     fun onTrackAck(sequence: Long, accepted: Int, expired: Int, serverTimeMs: Long) = Unit
 }
@@ -147,6 +159,22 @@ class RealtimeClient(
                     marker.optString("label", "marker"),
                     marker.floatArray("position", 3),
                     marker.optLong("expiresAtMs", System.currentTimeMillis() + 60_000)
+                )
+            }
+            "client_pose" -> {
+                val pose = json.optJSONObject("pose") ?: return
+                val remoteClientId = pose.optString("clientId")
+                if (remoteClientId.isBlank()) return
+                listener.onClientPose(
+                    RemoteClientPose(
+                        clientId = remoteClientId,
+                        role = pose.optString("role", "participant"),
+                        position = pose.floatArray("position", 3),
+                        rotation = pose.floatArray("rotation", 4),
+                        tracking = pose.optString("tracking", "UNKNOWN"),
+                        atMs = pose.optLong("atMs", System.currentTimeMillis()),
+                        serverReceivedAtMs = pose.optLong("serverReceivedAtMs", System.currentTimeMillis())
+                    )
                 )
             }
             "presence" -> listener.onPresence(

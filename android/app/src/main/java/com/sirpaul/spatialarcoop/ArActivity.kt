@@ -27,6 +27,7 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
+import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
@@ -50,6 +51,7 @@ import com.sirpaul.spatialarcoop.data.MapStatus
 import com.sirpaul.spatialarcoop.data.SpatialTrack
 import com.sirpaul.spatialarcoop.net.RealtimeClient
 import com.sirpaul.spatialarcoop.net.RealtimeListener
+import com.sirpaul.spatialarcoop.net.RemoteClientPose
 import com.sirpaul.spatialarcoop.net.UploadScheduler
 import com.sirpaul.spatialarcoop.ui.FieldTheme
 import com.sirpaul.spatialarcoop.ui.OffscreenIndicatorMath
@@ -57,6 +59,9 @@ import com.sirpaul.spatialarcoop.ui.ProjectedBox
 import com.sirpaul.spatialarcoop.ui.ProjectedCuboid
 import com.sirpaul.spatialarcoop.ui.ProjectedJoint
 import com.sirpaul.spatialarcoop.ui.ProjectedPose
+import com.sirpaul.spatialarcoop.ui.ProjectedParticipant
+import com.sirpaul.spatialarcoop.ui.ProjectedParticipantGizmo
+import com.sirpaul.spatialarcoop.ui.ProjectedPoint
 import com.sirpaul.spatialarcoop.ui.ProjectedSkeleton
 import com.sirpaul.spatialarcoop.ui.ProjectedTrack
 import com.sirpaul.spatialarcoop.ui.ScanOverlayState
@@ -69,6 +74,7 @@ import com.sirpaul.spatialarcoop.vision.ObjectDetectorEngine
 import com.sirpaul.spatialarcoop.vision.SpatialObservation
 import com.sirpaul.spatialarcoop.vision.YuvFrame
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
@@ -90,6 +96,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private lateinit var arErrorPanel: LinearLayout
     private lateinit var arErrorText: TextView
     private var reportButton: Button? = null
+    private var participantsButton: Button? = null
     private var finishSetupButton: Button? = null
     private var retryArButton: Button? = null
 
@@ -137,9 +144,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     @Volatile private var manualAlignmentOverride = false
     private val pendingDetection = AtomicReference<PendingDetection?>(null)
     private val remoteTracks = RemoteTrackStore()
+    private val remoteClientPoses = ConcurrentHashMap<String, RemoteClientPose>()
     private lateinit var localTracker: DetectionTracker
     private var detector: ObjectDetectorEngine? = null
     @Volatile private var reporting = false
+    @Volatile private var showParticipants = false
     @Volatile private var latestDetectionCount = 0
     private var realtime: RealtimeClient? = null
     private var cloudAnchors: CloudAnchorCoordinator? = null
@@ -283,7 +292,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 }
                 actions.addView(action("More") { showMapSetupMenu() })
             }
-            ArMode.LIVE -> actions.addView(action("More") { showLiveMenu() })
+            ArMode.LIVE -> {
+                participantsButton = action("Clients: Off") {
+                    setParticipantOverlayVisible(!showParticipants)
+                }.also(actions::addView)
+                actions.addView(action("More") { showLiveMenu() })
+            }
             ArMode.SENSOR, ArMode.VIEWER -> actions.addView(action("More") { showLiveMenu() })
         }
         scroll.addView(actions)
@@ -613,6 +627,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         stopDetector()
         realtime?.close()
         realtime = null
+        remoteClientPoses.clear()
+        if (::overlay.isInitialized) overlay.updateParticipants(emptyList())
         cloudAnchors?.close()
         cloudAnchors = null
         val closingSession = session
@@ -753,6 +769,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             }
             updateHud(frame, null, if (mode == ArMode.LIVE) null else instruction)
             overlay.updateTracks(emptyList())
+            overlay.updateParticipants(emptyList())
             return
         }
 
@@ -768,6 +785,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             ArMode.VIEWER -> overlay.updateLocalBoxes(emptyList())
         }
         updateProjectedTracks(cameraSite, worldFromSite)
+        updateProjectedParticipants(cameraSite, worldFromSite)
         publishClientPose(frame, siteFromWorld)
         updateHud(frame, worldFromSite, null)
     }
@@ -970,6 +988,20 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         reportButton?.text = if (enabled) "Stop reporting" else "Start reporting"
         realtime?.sendStatus(if (enabled) "reporting" else "observing", if (enabled) "object detection enabled" else "object detection disabled")
         showDetail(if (enabled) "Reporting enabled · detections are shared with this place" else "Observing · reporting is off")
+    }
+
+    private fun setParticipantOverlayVisible(enabled: Boolean) {
+        if (mode != ArMode.LIVE) return
+        showParticipants = enabled
+        participantsButton?.text = if (enabled) "Clients: On" else "Clients: Off"
+        if (!enabled && ::overlay.isInitialized) overlay.updateParticipants(emptyList())
+        showDetail(
+            if (enabled) {
+                "Participant gizmos on · localized phones appear through walls with direction arrows"
+            } else {
+                "Participant gizmos hidden · object sharing remains active"
+            }
+        )
     }
 
     private fun showMapSetupMenu() {
@@ -1194,6 +1226,65 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         overlay.updateTracks(projected)
     }
 
+    private fun updateProjectedParticipants(cameraSite: FloatArray, worldFromSite: FloatArray) {
+        if (mode != ArMode.LIVE || !showParticipants) {
+            overlay.updateParticipants(emptyList())
+            return
+        }
+        val now = System.currentTimeMillis()
+        val localClientId = spatialApp.preferences.deviceId
+        val projected = buildList {
+            remoteClientPoses.values.forEach { remote ->
+                val ageMs = (now - remote.serverReceivedAtMs).coerceAtLeast(0L)
+                if (ageMs > PARTICIPANT_POSE_TTL_MS) {
+                    remoteClientPoses.remove(remote.clientId, remote)
+                    return@forEach
+                }
+                if (remote.clientId == localClientId || remote.position.size < 3 || remote.rotation.size < 4) return@forEach
+
+                val world = PoseMath.transformPoint(worldFromSite, remote.position)
+                val cameraPoint = PoseMath.transformPoint(viewMatrix, world)
+                val screen = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                val direction = OffscreenIndicatorMath.direction(cameraPoint)
+                val onScreen = screen?.onScreen == true
+                add(
+                    ProjectedParticipant(
+                        clientId = remote.clientId,
+                        role = remote.role,
+                        x = screen?.x ?: viewportWidth * 0.5f,
+                        y = screen?.y ?: viewportHeight * 0.5f,
+                        onScreen = onScreen,
+                        distanceMeters = PoseMath.distance(cameraSite, remote.position),
+                        ageMs = ageMs,
+                        tracking = remote.tracking,
+                        offscreenDx = direction.dx,
+                        offscreenDy = direction.dy,
+                        gizmo = if (onScreen) projectParticipantGizmo(remote, worldFromSite) else null
+                    )
+                )
+            }
+        }
+        overlay.updateParticipants(projected)
+    }
+
+    private fun projectParticipantGizmo(remote: RemoteClientPose, worldFromSite: FloatArray): ProjectedParticipantGizmo? {
+        val siteFromClient = runCatching { PoseMath.poseToMatrix(Pose(remote.position, remote.rotation)) }.getOrNull()
+            ?: return null
+        val worldFromClient = PoseMath.multiply(worldFromSite, siteFromClient)
+        fun projectLocal(localPoint: FloatArray): ProjectedPoint? {
+            val world = PoseMath.transformPoint(worldFromClient, localPoint)
+            val projected = PoseMath.projectToScreen(viewProjectionMatrix, world, viewportWidth, viewportHeight)
+                ?: return null
+            return ProjectedPoint(projected.x, projected.y)
+        }
+        val right = projectLocal(floatArrayOf(PARTICIPANT_GIZMO_AXIS_METERS, 0f, 0f))
+        val up = projectLocal(floatArrayOf(0f, PARTICIPANT_GIZMO_AXIS_METERS, 0f))
+        val forward = projectLocal(floatArrayOf(0f, 0f, -PARTICIPANT_GIZMO_FORWARD_METERS))
+        return if (right == null && up == null && forward == null) null else {
+            ProjectedParticipantGizmo(right = right, up = up, forward = forward)
+        }
+    }
+
 
     private fun projectTrackSkeleton(track: SpatialTrack, worldFromSite: FloatArray): ProjectedSkeleton? {
         if (!track.label.equals("person", true) || track.poseJoints.size < 6) return null
@@ -1336,6 +1427,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     override fun onConnectionState(connected: Boolean, detail: String) {
         realtimeConnected = connected
+        if (!connected) {
+            remoteClientPoses.clear()
+            if (::overlay.isInitialized) overlay.updateParticipants(emptyList())
+        }
         runOnUiThread {
             networkText.text = when {
                 connected && mode == ArMode.MAP -> "Server connected · map sync is automatic"
@@ -1370,7 +1465,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         remoteTracks.addMarker(id, label, position, expiresAtMs)
     }
 
+    override fun onClientPose(pose: RemoteClientPose) {
+        if (pose.clientId.isBlank() || pose.clientId == spatialApp.preferences.deviceId) return
+        remoteClientPoses[pose.clientId] = pose
+    }
+
     override fun onPresence(clientId: String, action: String, role: String) {
+        if (action == "left") remoteClientPoses.remove(clientId)
         spatialApp.logger.debug("Realtime presence", mapOf("clientId" to clientId, "action" to action, "role" to role))
     }
 
@@ -1391,6 +1492,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val DETECTION_INTERVAL_MS = 120L
         private const val TRACK_PUBLISH_INTERVAL_MS = 120L
         private const val POSE_INTERVAL_MS = 500L
+        private const val PARTICIPANT_POSE_TTL_MS = 3_000L
+        private const val PARTICIPANT_GIZMO_AXIS_METERS = 0.35f
+        private const val PARTICIPANT_GIZMO_FORWARD_METERS = 0.55f
         private const val DETECTOR_STATUS_INTERVAL_MS = 1_500L
         private const val FEATURE_QUALITY_INTERVAL_MS = 500L
         private const val SCAN_HUD_INTERVAL_MS = 500L

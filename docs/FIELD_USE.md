@@ -99,6 +99,8 @@ For spatial estimation the app prefers ARCore Depth/plane/feature hits and the s
 
 Cloud Anchor localization tries several hosted anchors concurrently, accepts the first successful shared reference, cancels stalled batches, and retries automatically. A participant therefore does not have to choose an anchor manually.
 
+**Clients: Off / Clients: On** is a direct Live AR toggle for participant visualization. When enabled, every other localized client in the same map is drawn from its shared-site camera pose as a phone pictogram with an RGB orientation gizmo. A client outside the current camera view (including behind the viewer) becomes a viewport-edge direction arrow with distance. This overlay is intentionally not depth-occluded, so the phone marker remains visible through walls. The local phone is never drawn as its own remote client, and stale/disconnected poses expire automatically.
+
 ### The `More` menu during Live AR
 
 - **Re-localize with saved Cloud Anchors** — clears the current resolved reference and starts Cloud Anchor resolution again.
