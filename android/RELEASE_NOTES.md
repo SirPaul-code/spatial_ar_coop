@@ -1,5 +1,13 @@
 # Android release notes
 
+## 1.0.8
+
+- Add a direct **Clients: Off / Clients: On** toggle to Live AR for visualizing every other localized client in the same map.
+- Consume the existing realtime `client_pose` broadcast on Android and keep a short-lived per-client site-frame pose cache; a phone never renders its own pose and stale/disconnected clients disappear automatically.
+- Render an on-screen phone pictogram at the remote camera position plus a standard RGB camera-orientation gizmo (+X right, +Y up, -Z forward) using the remote pose quaternion.
+- Render off-screen/behind-camera participants as viewport-edge arrows with a small phone glyph, short client ID and distance. The overlay is intentionally screen-space and remains visible through physical walls.
+- Participant visualization uses only compact shared-site pose data already sent by Live AR; no remote camera image/video is transmitted.
+
 ## 1.0.7
 
 - Add MediaPipe Pose Landmarker Full for temporally confirmed `person` detections while keeping EfficientDet-Lite2 as the object detector and person identity gate.

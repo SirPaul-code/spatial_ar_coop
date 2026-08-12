@@ -16,6 +16,25 @@ data class ProjectedCuboid(val points: List<FloatArray>)
 data class ProjectedJoint(val index: Int, val x: Float, val y: Float, val confidence: Float)
 data class ProjectedSkeleton(val joints: List<ProjectedJoint>)
 data class ProjectedPose(val joints: List<ProjectedJoint>)
+data class ProjectedPoint(val x: Float, val y: Float)
+data class ProjectedParticipantGizmo(
+    val right: ProjectedPoint?,
+    val up: ProjectedPoint?,
+    val forward: ProjectedPoint?
+)
+data class ProjectedParticipant(
+    val clientId: String,
+    val role: String,
+    val x: Float,
+    val y: Float,
+    val onScreen: Boolean,
+    val distanceMeters: Float,
+    val ageMs: Long,
+    val tracking: String,
+    val offscreenDx: Float,
+    val offscreenDy: Float,
+    val gizmo: ProjectedParticipantGizmo? = null
+)
 
 data class ProjectedTrack(
     val key: String,
@@ -99,9 +118,39 @@ class SpatialOverlayView @JvmOverloads constructor(
         strokeWidth = 1.5f * density
         color = Color.argb(160, 120, 149, 178)
     }
+    private val participantStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.1f * density
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.rgb(91, 213, 190)
+    }
+    private val participantFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.argb(62, 91, 213, 190)
+    }
+    private val participantAxisRight = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(235, 92, 92)
+    }
+    private val participantAxisUp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(92, 214, 126)
+    }
+    private val participantAxisForward = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.2f * density
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(94, 145, 235)
+    }
     @Volatile private var tracks: List<ProjectedTrack> = emptyList()
     @Volatile private var boxes: List<ProjectedBox> = emptyList()
     @Volatile private var localPoses: List<ProjectedPose> = emptyList()
+    @Volatile private var participants: List<ProjectedParticipant> = emptyList()
     @Volatile private var scan = ScanOverlayState()
     @Volatile private var showScan = false
 
@@ -120,6 +169,11 @@ class SpatialOverlayView @JvmOverloads constructor(
         postInvalidateOnAnimation()
     }
 
+    fun updateParticipants(values: List<ProjectedParticipant>) {
+        participants = values
+        postInvalidateOnAnimation()
+    }
+
     fun updateScanState(value: ScanOverlayState, visible: Boolean = true) {
         scan = value
         showScan = visible
@@ -131,6 +185,7 @@ class SpatialOverlayView @JvmOverloads constructor(
         boxes.forEach { drawDetectionBox(canvas, it) }
         localPoses.forEach { drawLocalPose(canvas, it) }
         tracks.forEach { track -> if (track.onScreen) drawTrack(canvas, track) else drawOffscreen(canvas, track) }
+        participants.forEach { drawParticipant(canvas, it) }
         if (showScan) drawScanCard(canvas)
         drawReticle(canvas)
     }
@@ -295,6 +350,92 @@ class SpatialOverlayView @JvmOverloads constructor(
         val background = RectF(box.rectangle.left, box.rectangle.top - 24f * density, box.rectangle.left + labelWidth, box.rectangle.top)
         canvas.drawRoundRect(background, 5f * density, 5f * density, panel)
         canvas.drawText(label, background.left + 6f * density, background.bottom - 6f * density, text)
+    }
+
+    private fun drawParticipant(canvas: Canvas, participant: ProjectedParticipant) {
+        val ageAlpha = (255 - (participant.ageMs / 14L).toInt()).coerceIn(82, 255)
+        participantStroke.alpha = ageAlpha
+        participantFill.alpha = (ageAlpha * 0.24f).toInt().coerceIn(24, 96)
+        participantAxisRight.alpha = ageAlpha
+        participantAxisUp.alpha = ageAlpha
+        participantAxisForward.alpha = ageAlpha
+
+        if (!participant.onScreen) {
+            drawParticipantOffscreen(canvas, participant)
+            return
+        }
+
+        participant.gizmo?.let { gizmo ->
+            drawParticipantAxis(canvas, participant.x, participant.y, gizmo.right, participantAxisRight)
+            drawParticipantAxis(canvas, participant.x, participant.y, gizmo.up, participantAxisUp)
+            drawParticipantAxis(canvas, participant.x, participant.y, gizmo.forward, participantAxisForward)
+        }
+        drawPhoneGlyph(canvas, participant.x, participant.y)
+
+        val shortId = participant.clientId.substringAfterLast('-').takeLast(8).ifBlank { participant.clientId.takeLast(8) }
+        val title = "phone · $shortId"
+        val detail = "%.1f m · %s".format(participant.distanceMeters, participant.tracking.lowercase())
+        val panelWidth = maxOf(text.measureText(title), subText.measureText(detail)) + 18f * density
+        val left = (participant.x - panelWidth / 2f).coerceIn(6f * density, width - panelWidth - 6f * density)
+        val top = (participant.y - 66f * density).coerceAtLeast(6f * density)
+        val rect = RectF(left, top, left + panelWidth, top + 38f * density)
+        canvas.drawRoundRect(rect, 7f * density, 7f * density, panel)
+        canvas.drawText(title, rect.left + 9f * density, rect.top + 15f * density, text)
+        canvas.drawText(detail, rect.left + 9f * density, rect.top + 31f * density, subText)
+    }
+
+    private fun drawParticipantAxis(
+        canvas: Canvas,
+        originX: Float,
+        originY: Float,
+        endpoint: ProjectedPoint?,
+        paint: Paint
+    ) {
+        endpoint ?: return
+        if (!endpoint.x.isFinite() || !endpoint.y.isFinite()) return
+        canvas.drawLine(originX, originY, endpoint.x, endpoint.y, paint)
+        canvas.drawCircle(endpoint.x, endpoint.y, 2.8f * density, paint)
+    }
+
+    private fun drawParticipantOffscreen(canvas: Canvas, participant: ProjectedParticipant) {
+        val direction = OffscreenDirection(participant.offscreenDx, participant.offscreenDy)
+        val point = OffscreenIndicatorMath.edgePoint(width.toFloat(), height.toFloat(), 40f * density, direction)
+        val angle = atan2(direction.dy, direction.dx)
+        val arrow = Path().apply {
+            moveTo(point.x + kotlin.math.cos(angle) * 15f * density, point.y + kotlin.math.sin(angle) * 15f * density)
+            lineTo(point.x + kotlin.math.cos(angle + 2.55f) * 11f * density, point.y + kotlin.math.sin(angle + 2.55f) * 11f * density)
+            lineTo(point.x + kotlin.math.cos(angle - 2.55f) * 11f * density, point.y + kotlin.math.sin(angle - 2.55f) * 11f * density)
+            close()
+        }
+        canvas.drawPath(arrow, participantFill)
+        canvas.drawPath(arrow, participantStroke)
+
+        val phoneX = point.x - kotlin.math.cos(angle) * 22f * density
+        val phoneY = point.y - kotlin.math.sin(angle) * 22f * density
+        drawPhoneGlyph(canvas, phoneX, phoneY, 0.72f)
+
+        val shortId = participant.clientId.substringAfterLast('-').takeLast(6).ifBlank { participant.clientId.takeLast(6) }
+        val label = "phone $shortId · %.1fm".format(participant.distanceMeters)
+        val labelWidth = subText.measureText(label)
+        val labelX = (point.x - labelWidth / 2f).coerceIn(8f * density, width - labelWidth - 8f * density)
+        val labelY = (point.y - 22f * density).coerceIn(16f * density, height - 12f * density)
+        canvas.drawText(label, labelX, labelY, subText)
+    }
+
+    private fun drawPhoneGlyph(canvas: Canvas, centerX: Float, centerY: Float, scale: Float = 1f) {
+        val halfWidth = 9f * density * scale
+        val halfHeight = 15f * density * scale
+        val body = RectF(centerX - halfWidth, centerY - halfHeight, centerX + halfWidth, centerY + halfHeight)
+        canvas.drawRoundRect(body, 4f * density * scale, 4f * density * scale, participantFill)
+        canvas.drawRoundRect(body, 4f * density * scale, 4f * density * scale, participantStroke)
+        canvas.drawCircle(centerX, body.top + 3.5f * density * scale, 1.2f * density * scale, participantStroke)
+        canvas.drawLine(
+            centerX - 3f * density * scale,
+            body.bottom - 3f * density * scale,
+            centerX + 3f * density * scale,
+            body.bottom - 3f * density * scale,
+            participantStroke
+        )
     }
 
     private fun drawScanCard(canvas: Canvas) {
