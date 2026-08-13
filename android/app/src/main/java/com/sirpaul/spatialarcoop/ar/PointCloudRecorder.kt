@@ -43,8 +43,9 @@ class PointCloudRecorder(
                 while (buffer.remaining() >= 4 && points.size < MAX_POINTS_PER_CHUNK) {
                     val world = floatArrayOf(buffer.get(), buffer.get(), buffer.get())
                     val confidence = buffer.get()
-                    if (confidence < MIN_CONFIDENCE) continue
+                    if (!confidence.isFinite() || confidence < MIN_CONFIDENCE || world.any { !it.isFinite() }) continue
                     val site = PoseMath.transformPoint(siteFromWorld, world)
+                    if (site.any { !it.isFinite() }) continue
                     val key = VoxelKey(
                         floor(site[0] / VOXEL_METERS).toInt(),
                         floor(site[1] / VOXEL_METERS).toInt(),
@@ -98,8 +99,6 @@ class PointCloudRecorder(
                 mapOf("mapId" to mapId, "chunkId" to chunkId, "pointCount" to snapshot.size, "bytes" to finalFile.length())
             )
         }.onFailure { error ->
-            // A valid final or temporary file is already durable. Drop the in-memory snapshot so
-            // it is not duplicated under another chunk ID; ScanRecovery will register/promote it.
             val durableFile = listOf(finalFile, temporary).firstOrNull { candidate ->
                 candidate.exists() && runCatching {
                     ScanChunkCodec.readMetadata(candidate).pointCount == snapshot.size
