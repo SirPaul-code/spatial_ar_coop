@@ -80,7 +80,7 @@ val requiredModels = listOf(
     Triple(
         "efficientdet-lite0.tflite",
         "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite",
-        "df3d841163e688f11274618b03a1be2036815955b20ee785b19d29f05493ae82"
+        "0720bf247bd76e6594ea28fa9c6f7c5242be774818997dbbeffc4da460c723bb"
     ),
     Triple(
         "efficientdet-lite2.tflite",
