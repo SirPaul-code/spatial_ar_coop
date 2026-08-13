@@ -41,17 +41,14 @@ internal object DetectorPostProcessor {
         capturedAtMs: Long,
         rawWidth: Int,
         rawHeight: Int,
-        captureGeometry: CaptureGeometry?,
-        poses: Map<String, List<PoseLandmark2D>>
+        captureGeometry: CaptureGeometry?
     ): List<Detection2D> = tracked.filter { it.confirmed }.map { detection ->
         val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
-        val pose = poses[detection.temporalId].orEmpty()
-        val contact = if (detection.label == "person") PersonPoseDetector.groundContact(pose) else null
         Detection2D(
             label = detection.label,
             confidence = detection.confidence,
             rawBoundingBox = rawBox,
-            rawBottomCenter = contact ?: floatArrayOf(
+            rawBottomCenter = floatArrayOf(
                 rawBox.centerX(),
                 rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
             ),
@@ -61,7 +58,7 @@ internal object DetectorPostProcessor {
             temporalId = detection.temporalId,
             temporallyConfirmed = true,
             captureGeometry = captureGeometry,
-            poseLandmarks = pose
+            poseLandmarks = emptyList()
         )
     }
 
