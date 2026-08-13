@@ -85,7 +85,7 @@ val requiredModels = listOf(
     Triple(
         "efficientdet-lite2.tflite",
         "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite",
-        "428fde2ea6759f76defd638a2044096b84d4d84fca4c629a9c1bd07f81560abe"
+        "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896"
     ),
     Triple(
         "pose_landmarker_full.task",
