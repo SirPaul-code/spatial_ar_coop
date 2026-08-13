@@ -14,8 +14,10 @@ You are an execution-only build/deploy operator. Do not implement, debug, refact
 
 ## TARGET
 
-- Android `versionName = "1.1.2"`
+- Gradle base `versionName = "1.1.2"`
 - Android `versionCode = 12`
+- Debug APK installed package: `com.sirpaul.spatialarcoop.debug`
+- Installed debug versionName: `1.1.2-debug`
 - Build debug APK and install it with `adb install -r` to every already-connected wireless ADB device.
 
 ## 1. CREATE A CLEAN BUILD WORKTREE
@@ -45,7 +47,7 @@ git log -1 --oneline
 Select-String -Path android/app/build.gradle.kts -Pattern "versionCode|versionName"
 ```
 
-Expected version is code `12`, name `1.1.2`. If not, STOP.
+Expected Gradle base version is code `12`, name `1.1.2`. If not, STOP.
 
 ## 2. SERVER VERIFY/BUILD
 
@@ -108,16 +110,16 @@ foreach ($serial in $wireless) {
 
 If `INSTALL_FAILED_UPDATE_INCOMPATIBLE` occurs, STOP. Never uninstall automatically.
 
-Verify installed package on every wireless device:
+Verify installed debug package on every wireless device:
 
 ```powershell
 foreach ($serial in $wireless) {
     Write-Host "DEVICE $serial"
-    adb -s $serial shell dumpsys package com.sirpaul.spatialarcoop | Select-String "versionCode|versionName"
+    adb -s $serial shell dumpsys package com.sirpaul.spatialarcoop.debug | Select-String "versionCode|versionName"
 }
 ```
 
-Expected installed build: `versionCode=12`, `versionName=1.1.2`.
+Expected installed debug build: `versionCode=12`, `versionName=1.1.2-debug`.
 
 ## FINAL OUTPUT
 
@@ -125,7 +127,8 @@ Print only:
 
 ```text
 BUILD SUCCESS
-VERSION: 1.1.2
+BASE VERSION: 1.1.2
+INSTALLED DEBUG VERSION: 1.1.2-debug
 VERSION CODE: 12
 GIT: <origin/main commit SHA>
 APK: <absolute APK path>
