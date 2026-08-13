@@ -1,120 +1,114 @@
 # CODEX TODO — BUILD/DEPLOY ONLY
 
-You are an execution-only build/deploy operator for this repository.
+You are an execution-only build/deploy operator. Do not implement, debug, refactor or edit project source code.
 
 ## HARD RULES
 
-- DO NOT design, refactor, debug or implement source code.
-- DO NOT edit source files.
-- DO NOT create commits or push code.
+- DO NOT modify, reset, stash or delete the user's current working tree.
+- DO NOT write source-code fixes.
+- DO NOT commit or push.
 - DO NOT browse the web.
-- DO NOT reset/stash/delete user work.
 - DO NOT uninstall the Android app or clear app data.
-- If a build/test fails, STOP and print the exact failing command and relevant error only.
-- Remote `main` is the source of truth once the working tree is clean.
+- If any test/build fails, STOP and print only the failing command plus relevant error output.
+- Build only the latest `origin/main`.
 
-## TARGET BUILD
+## TARGET
 
-Expected Android build after the current TODO lands:
+- Android `versionName = "1.1.2"`
+- Android `versionCode = 12`
+- Build debug APK and install it with `adb install -r` to every already-connected wireless ADB device.
 
-- versionName: `1.1.2`
-- versionCode: `12`
-- APK: `android/app/build/outputs/apk/debug/app-debug.apk`
+## 1. CREATE A CLEAN BUILD WORKTREE
 
-## 1. UPDATE
+The current checkout may contain old local 1.1.1 source changes. LEAVE THEM COMPLETELY UNTOUCHED.
 
-From repository root:
-
-```powershell
-git status --porcelain
-```
-
-If there are source changes outside generated model files and `server/node_modules/**`, STOP and show them. Do not overwrite them.
-
-If clean enough to update:
+From the existing repository:
 
 ```powershell
+$sourceRoot = (git rev-parse --show-toplevel).Trim()
 git fetch origin
-git switch main
-git pull --ff-only origin main
-git log -1 --oneline
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$buildRoot = Join-Path $env:TEMP ("spatial_ar_coop_build_" + [guid]::NewGuid().ToString("N"))
+git worktree add --detach $buildRoot origin/main
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
-## 2. SERVER VERIFICATION
+Copy only local Android build configuration if present. Do not print its contents:
 
 ```powershell
-cd server
+if (Test-Path (Join-Path $sourceRoot "android/local.properties")) {
+    Copy-Item (Join-Path $sourceRoot "android/local.properties") (Join-Path $buildRoot "android/local.properties")
+}
+Set-Location $buildRoot
+git log -1 --oneline
+Select-String -Path android/app/build.gradle.kts -Pattern "versionCode|versionName"
+```
+
+Expected version is code `12`, name `1.1.2`. If not, STOP.
+
+## 2. SERVER VERIFY/BUILD
+
+```powershell
+Set-Location (Join-Path $buildRoot "server")
 npm ci
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 npm test
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 npm run check
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-cd ..
+Set-Location $buildRoot
 ```
 
-If Docker is already available, building the server image is allowed but optional:
+If Docker is already available, you MAY build the image, but DO NOT deploy or reconfigure the running server:
 
 ```powershell
 docker info
+if ($LASTEXITCODE -eq 0) {
+    docker build -t spatial-ar-coop-server:1.1.2 ./server
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 ```
 
-If that succeeds:
+## 3. BUILD APK
 
 ```powershell
-docker build -t spatial-ar-coop-server:1.1.2 ./server
-```
-
-Do not deploy/reconfigure the running server automatically.
-
-## 3. ANDROID BUILD
-
-Verify `android/local.properties` exists. Do not print secrets.
-
-```powershell
-Select-String -Path android/app/build.gradle.kts -Pattern "versionCode|versionName"
-cd android
+Set-Location (Join-Path $buildRoot "android")
 .\gradlew.bat --no-daemon --stacktrace testDebugUnitTest assembleDebug
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-cd ..
-```
+Set-Location $buildRoot
 
-Verify APK:
-
-```powershell
-$apk = "android/app/build/outputs/apk/debug/app-debug.apk"
+$apk = Join-Path $buildRoot "android/app/build/outputs/apk/debug/app-debug.apk"
 if (!(Test-Path $apk)) { throw "APK WAS NOT CREATED" }
+$hash = (Get-FileHash $apk -Algorithm SHA256).Hash
 Get-Item $apk
-Get-FileHash $apk -Algorithm SHA256
+Write-Host "SHA256 $hash"
 ```
 
-Expected: `versionCode = 12`, `versionName = "1.1.2"`.
+## 4. WIRELESS ADB INSTALL
 
-## 4. WIRELESS ADB DEPLOY
-
-Use only devices that are already paired/connected and shown as `device` by ADB. Do not attempt pairing, network discovery, rooting or USB-mode changes.
+Use ONLY devices already paired/connected to ADB. Do not perform pairing, discovery, rooting, network reconfiguration or USB-mode changes.
 
 ```powershell
 adb start-server
 adb devices -l
+$wireless = adb devices | Select-String "\sdevice$" | ForEach-Object { ($_ -split "\s+")[0] } | Where-Object { $_ -match ":" }
 ```
 
-Collect all authorized devices whose serial contains `:` (ADB-over-network/wireless). If none exist, print `APK READY — NO WIRELESS ADB DEVICE CONNECTED` and stop without modifying anything.
+If `$wireless.Count -eq 0`, print `APK READY — NO WIRELESS ADB DEVICE CONNECTED` and stop successfully.
 
-For every authorized wireless device, install the SAME already-built APK without rebuilding:
+Otherwise install the SAME built APK on every available wireless device without rebuilding:
 
 ```powershell
-$apk = "android/app/build/outputs/apk/debug/app-debug.apk"
-$wireless = adb devices | Select-String "\sdevice$" | ForEach-Object { ($_ -split "\s+")[0] } | Where-Object { $_ -match ":" }
 foreach ($serial in $wireless) {
     adb -s $serial install -r $apk
     if ($LASTEXITCODE -ne 0) { throw "ADB install failed on $serial" }
 }
 ```
 
-If `INSTALL_FAILED_UPDATE_INCOMPATIBLE` occurs, STOP. Do not uninstall anything.
+If `INSTALL_FAILED_UPDATE_INCOMPATIBLE` occurs, STOP. Never uninstall automatically.
 
-After install, verify each device:
+Verify installed package on every wireless device:
 
 ```powershell
 foreach ($serial in $wireless) {
@@ -123,7 +117,7 @@ foreach ($serial in $wireless) {
 }
 ```
 
-Expected installed build: versionCode `12`, versionName `1.1.2`.
+Expected installed build: `versionCode=12`, `versionName=1.1.2`.
 
 ## FINAL OUTPUT
 
@@ -133,8 +127,8 @@ Print only:
 BUILD SUCCESS
 VERSION: 1.1.2
 VERSION CODE: 12
-GIT: <commit SHA>
-APK: android/app/build/outputs/apk/debug/app-debug.apk
+GIT: <origin/main commit SHA>
+APK: <absolute APK path>
 SHA256: <hash>
 WIRELESS DEVICES INSTALLED: <serials or none>
 ```
