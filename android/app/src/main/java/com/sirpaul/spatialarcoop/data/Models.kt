@@ -176,6 +176,10 @@ data class SpatialTrack(
     val yawRadians: Float = 0f,
     /** Optional compact person skeleton; each joint is relative to position in shared-site meters. */
     val poseJoints: List<PoseJoint> = emptyList(),
+    val spatialMethod: String = "unknown",
+    val terrainY: Float? = null,
+    val depthConfidence: Float? = null,
+    val hitCount: Int = 0,
     val serverReceivedAtMs: Long = System.currentTimeMillis()
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -188,6 +192,10 @@ data class SpatialTrack(
         .put("observedAtMs", observedAtMs)
         .put("extentMeters", JSONArray(extentMeters.map { it.toDouble() }))
         .put("yawRadians", yawRadians)
+        .put("spatialMethod", spatialMethod)
+        .put("terrainY", terrainY ?: JSONObject.NULL)
+        .put("depthConfidence", depthConfidence ?: JSONObject.NULL)
+        .put("hitCount", hitCount)
         .apply {
             if (poseJoints.isNotEmpty()) put("poseJoints", JSONArray(poseJoints.map(PoseJoint::toJson)))
         }
@@ -220,6 +228,10 @@ data class SpatialTrack(
                     ?: defaultTrackExtent(label),
                 yawRadians = json.optDouble("yawRadians", 0.0).toFloat().takeIf(Float::isFinite) ?: 0f,
                 poseJoints = if (label.equals("person", true)) poseJoints else emptyList(),
+                spatialMethod = json.optString("spatialMethod", "unknown").take(48),
+                terrainY = if (json.has("terrainY") && !json.isNull("terrainY")) json.optDouble("terrainY").toFloat().takeIf(Float::isFinite) else null,
+                depthConfidence = if (json.has("depthConfidence") && !json.isNull("depthConfidence")) json.optDouble("depthConfidence").toFloat().takeIf(Float::isFinite)?.coerceIn(0f, 1f) else null,
+                hitCount = json.optInt("hitCount", 0).coerceAtLeast(0),
                 serverReceivedAtMs = System.currentTimeMillis()
             )
         }

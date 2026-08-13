@@ -44,11 +44,13 @@ import com.sirpaul.spatialarcoop.ar.PoseMath
 import com.sirpaul.spatialarcoop.ar.PoseSkeletonBuilder
 import com.sirpaul.spatialarcoop.ar.RemoteTrackStore
 import com.sirpaul.spatialarcoop.ar.SpatialEstimator
+import com.sirpaul.spatialarcoop.ar.TerrainHeightMap
 import com.sirpaul.spatialarcoop.data.AnchorStatus
 import com.sirpaul.spatialarcoop.data.FeatureQuality
 import com.sirpaul.spatialarcoop.data.MapDefinition
 import com.sirpaul.spatialarcoop.data.MapStatus
 import com.sirpaul.spatialarcoop.data.SpatialTrack
+import com.sirpaul.spatialarcoop.net.MapApiClient
 import com.sirpaul.spatialarcoop.net.RealtimeClient
 import com.sirpaul.spatialarcoop.net.RealtimeListener
 import com.sirpaul.spatialarcoop.net.RemoteClientPose
@@ -68,13 +70,16 @@ import com.sirpaul.spatialarcoop.ui.ScanOverlayState
 import com.sirpaul.spatialarcoop.ui.SpatialOverlayView
 import com.sirpaul.spatialarcoop.util.Diagnostics
 import com.sirpaul.spatialarcoop.vision.CaptureGeometry
+import com.sirpaul.spatialarcoop.vision.DepthSnapshot
 import com.sirpaul.spatialarcoop.vision.Detection2D
+import com.sirpaul.spatialarcoop.vision.DetectorRuntimeState
 import com.sirpaul.spatialarcoop.vision.DetectionTracker
 import com.sirpaul.spatialarcoop.vision.ObjectDetectorEngine
 import com.sirpaul.spatialarcoop.vision.SpatialObservation
 import com.sirpaul.spatialarcoop.vision.YuvFrame
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
@@ -145,6 +150,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private val pendingDetection = AtomicReference<PendingDetection?>(null)
     private val remoteTracks = RemoteTrackStore()
     private val remoteClientPoses = ConcurrentHashMap<String, RemoteClientPose>()
+    private val terrainModel = AtomicReference<TerrainHeightMap?>(null)
+    private val terrainLoadStarted = AtomicBoolean(false)
+    private val terrainExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "spatial-terrain-loader") }
+    @Volatile private var detectorRuntimeState: DetectorRuntimeState? = null
     private lateinit var localTracker: DetectionTracker
     private var detector: ObjectDetectorEngine? = null
     @Volatile private var reporting = false
@@ -222,6 +231,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             listener = this
         )
         if (mode == ArMode.SENSOR || mode == ArMode.LIVE) {
+            loadTerrainAsync(map)
             reporting = true
             ensureDetector()
             if (mode == ArMode.LIVE) {
@@ -386,7 +396,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             session = created
             spatialApp.logger.info(
                 "ARCore session configured",
-                mapOf("mapId" to mapId, "profile" to profile.name, "cloudAnchors" to BuildConfig.CLOUD_ANCHORS_CONFIGURED)
+                mapOf(
+                    "mapId" to mapId,
+                    "profile" to profile.name,
+                    "cloudAnchors" to BuildConfig.CLOUD_ANCHORS_CONFIGURED,
+                    "depthSupported" to created.isDepthModeSupported(Config.DepthMode.AUTOMATIC),
+                    "depthEnabled" to (config.depthMode == Config.DepthMode.AUTOMATIC)
+                )
             )
             return created
         } catch (error: Throwable) {
@@ -631,6 +647,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         if (::overlay.isInitialized) overlay.updateParticipants(emptyList())
         cloudAnchors?.close()
         cloudAnchors = null
+        terrainModel.set(null)
+        terrainExecutor.shutdownNow()
         val closingSession = session
         session = null
         runCatching { closingSession?.pause() }
@@ -833,7 +851,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         pendingDetection.getAndSet(null)?.let { pending ->
             val rejected = linkedMapOf<String, Int>()
             val observations = pending.detections.mapNotNull { detection ->
-                val attempt = SpatialEstimator.estimateDetailed(frame, detection, worldFromSite, map.groundY)
+                val attempt = SpatialEstimator.estimateDetailed(
+                    frame, detection, worldFromSite, map.groundY, terrainModel.get()
+                )
                 val estimate = attempt.estimate
                 if (estimate == null) {
                     val reason = attempt.rejectionReason ?: "unknown"
@@ -853,7 +873,10 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         extentMeters = estimate.extentMeters,
                         yawRadians = estimate.yawRadians,
                         requiredHits = estimate.requiredHits,
-                        poseJoints = poseJoints
+                        poseJoints = poseJoints,
+                        spatialMethod = estimate.method,
+                        terrainY = estimate.terrainY,
+                        depthConfidence = estimate.depthConfidence
                     )
                 }
             }
@@ -869,9 +892,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             latestSentTrackCount = if (queued) tracks.size else 0
             if (now - lastDetectorStatusAtMs >= DETECTOR_STATUS_INTERVAL_MS) {
                 lastDetectorStatusAtMs = now
+                val methods = observations.groupingBy { it.spatialMethod }.eachCount()
+                    .entries.sortedByDescending { it.value }.joinToString(",") { "${it.key}:${it.value}" }
                 realtime?.sendStatus(
                     "detecting",
-                    "${pending.detections.size} detected, ${observations.size} spatialized, ${tracks.size} active, ${pending.inferenceMs}ms"
+                    "${pending.detections.size} detected, ${observations.size} spatialized, ${tracks.size} active, ${pending.inferenceMs}ms${if (methods.isBlank()) "" else ", $methods"}"
                 )
                 if (rejected.isNotEmpty()) {
                     spatialApp.logger.debug(
@@ -892,6 +917,34 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             latestLocalTrackCount = tracks.size
             latestSentTrackCount = if (queued) tracks.size else 0
             lastTrackPublishAtMs = now
+        }
+    }
+
+    private fun loadTerrainAsync(map: MapDefinition) {
+        if (!terrainLoadStarted.compareAndSet(false, true)) return
+        terrainExecutor.execute {
+            try {
+                val credential = map.accessKey.ifBlank { spatialApp.preferences.apiToken }
+                val preview = MapApiClient(map.serverUrl, credential, spatialApp.logger)
+                    .getPointCloudPreview(map.id, TERRAIN_POINT_LIMIT)
+                val model = TerrainHeightMap.fromPoints(preview.points, map.groundY)
+                if (!closing.get()) terrainModel.set(model)
+                spatialApp.logger.info(
+                    "Terrain model loaded",
+                    mapOf(
+                        "mapId" to map.id,
+                        "sourcePoints" to preview.sampledPoints,
+                        "serverPoints" to preview.totalPoints,
+                        "cells" to (model?.cellCount ?: 0),
+                        "elevation" to model?.elevationRangeMeters?.let { "${it.start}..${it.endInclusive}" }
+                    )
+                )
+            } catch (error: Throwable) {
+                spatialApp.logger.warn(
+                    "Terrain model unavailable; spatializer will use depth/legacy fallbacks",
+                    mapOf("mapId" to map.id, "error" to (error.message ?: error.javaClass.simpleName))
+                )
+            }
         }
     }
 
@@ -927,7 +980,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             val captureGeometry = CaptureGeometry(
                 siteFromCamera = siteFromCamera,
                 focalLength = intrinsics.focalLength.copyOf(),
-                principalPoint = intrinsics.principalPoint.copyOf()
+                principalPoint = intrinsics.principalPoint.copyOf(),
+                depthSnapshot = if (siteFromCamera != null) DepthSnapshot.capture(frame) else null
             )
             if (detector?.submit(yuv, rotation, now, captureGeometry) == true) lastDetectionCaptureAtMs = now
         } finally {
@@ -949,7 +1003,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                 latestInferenceMs = inferenceMs
                 pendingDetection.set(PendingDetection(values, inferenceMs))
             },
-            onError = { message -> showDetail("Detector error: $message") }
+            onError = { message -> showDetail("Detector error: $message") },
+            onRuntimeState = { state -> detectorRuntimeState = state }
         )
     }
 
@@ -957,6 +1012,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         pendingDetection.set(null)
         detector?.close()
         detector = null
+        detectorRuntimeState = null
         latestLocalTrackCount = 0
         latestSpatializedCount = 0
         latestSentTrackCount = 0
@@ -1394,7 +1450,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                             latestSentTrackCount > 0 -> "server awaiting ack"
                             else -> "server connected"
                         }
-                        "$latestDetectionCount detected · $latestPoseCount pose · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack · $bufferedRemoteTracks remote · ${latestInferenceMs} ms"
+                        val runtime = detectorRuntimeState
+                        val detectorText = runtime?.let {
+                            "${it.profile.model.name.lowercase()}/${it.profile.delegate.name.lowercase()} · drop ${it.droppedFrames}"
+                        } ?: "detector starting"
+                        val terrainText = terrainModel.get()?.let { "terrain ${it.cellCount}" } ?: "terrain fallback"
+                        "$latestDetectionCount detected · $latestPoseCount pose · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack · $bufferedRemoteTracks remote · ${latestInferenceMs} ms · $detectorText · $terrainText"
                     }
                     ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks"
                 }
@@ -1489,8 +1550,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     companion object {
         const val EXTRA_MAP_ID = "map_id"
         const val EXTRA_MODE = "mode"
-        private const val DETECTION_INTERVAL_MS = 120L
-        private const val TRACK_PUBLISH_INTERVAL_MS = 120L
+        private const val DETECTION_INTERVAL_MS = 80L
+        private const val TRACK_PUBLISH_INTERVAL_MS = 100L
         private const val POSE_INTERVAL_MS = 500L
         private const val PARTICIPANT_POSE_TTL_MS = 3_000L
         private const val PARTICIPANT_GIZMO_AXIS_METERS = 0.35f
@@ -1506,5 +1567,6 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         private const val ARCORE_RETRY_SETTLE_DELAY_MS = 550L
         private const val MIN_SETUP_CHUNKS = 2
         private const val MIN_SETUP_POINTS = 1_000
+        private const val TERRAIN_POINT_LIMIT = 50_000
     }
 }

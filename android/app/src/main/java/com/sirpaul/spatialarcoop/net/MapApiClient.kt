@@ -34,6 +34,12 @@ data class MapInvite(
     val deepLink: String
 )
 
+data class PointCloudPreview(
+    val totalPoints: Int,
+    val sampledPoints: Int,
+    val points: List<FloatArray>
+)
+
 class MapApiClient(
     private val serverUrl: String,
     /** May be an owner admin token or a single-map access key. */
@@ -152,6 +158,29 @@ class MapApiClient(
             .header("X-Device-Id", deviceId)
             .post(file.asRequestBody(binaryMediaType))
         execute(request).close()
+    }
+
+    fun getPointCloudPreview(mapId: String, maxPoints: Int = 50_000): PointCloudPreview {
+        val safeMax = maxPoints.coerceIn(100, 50_000)
+        val json = executeJson(Request.Builder().url(url("/api/v1/maps/$mapId/point-cloud?maxPoints=$safeMax")).get())
+        val array = json.optJSONArray("points")
+        val points = buildList {
+            if (array != null) {
+                for (index in 0 until array.length()) {
+                    val point = array.optJSONArray(index) ?: continue
+                    if (point.length() < 3) continue
+                    val values = FloatArray(4) { component ->
+                        point.optDouble(component, if (component == 3) 1.0 else Double.NaN).toFloat()
+                    }
+                    if (values.take(3).all(Float::isFinite)) add(values)
+                }
+            }
+        }
+        return PointCloudPreview(
+            totalPoints = json.optInt("totalPoints", points.size).coerceAtLeast(0),
+            sampledPoints = json.optInt("sampledPoints", points.size).coerceAtLeast(0),
+            points = points
+        )
     }
 
     private fun parseInvite(json: JSONObject): MapInvite = MapInvite(

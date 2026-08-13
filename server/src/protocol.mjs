@@ -77,7 +77,11 @@ function normalizeTrack(track, index) {
     observedAtMs: finiteInt(track.observedAtMs, Date.now()),
     extentMeters: physicalVector(track.extentMeters ?? defaultExtent(label), 3, `track[${index}].extentMeters`),
     yawRadians: finiteNumber(track.yawRadians, 0, -Math.PI, Math.PI),
-    poseJoints: label === 'person' ? normalizePoseJoints(track.poseJoints, index) : []
+    poseJoints: label === 'person' ? normalizePoseJoints(track.poseJoints, index) : [],
+    spatialMethod: limitedString(track.spatialMethod, 48, 'unknown'),
+    terrainY: track.terrainY == null ? null : finiteNumber(track.terrainY, undefined, -10000, 10000, `track[${index}].terrainY`),
+    depthConfidence: track.depthConfidence == null ? null : finiteNumber(track.depthConfidence, undefined, 0, 1, `track[${index}].depthConfidence`),
+    hitCount: Math.max(0, Math.min(100000, finiteInt(track.hitCount, 0)))
   };
 }
 

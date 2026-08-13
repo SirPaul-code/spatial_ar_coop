@@ -1,30 +1,36 @@
 package com.sirpaul.spatialarcoop.vision
 
+import android.app.ActivityManager
 import android.content.Context
 import android.graphics.RectF
+import android.os.Build
+import android.os.SystemClock
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.sirpaul.spatialarcoop.util.FileLogger
 import java.io.Closeable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 
 
 data class CaptureGeometry(
     val siteFromCamera: FloatArray?,
     val focalLength: FloatArray,
-    val principalPoint: FloatArray
+    val principalPoint: FloatArray,
+    val depthSnapshot: DepthSnapshot? = null
 )
 
 data class PoseLandmark2D(
     val index: Int,
-    /** Raw ARCore CPU-image pixel coordinate, not display-rotated coordinate. */
     val x: Float,
     val y: Float,
     val confidence: Float
@@ -41,7 +47,6 @@ data class Detection2D(
     val temporalId: String? = null,
     val temporallyConfirmed: Boolean = true,
     val captureGeometry: CaptureGeometry? = null,
-    /** Selected MediaPipe pose landmarks in raw CPU-image pixels for confirmed people. */
     val poseLandmarks: List<PoseLandmark2D> = emptyList()
 )
 
@@ -50,15 +55,40 @@ class ObjectDetectorEngine(
     private val threshold: Float,
     private val logger: FileLogger,
     private val onResult: (List<Detection2D>, inferenceMs: Long) -> Unit,
-    private val onError: (String) -> Unit
+    private val onError: (String) -> Unit,
+    private val onRuntimeState: (DetectorRuntimeState) -> Unit = {}
 ) : Closeable {
+    private data class PendingFrame(
+        val streamTimestampMs: Long,
+        val capturedAtMs: Long,
+        val rawWidth: Int,
+        val rawHeight: Int,
+        val rotationDegrees: Int,
+        val captureGeometry: CaptureGeometry?
+    )
+
     private val appContext = context.applicationContext
-    private val executor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "spatial-object-detector") }
-    private val busy = AtomicBoolean(false)
+    private val detectorExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "spatial-object-live") }
     private val temporalTracker = TemporalDetectionTracker(threshold)
+    private val pending = ConcurrentHashMap<Long, PendingFrame>()
+    private val streamTimestamp = AtomicLong(SystemClock.uptimeMillis())
+    private val reconfigurePending = AtomicBoolean(false)
+    private val resultLock = Any()
+    private val lowRamDevice = (appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)?.isLowRamDevice == true
+    private val emulator = Build.FINGERPRINT.contains("generic", true) || Build.MODEL.contains("Emulator", true)
+    private val policy = DetectorRuntimePolicy(lowRamDevice || emulator)
+
     @Volatile private var closed = false
-    private var detector: ObjectDetector? = null
+    @Volatile private var detector: ObjectDetector? = null
+    @Volatile private var activeProfile = policy.profile
     private var poseLandmarker: PoseLandmarker? = null
+    private var submittedFrames = 0L
+    private var resultFrames = 0L
+    private var droppedFrames = 0L
+
+    init {
+        detectorExecutor.execute { ensureDetectorOnWorker() }
+    }
 
     fun submit(
         frame: YuvFrame,
@@ -66,87 +96,235 @@ class ObjectDetectorEngine(
         capturedAtMs: Long,
         captureGeometry: CaptureGeometry? = null
     ): Boolean {
-        if (closed || !busy.compareAndSet(false, true)) return false
-        executor.execute {
+        if (closed || reconfigurePending.get()) return false
+        val timestamp = nextStreamTimestamp()
+        submittedFrames += 1
+        detectorExecutor.execute {
+            if (closed) return@execute
             try {
-                val start = System.nanoTime()
+                ensureDetectorOnWorker()
+                if (pending.size >= MAX_PENDING_METADATA) {
+                    pending.keys.sorted().take(pending.size - MAX_PENDING_METADATA + 1).forEach {
+                        if (pending.remove(it) != null) droppedFrames += 1
+                    }
+                }
                 val rawBitmap = YuvFrameConverter.toBitmap(frame)
                 val upright = YuvFrameConverter.rotate(rawBitmap, rotationDegrees)
                 val image = BitmapImageBuilder(upright).build()
+                pending[timestamp] = PendingFrame(
+                    timestamp,
+                    capturedAtMs,
+                    frame.width,
+                    frame.height,
+                    rotationDegrees,
+                    captureGeometry
+                )
                 try {
-                    val result = detector().detect(image)
-                    val rawCandidates = result.detections().mapNotNull { detection ->
-                        val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
-                        val label = category.categoryName().lowercase()
-                        if (label !in ALLOWED_LABELS) return@mapNotNull null
-
-                        val box = detection.boundingBox()
-                        val corners = arrayOf(
-                            YuvFrameConverter.rotatedToRaw(box.left, box.top, frame.width, frame.height, rotationDegrees),
-                            YuvFrameConverter.rotatedToRaw(box.right, box.top, frame.width, frame.height, rotationDegrees),
-                            YuvFrameConverter.rotatedToRaw(box.right, box.bottom, frame.width, frame.height, rotationDegrees),
-                            YuvFrameConverter.rotatedToRaw(box.left, box.bottom, frame.width, frame.height, rotationDegrees)
-                        )
-                        DetectionCandidate2D(
-                            label = label,
-                            confidence = category.score(),
-                            left = corners.minOf { it[0] },
-                            top = corners.minOf { it[1] },
-                            right = corners.maxOf { it[0] },
-                            bottom = corners.maxOf { it[1] }
-                        )
-                    }
-
-                    val candidates = suppressOverlaps(rawCandidates)
-                    val tracked = temporalTracker.update(candidates, capturedAtMs)
-                    val confirmed = tracked.filter { it.confirmed }
-                    val poseByTemporalId = if (confirmed.any { it.label == "person" }) {
-                        detectPersonPoses(
-                            image = image,
-                            uprightWidth = upright.width,
-                            uprightHeight = upright.height,
-                            rawWidth = frame.width,
-                            rawHeight = frame.height,
-                            rotationDegrees = rotationDegrees,
-                            people = confirmed.filter { it.label == "person" }
-                        )
-                    } else emptyMap()
-
-                    val detections = confirmed.map { detection ->
-                        val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
-                        val pose = poseByTemporalId[detection.temporalId].orEmpty()
-                        val contact = if (detection.label == "person") poseGroundContact(pose) else null
-                        Detection2D(
-                            label = detection.label,
-                            confidence = detection.confidence,
-                            rawBoundingBox = rawBox,
-                            rawBottomCenter = contact ?: floatArrayOf(
-                                rawBox.centerX(),
-                                rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
-                            ),
-                            capturedAtMs = capturedAtMs,
-                            rawImageWidth = frame.width,
-                            rawImageHeight = frame.height,
-                            temporalId = detection.temporalId,
-                            temporallyConfirmed = true,
-                            captureGeometry = captureGeometry,
-                            poseLandmarks = pose
-                        )
-                    }
-                    onResult(detections, (System.nanoTime() - start) / 1_000_000L)
+                    detector?.detectAsync(image, timestamp)
                 } finally {
                     image.close()
                     if (upright !== rawBitmap) upright.recycle()
                     rawBitmap.recycle()
                 }
             } catch (error: Throwable) {
-                logger.error("Object detection failed", error)
-                onError(error.message ?: error.javaClass.simpleName)
-            } finally {
-                busy.set(false)
+                pending.remove(timestamp)
+                handleDetectorFailure(error)
             }
         }
+        emitRuntimeState("submitted")
         return true
+    }
+
+    private fun nextStreamTimestamp(): Long {
+        while (true) {
+            val previous = streamTimestamp.get()
+            val next = maxOf(SystemClock.uptimeMillis(), previous + 1L)
+            if (streamTimestamp.compareAndSet(previous, next)) return next
+        }
+    }
+
+    private fun ensureDetectorOnWorker() {
+        if (closed || detector != null) return
+        var profile = activeProfile
+        try {
+            detector = createDetector(profile)
+        } catch (gpuError: Throwable) {
+            if (profile.delegate != DetectorDelegateProfile.GPU) throw gpuError
+            logger.warn(
+                "GPU object detector initialization failed; falling back to CPU",
+                mapOf("model" to profile.model.displayName, "error" to (gpuError.message ?: gpuError.javaClass.simpleName))
+            )
+            profile = policy.gpuFailure(System.currentTimeMillis()) ?: profile.copy(delegate = DetectorDelegateProfile.CPU)
+            activeProfile = profile
+            detector = createDetector(profile)
+        }
+        activeProfile = profile
+        logger.info(
+            "Object detector live stream initialized",
+            mapOf(
+                "model" to profile.model.displayName,
+                "delegate" to profile.delegate.name,
+                "runningMode" to RunningMode.LIVE_STREAM.name,
+                "userThreshold" to threshold,
+                "lowRam" to lowRamDevice,
+                "emulator" to emulator
+            )
+        )
+        emitRuntimeState("ready")
+    }
+
+    private fun createDetector(profile: DetectorRuntimeProfile): ObjectDetector {
+        val modelThreshold = minOf(threshold, MIN_MODEL_SCORE_THRESHOLD)
+        val baseOptions = BaseOptions.builder()
+            .setModelAssetPath(profile.model.assetName)
+            .setDelegate(if (profile.delegate == DetectorDelegateProfile.GPU) Delegate.GPU else Delegate.CPU)
+            .build()
+        val options = ObjectDetector.ObjectDetectorOptions.builder()
+            .setBaseOptions(baseOptions)
+            .setScoreThreshold(modelThreshold)
+            .setCategoryAllowlist(ALLOWED_LABELS.toList())
+            .setMaxResults(MAX_RESULTS)
+            .setRunningMode(RunningMode.LIVE_STREAM)
+            .setResultListener { result, inputImage -> handleLiveResult(result, inputImage) }
+            .setErrorListener { error -> handleDetectorFailure(error) }
+            .build()
+        return ObjectDetector.createFromOptions(appContext, options)
+    }
+
+    private fun handleLiveResult(result: ObjectDetectorResult, inputImage: MPImage) {
+        synchronized(resultLock) {
+            if (closed) return
+            val timestamp = result.timestampMs()
+            val metadata = pending.remove(timestamp) ?: run {
+                droppedFrames += 1
+                emitRuntimeState("orphan result")
+                return
+            }
+            val dropped = pending.keys.filter { it < timestamp }
+            for (old in dropped) if (pending.remove(old) != null) droppedFrames += 1
+            val latencyMs = (System.currentTimeMillis() - metadata.capturedAtMs).coerceAtLeast(0L)
+            try {
+                val rawCandidates = result.detections().mapNotNull { detection ->
+                    val category = detection.categories().maxByOrNull { it.score() } ?: return@mapNotNull null
+                    val label = category.categoryName().lowercase()
+                    if (label !in ALLOWED_LABELS) return@mapNotNull null
+                    val box = detection.boundingBox()
+                    val corners = arrayOf(
+                        YuvFrameConverter.rotatedToRaw(box.left, box.top, metadata.rawWidth, metadata.rawHeight, metadata.rotationDegrees),
+                        YuvFrameConverter.rotatedToRaw(box.right, box.top, metadata.rawWidth, metadata.rawHeight, metadata.rotationDegrees),
+                        YuvFrameConverter.rotatedToRaw(box.right, box.bottom, metadata.rawWidth, metadata.rawHeight, metadata.rotationDegrees),
+                        YuvFrameConverter.rotatedToRaw(box.left, box.bottom, metadata.rawWidth, metadata.rawHeight, metadata.rotationDegrees)
+                    )
+                    DetectionCandidate2D(
+                        label = label,
+                        confidence = category.score(),
+                        left = corners.minOf { it[0] },
+                        top = corners.minOf { it[1] },
+                        right = corners.maxOf { it[0] },
+                        bottom = corners.maxOf { it[1] }
+                    )
+                }
+
+                val candidates = suppressOverlaps(rawCandidates)
+                val tracked = temporalTracker.update(candidates, metadata.capturedAtMs)
+                val confirmed = tracked.filter { it.confirmed }
+                val poseByTemporalId = if (confirmed.any { it.label == "person" }) {
+                    detectPersonPoses(
+                        image = inputImage,
+                        uprightWidth = inputImage.width,
+                        uprightHeight = inputImage.height,
+                        rawWidth = metadata.rawWidth,
+                        rawHeight = metadata.rawHeight,
+                        rotationDegrees = metadata.rotationDegrees,
+                        people = confirmed.filter { it.label == "person" }
+                    )
+                } else emptyMap()
+
+                val detections = confirmed.map { detection ->
+                    val rawBox = RectF(detection.left, detection.top, detection.right, detection.bottom)
+                    val pose = poseByTemporalId[detection.temporalId].orEmpty()
+                    val contact = if (detection.label == "person") poseGroundContact(pose) else null
+                    Detection2D(
+                        label = detection.label,
+                        confidence = detection.confidence,
+                        rawBoundingBox = rawBox,
+                        rawBottomCenter = contact ?: floatArrayOf(
+                            rawBox.centerX(),
+                            rawBox.bottom - rawBox.height() * BOTTOM_CENTER_INSET
+                        ),
+                        capturedAtMs = metadata.capturedAtMs,
+                        rawImageWidth = metadata.rawWidth,
+                        rawImageHeight = metadata.rawHeight,
+                        temporalId = detection.temporalId,
+                        temporallyConfirmed = true,
+                        captureGeometry = metadata.captureGeometry,
+                        poseLandmarks = pose
+                    )
+                }
+                resultFrames += 1
+                onResult(detections, latencyMs)
+                policy.observeLatency(latencyMs, System.currentTimeMillis())?.let(::requestReconfigure)
+                emitRuntimeState("live")
+            } catch (error: Throwable) {
+                logger.error("Object detector result processing failed", error)
+                onError(error.message ?: error.javaClass.simpleName)
+            }
+        }
+    }
+
+    private fun requestReconfigure(profile: DetectorRuntimeProfile) {
+        if (closed || profile == activeProfile || !reconfigurePending.compareAndSet(false, true)) return
+        detectorExecutor.execute {
+            try {
+                val old = activeProfile
+                detector?.close()
+                detector = null
+                pending.clear()
+                activeProfile = profile
+                ensureDetectorOnWorker()
+                logger.info(
+                    "Object detector runtime profile changed",
+                    mapOf("from" to "${old.model.name}/${old.delegate.name}", "to" to "${profile.model.name}/${profile.delegate.name}")
+                )
+            } catch (error: Throwable) {
+                handleDetectorFailure(error)
+            } finally {
+                reconfigurePending.set(false)
+            }
+        }
+    }
+
+    private fun handleDetectorFailure(error: Throwable) {
+        if (closed) return
+        logger.warn(
+            "Object detector live stream error",
+            mapOf(
+                "model" to activeProfile.model.displayName,
+                "delegate" to activeProfile.delegate.name,
+                "error" to (error.message ?: error.javaClass.simpleName)
+            )
+        )
+        if (activeProfile.delegate == DetectorDelegateProfile.GPU) {
+            val fallback = policy.gpuFailure(System.currentTimeMillis())
+                ?: activeProfile.copy(delegate = DetectorDelegateProfile.CPU)
+            requestReconfigure(fallback)
+        } else {
+            onError(error.message ?: error.javaClass.simpleName)
+        }
+    }
+
+    private fun emitRuntimeState(note: String) {
+        onRuntimeState(
+            DetectorRuntimeState(
+                profile = activeProfile,
+                ewmaLatencyMs = policy.ewmaLatencyMs,
+                submittedFrames = submittedFrames,
+                resultFrames = resultFrames,
+                droppedFrames = droppedFrames,
+                switches = policy.switches,
+                note = note
+            )
+        )
     }
 
     private fun detectPersonPoses(
@@ -191,39 +369,8 @@ class ObjectDetectorEngine(
                 }
             }
         }.onFailure { error ->
-            // Pose is an enhancement. A pose failure must never take object detection or sharing down.
             logger.warn("Pose landmark detection failed", mapOf("error" to (error.message ?: error.javaClass.simpleName)))
         }.getOrDefault(emptyMap())
-    }
-
-    private fun detector(): ObjectDetector {
-        detector?.let { return it }
-        val modelThreshold = minOf(threshold, MIN_MODEL_SCORE_THRESHOLD)
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("efficientdet-lite2.tflite")
-            .setDelegate(Delegate.CPU)
-            .build()
-        val options = ObjectDetector.ObjectDetectorOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setScoreThreshold(modelThreshold)
-            .setCategoryAllowlist(ALLOWED_LABELS.toList())
-            .setMaxResults(MAX_RESULTS)
-            .setRunningMode(RunningMode.IMAGE)
-            .build()
-        return ObjectDetector.createFromOptions(appContext, options).also {
-            detector = it
-            logger.info(
-                "Object detector initialized",
-                mapOf(
-                    "model" to "EfficientDet-Lite2 int8",
-                    "userThreshold" to threshold,
-                    "modelFloor" to modelThreshold,
-                    "temporalHysteresis" to true,
-                    "categoryAllowlist" to ALLOWED_LABELS.joinToString(),
-                    "maxResults" to MAX_RESULTS
-                )
-            )
-        }
     }
 
     private fun poseLandmarker(): PoseLandmarker {
@@ -242,17 +389,9 @@ class ObjectDetectorEngine(
             .build()
         return PoseLandmarker.createFromOptions(appContext, options).also {
             poseLandmarker = it
-            logger.info(
-                "Pose landmarker initialized",
-                mapOf(
-                    "model" to "Pose Landmarker Full float16",
-                    "maxPoses" to MAX_POSES,
-                    "sharedJoints" to SHARED_POSE_INDICES.size
-                )
-            )
+            logger.info("Pose landmarker initialized", mapOf("model" to "Pose Landmarker Full float16", "maxPoses" to MAX_POSES))
         }
     }
-
 
     private fun poseGroundContact(pose: List<PoseLandmark2D>): FloatArray? {
         val feet = pose.filter { it.index in POSE_GROUND_INDICES && it.confidence >= POSE_GROUND_CONFIDENCE }
@@ -316,14 +455,17 @@ class ObjectDetectorEngine(
     override fun close() {
         if (closed) return
         closed = true
-        temporalTracker.clear()
-        executor.execute {
+        pending.clear()
+        synchronized(resultLock) {
+            temporalTracker.clear()
             poseLandmarker?.close()
             poseLandmarker = null
-            detector?.close()
+        }
+        detectorExecutor.execute {
+            runCatching { detector?.close() }
             detector = null
         }
-        executor.shutdown()
+        detectorExecutor.shutdown()
     }
 
     private data class PoseCandidate(
@@ -361,6 +503,7 @@ class ObjectDetectorEngine(
         private const val BOTTOM_CENTER_INSET = 0.04f
         private const val MAX_RESULTS = 40
         private const val MAX_POSES = 4
+        private const val MAX_PENDING_METADATA = 8
         private const val POSE_DETECTION_CONFIDENCE = 0.48f
         private const val POSE_PRESENCE_CONFIDENCE = 0.45f
         private const val POSE_TRACKING_CONFIDENCE = 0.50f

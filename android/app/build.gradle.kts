@@ -36,8 +36,8 @@ android {
         applicationId = "com.sirpaul.spatialarcoop"
         minSdk = 26
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.0.8"
+        versionCode = 10
+        versionName = "1.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${defaultServerUrl.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
@@ -97,6 +97,12 @@ data class VerifiedModel(
     val sha256: String
 )
 
+val objectDetectorFastModel = VerifiedModel(
+    assetName = "efficientdet-lite0.tflite",
+    url = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite",
+    bytes = 4_602_795L,
+    sha256 = "0720bf247bd76e6594ea28fa9c6f7c5242be774818997dbbeffc4da460c723bb"
+)
 val objectDetectorModel = VerifiedModel(
     assetName = "efficientdet-lite2.tflite",
     url = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite",
@@ -149,11 +155,12 @@ fun registerVerifiedModelTask(taskName: String, model: VerifiedModel) = tasks.re
     }
 }
 
+val downloadObjectDetectorFastModel = registerVerifiedModelTask("downloadObjectDetectorFastModel", objectDetectorFastModel)
 val downloadObjectDetectorModel = registerVerifiedModelTask("downloadObjectDetectorModel", objectDetectorModel)
 val downloadPoseLandmarkerModel = registerVerifiedModelTask("downloadPoseLandmarkerModel", poseLandmarkerModel)
 
 tasks.named("preBuild").configure {
-    dependsOn(downloadObjectDetectorModel, downloadPoseLandmarkerModel)
+    dependsOn(downloadObjectDetectorFastModel, downloadObjectDetectorModel, downloadPoseLandmarkerModel)
 }
 
 dependencies {

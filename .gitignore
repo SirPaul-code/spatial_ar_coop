@@ -8,6 +8,13 @@ android/local.properties
 *.keystore
 android/app/src/main/assets/efficientdet-lite0.tflite
 android/app/src/main/assets/efficientdet-lite0.tflite.download
+android/app/src/main/assets/efficientdet-lite2.tflite
+android/app/src/main/assets/efficientdet-lite2.tflite.download
+android/app/src/main/assets/pose_landmarker_full.task
+android/app/src/main/assets/pose_landmarker_full.task.download
+
+# Node dependencies
+server/node_modules/
 
 # Runtime state
 .env

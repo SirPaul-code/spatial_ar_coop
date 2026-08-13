@@ -7,6 +7,7 @@ import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import com.sirpaul.spatialarcoop.data.defaultTrackExtent
 import com.sirpaul.spatialarcoop.vision.CaptureGeometry
+import com.sirpaul.spatialarcoop.vision.DepthContactSample
 import com.sirpaul.spatialarcoop.vision.Detection2D
 import kotlin.math.PI
 import kotlin.math.atan2
@@ -18,8 +19,9 @@ data class EstimatedPosition(
     val method: String,
     val extentMeters: FloatArray,
     val yawRadians: Float,
-    /** Noisy monocular/depth fallbacks must be stable for more frames before network publication. */
-    val requiredHits: Int = 2
+    val requiredHits: Int = 2,
+    val terrainY: Float? = null,
+    val depthConfidence: Float? = null
 )
 
 data class SpatialEstimateAttempt(
@@ -32,14 +34,16 @@ object SpatialEstimator {
         frame: Frame,
         detection: Detection2D,
         worldFromSite: FloatArray,
-        groundY: Float?
-    ): EstimatedPosition? = estimateDetailed(frame, detection, worldFromSite, groundY).estimate
+        groundY: Float?,
+        terrain: TerrainHeightMap? = null
+    ): EstimatedPosition? = estimateDetailed(frame, detection, worldFromSite, groundY, terrain).estimate
 
     fun estimateDetailed(
         frame: Frame,
         detection: Detection2D,
         worldFromSite: FloatArray,
-        groundY: Float?
+        groundY: Float?,
+        terrain: TerrainHeightMap? = null
     ): SpatialEstimateAttempt {
         if (frame.camera.trackingState != TrackingState.TRACKING) return rejected("camera-not-tracking")
         if (!detection.temporallyConfirmed) return rejected("temporal-not-confirmed")
@@ -50,24 +54,52 @@ object SpatialEstimator {
             captured
         } ?: currentGeometry(frame, worldFromSite)
 
-        if (groundY != null && detection.label in GROUND_CONTACT_LABELS) {
-            val ground = intersectGround(detection.rawBottomCenter, geometry, groundY)
-            if (ground != null && hasPlausibleApparentScale(detection, ground, geometry)) {
-                return accepted(
-                    detection = detection,
-                    position = ground,
-                    geometry = geometry,
-                    uncertainty = if (captureGeometry != null) 0.22f else 0.36f,
-                    method = if (captureGeometry != null) "ground-capture-site" else "ground-current",
-                    requiredHits = 2
-                )
+        if (detection.label in GROUND_CONTACT_LABELS) {
+            depthContact(detection, geometry, terrain)?.let { solution ->
+                if (hasPlausibleApparentScale(detection, solution.position, geometry)) {
+                    return accepted(
+                        detection,
+                        solution.position,
+                        geometry,
+                        solution.uncertainty,
+                        solution.method,
+                        2,
+                        solution.terrainY,
+                        solution.depthConfidence
+                    )
+                }
+            }
+
+            terrainContact(detection, geometry, terrain)?.let { solution ->
+                if (hasPlausibleApparentScale(detection, solution.position, geometry)) {
+                    return accepted(
+                        detection,
+                        solution.position,
+                        geometry,
+                        solution.uncertainty,
+                        solution.method,
+                        2,
+                        solution.terrainY
+                    )
+                }
+            }
+
+            if (groundY != null) {
+                val ground = intersectGround(detection.rawBottomCenter, geometry, groundY)
+                if (ground != null && hasPlausibleApparentScale(detection, ground, geometry)) {
+                    return accepted(
+                        detection,
+                        ground,
+                        geometry,
+                        if (captureGeometry != null) 0.34f else 0.46f,
+                        if (captureGeometry != null) "ground-capture-fallback" else "ground-current-fallback",
+                        2,
+                        groundY
+                    )
+                }
             }
         }
 
-        // A detector result from CPU image t0 must never be hit-tested against an unrelated ARCore
-        // frame t1 after inference. Current-frame plane/depth is valid only for callers that did not
-        // provide capture geometry (manual/current-frame paths). Live detector results use either
-        // capture-time ground geometry above or the guarded capture-time monocular fallback below.
         val bestHit = if (captureGeometry == null) {
             val image = detection.rawBottomCenter
             val view = FloatArray(2)
@@ -88,30 +120,33 @@ object SpatialEstimator {
         } else null
 
         if (bestHit != null) {
-            val site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
+            var site = PoseMath.transformPoint(siteFromWorld, bestHit.hitPose.translation)
+            val localTerrain = terrain?.heightAt(site[0], site[2])
+            if (localTerrain != null && detection.label in GROUND_CONTACT_LABELS &&
+                kotlin.math.abs(site[1] - localTerrain.y) <= MAX_TERRAIN_SNAP_METERS
+            ) {
+                site = site.copyOf().also { it[1] = localTerrain.y }
+            }
             if (hasPlausibleApparentScale(detection, site, geometry)) {
                 val (uncertainty, method, requiredHits) = when (bestHit.trackable) {
-                    is Plane -> Triple(0.44f, "plane-current-fallback", 2)
-                    is DepthPoint -> Triple(0.72f, "depth-current-fallback", 3)
+                    is Plane -> Triple(0.42f, "plane-current-fallback", 2)
+                    is DepthPoint -> Triple(0.62f, "depthpoint-current-fallback", 3)
                     else -> Triple(0.90f, "hit-current-fallback", 3)
                 }
-                return accepted(detection, site, geometry, uncertainty, method, requiredHits)
+                return accepted(detection, site, geometry, uncertainty, method, requiredHits, localTerrain?.y)
             }
         }
 
-        // Last resort for a *strong, temporally confirmed* detector track: estimate range from class
-        // height at the exact capture pose. It has intentionally high uncertainty and requires four
-        // consistent 3D observations before publication, so it fills real "bbox but no track" gaps
-        // without letting a single classifier mistake become a shared ghost.
         if (detection.confidence >= monocularMinimumConfidence(detection.label)) {
-            monocularContact(detection, geometry, groundY)?.let { position ->
+            monocularContact(detection, geometry, groundY, terrain)?.let { solution ->
                 return accepted(
-                    detection = detection,
-                    position = position,
-                    geometry = geometry,
-                    uncertainty = 1.10f,
-                    method = "monocular-capture-fallback",
-                    requiredHits = 4
+                    detection,
+                    solution.position,
+                    geometry,
+                    solution.uncertainty,
+                    solution.method,
+                    4,
+                    solution.terrainY
                 )
             }
         }
@@ -143,18 +178,74 @@ object SpatialEstimator {
         }
     }
 
+    private data class ContactSolution(
+        val position: FloatArray,
+        val uncertainty: Float,
+        val method: String,
+        val terrainY: Float? = null,
+        val depthConfidence: Float? = null
+    )
+
+    private fun depthContact(
+        detection: Detection2D,
+        geometry: CaptureGeometry,
+        terrain: TerrainHeightMap?
+    ): ContactSolution? {
+        val siteFromCamera = geometry.siteFromCamera ?: return null
+        val sample: DepthContactSample = geometry.depthSnapshot?.sample(detection.rawBottomCenter) ?: return null
+        val ray = cameraRay(detection.rawBottomCenter, geometry) ?: return null
+        if (ray[2] >= -0.05f) return null
+        val scale = sample.opticalDepthMeters / -ray[2]
+        if (!scale.isFinite() || scale !in MIN_GROUND_RANGE_METERS..MAX_GROUND_RANGE_METERS * 1.5f) return null
+        val cameraPoint = floatArrayOf(ray[0] * scale, ray[1] * scale, -sample.opticalDepthMeters)
+        val site = PoseMath.transformPoint(siteFromCamera, cameraPoint)
+        val localTerrain = terrain?.heightAt(site[0], site[2])
+        val method = if (localTerrain != null && kotlin.math.abs(site[1] - localTerrain.y) <= MAX_TERRAIN_SNAP_METERS) {
+            site[1] = localTerrain.y
+            "${sample.source}+terrain"
+        } else sample.source
+        val confidencePenalty = (1f - sample.confidence.coerceIn(0f, 1f)) * 0.24f
+        val base = if (sample.source.startsWith("raw")) 0.14f else 0.24f
+        return ContactSolution(
+            site,
+            (base + confidencePenalty).coerceIn(0.12f, 0.58f),
+            method,
+            localTerrain?.y,
+            sample.confidence
+        )
+    }
+
+    private fun terrainContact(
+        detection: Detection2D,
+        geometry: CaptureGeometry,
+        terrain: TerrainHeightMap?
+    ): ContactSolution? {
+        terrain ?: return null
+        val siteFromCamera = geometry.siteFromCamera ?: return null
+        val rayCamera = cameraRay(detection.rawBottomCenter, geometry) ?: return null
+        val siteDirection = PoseMath.normalize(PoseMath.transformDirection(siteFromCamera, rayCamera))
+        if (siteDirection[1] > 0.18f) return null
+        val origin = PoseMath.translationOf(siteFromCamera)
+        val hit = terrain.intersectRay(origin, siteDirection, MAX_GROUND_RANGE_METERS) ?: return null
+        val supportPenalty = if (hit.terrain.support >= 8) 0f else (8 - hit.terrain.support) * 0.018f
+        val uncertainty = (0.18f + hit.terrain.spreadMeters * 0.35f + supportPenalty).coerceIn(0.18f, 0.58f)
+        return ContactSolution(hit.position, uncertainty, "terrain-ray", hit.terrain.y)
+    }
+
     private fun accepted(
         detection: Detection2D,
         position: FloatArray,
         geometry: CaptureGeometry,
         uncertainty: Float,
         method: String,
-        requiredHits: Int
+        requiredHits: Int,
+        terrainY: Float? = null,
+        depthConfidence: Float? = null
     ): SpatialEstimateAttempt {
         val extent = estimateExtent(detection, position, geometry)
         val yaw = estimateYaw(detection, position, geometry)
         return SpatialEstimateAttempt(
-            EstimatedPosition(position, uncertainty, method, extent, yaw, requiredHits),
+            EstimatedPosition(position, uncertainty, method, extent, yaw, requiredHits, terrainY, depthConfidence),
             null
         )
     }
@@ -196,8 +287,9 @@ object SpatialEstimator {
     private fun monocularContact(
         detection: Detection2D,
         geometry: CaptureGeometry,
-        groundY: Float?
-    ): FloatArray? {
+        groundY: Float?,
+        terrain: TerrainHeightMap?
+    ): ContactSolution? {
         val siteFromCamera = geometry.siteFromCamera ?: return null
         val focalY = geometry.focalLength.getOrNull(1) ?: return null
         if (focalY <= 0f || detection.rawBoundingBox.height() < 4f) return null
@@ -209,8 +301,18 @@ object SpatialEstimator {
         val scale = opticalDepth / -ray[2]
         val cameraPoint = floatArrayOf(ray[0] * scale, ray[1] * scale, -opticalDepth)
         val sitePoint = PoseMath.transformPoint(siteFromCamera, cameraPoint)
-        if (groundY != null) sitePoint[1] = groundY
-        return sitePoint
+        val localTerrain = terrain?.heightAt(sitePoint[0], sitePoint[2])
+        return when {
+            localTerrain != null -> {
+                sitePoint[1] = localTerrain.y
+                ContactSolution(sitePoint, 0.82f, "monocular+terrain", localTerrain.y)
+            }
+            groundY != null -> {
+                sitePoint[1] = groundY
+                ContactSolution(sitePoint, 1.05f, "monocular+ground", groundY)
+            }
+            else -> ContactSolution(sitePoint, 1.18f, "monocular-free")
+        }
     }
 
     private fun cameraRay(imagePixel: FloatArray, geometry: CaptureGeometry): FloatArray? {
@@ -294,8 +396,6 @@ object SpatialEstimator {
         val sideView = detection.label.equals("car", true) &&
             detection.rawBoundingBox.width() / detection.rawBoundingBox.height().coerceAtLeast(1f) >= CAR_SIDE_ASPECT
         val desiredDepthAxisBearing = if (sideView) bearing + (PI.toFloat() / 2f) else bearing
-        // The cuboid renderer rotates local [x,z] as x'=x*cos-z*sin, z'=x*sin+z*cos.
-        // Therefore the resulting +Z axis has site bearing -yaw.
         return normalizeAngle(-desiredDepthAxisBearing)
     }
 
@@ -351,6 +451,7 @@ object SpatialEstimator {
     private val GROUND_CONTACT_LABELS = setOf("person", "car", "bird", "dog", "cat")
     private const val CAR_SIDE_ASPECT = 1.55f
     private const val MIN_DOWNWARD_RAY_COMPONENT = 0.035f
-    private const val MIN_GROUND_RANGE_METERS = 0.20f
+    private const val MIN_GROUND_RANGE_METERS = 0.25f
     private const val MAX_GROUND_RANGE_METERS = 45f
+    private const val MAX_TERRAIN_SNAP_METERS = 1.10f
 }

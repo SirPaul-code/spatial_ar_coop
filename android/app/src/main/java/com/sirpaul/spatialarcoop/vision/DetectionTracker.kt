@@ -18,7 +18,10 @@ data class SpatialObservation(
     val extentMeters: FloatArray = defaultTrackExtent(label),
     val yawRadians: Float = 0f,
     val requiredHits: Int = 2,
-    val poseJoints: List<PoseJoint> = emptyList()
+    val poseJoints: List<PoseJoint> = emptyList(),
+    val spatialMethod: String = "unknown",
+    val terrainY: Float? = null,
+    val depthConfidence: Float? = null
 )
 
 class DetectionTracker(private val sourceId: String) {
@@ -37,7 +40,10 @@ class DetectionTracker(private val sourceId: String) {
         var hitCount: Int,
         var rejectedMeasurements: Int,
         var poseJoints: List<PoseJoint>,
-        var poseLastSeenAtMs: Long?
+        var poseLastSeenAtMs: Long?,
+        var spatialMethod: String,
+        var terrainY: Float?,
+        var depthConfidence: Float?
     )
 
     private val states = linkedMapOf<String, State>()
@@ -72,7 +78,10 @@ class DetectionTracker(private val sourceId: String) {
                     hitCount = 1,
                     rejectedMeasurements = 0,
                     poseJoints = copyPose(observation.poseJoints),
-                    poseLastSeenAtMs = observation.observedAtMs.takeIf { observation.poseJoints.isNotEmpty() }
+                    poseLastSeenAtMs = observation.observedAtMs.takeIf { observation.poseJoints.isNotEmpty() },
+                    spatialMethod = observation.spatialMethod,
+                    terrainY = observation.terrainY,
+                    depthConfidence = observation.depthConfidence
                 )
             } else {
                 unmatched.remove(reacquired)
@@ -144,8 +153,10 @@ class DetectionTracker(private val sourceId: String) {
 
         state.rejectedMeasurements = 0
         val apparentSpeed = residualDistance / dt
-        val alpha = positionAlpha(residualDistance, apparentSpeed, observation.uncertaintyMeters)
+        val alpha = positionAlpha(residualDistance, apparentSpeed, observation.uncertaintyMeters, observation.depthConfidence)
         val corrected = FloatArray(3) { index -> predicted[index] + alpha * residual[index] }
+        val groundContactMeasurement = isGroundContactMethod(observation.spatialMethod)
+        if (groundContactMeasurement) corrected[1] = observation.position[1]
 
         val measuredVelocity = FloatArray(3) { index -> residual[index] / dt }
         val beta = if (apparentSpeed > 1.5f) 0.20f else 0.10f
@@ -153,6 +164,7 @@ class DetectionTracker(private val sourceId: String) {
             state.velocity[index] * (1f - beta) + measuredVelocity[index] * beta
         }
         velocity = clampMagnitude(velocity, maxSpeed(observation.label))
+        if (groundContactMeasurement) velocity[1] *= 0.08f
         if (residualDistance < STATIONARY_RESIDUAL_METERS && magnitude(velocity) < STATIONARY_SPEED_METERS_PER_SECOND) {
             velocity = floatArrayOf(0f, 0f, 0f)
         }
@@ -173,6 +185,9 @@ class DetectionTracker(private val sourceId: String) {
             state.poseJoints = blendPose(state.poseJoints, observation.poseJoints)
             state.poseLastSeenAtMs = observation.observedAtMs
         }
+        state.spatialMethod = observation.spatialMethod
+        state.terrainY = observation.terrainY
+        state.depthConfidence = observation.depthConfidence
         // A later high-quality ground/plane measurement may reduce the confirmation requirement of
         // a track that initially started from the conservative monocular fallback.
         state.requiredHits = min(state.requiredHits, observation.requiredHits.coerceIn(2, 6))
@@ -199,12 +214,22 @@ class DetectionTracker(private val sourceId: String) {
     private fun copyPose(values: List<PoseJoint>): List<PoseJoint> =
         values.map { PoseJoint(it.index, it.offsetMeters.copyOf(), it.confidence) }
 
-    private fun positionAlpha(residualDistance: Float, apparentSpeed: Float, uncertaintyMeters: Float): Float {
+    private fun positionAlpha(
+        residualDistance: Float,
+        apparentSpeed: Float,
+        uncertaintyMeters: Float,
+        depthConfidence: Float?
+    ): Float {
         if (residualDistance < POSITION_DEADBAND_METERS) return 0.06f
         val quality = (1f - (uncertaintyMeters / 1.4f)).coerceIn(0f, 1f)
+        val depthBoost = (depthConfidence ?: 0f).coerceIn(0f, 1f) * 0.08f
         val motionBoost = (apparentSpeed / 4f).coerceIn(0f, 1f) * 0.24f
-        return (0.18f + quality * 0.18f + motionBoost).coerceIn(0.16f, 0.56f)
+        return (0.18f + quality * 0.18f + depthBoost + motionBoost).coerceIn(0.16f, 0.62f)
     }
+
+    private fun isGroundContactMethod(method: String): Boolean =
+        method.contains("depth", true) || method.contains("terrain", true) ||
+            method.contains("ground", true) || method.contains("plane", true)
 
     private fun measurementGate(state: State, observation: SpatialObservation, dt: Float): Float {
         val base = when (observation.label) {
@@ -313,7 +338,11 @@ class DetectionTracker(private val sourceId: String) {
             observedAtMs = nowMs,
             extentMeters = state.extentMeters.copyOf(),
             yawRadians = state.yawRadians,
-            poseJoints = if (state.label == "person" && poseAgeMs <= POSE_HOLD_MS) copyPose(state.poseJoints) else emptyList()
+            poseJoints = if (state.label == "person" && poseAgeMs <= POSE_HOLD_MS) copyPose(state.poseJoints) else emptyList(),
+            spatialMethod = state.spatialMethod,
+            terrainY = state.terrainY,
+            depthConfidence = state.depthConfidence,
+            hitCount = state.hitCount
         )
     }
 

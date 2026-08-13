@@ -21,7 +21,8 @@ test('normalizes track batches, geometry and complete-source semantics', () => {
     replaceSource: true,
     tracks: [{
       id: 't1', label: 'Car', confidence: 2, position: [1, 2, 3],
-      extentMeters: [1.9, 1.55, 4.6], yawRadians: 0.75
+      extentMeters: [1.9, 1.55, 4.6], yawRadians: 0.75,
+      spatialMethod: 'raw-depth+terrain', terrainY: 1.2, depthConfidence: 0.91, hitCount: 7
     }]
   }));
   assert.equal(message.sequence, 7);
@@ -32,6 +33,10 @@ test('normalizes track batches, geometry and complete-source semantics', () => {
   assert.deepEqual(message.tracks[0].extentMeters, [1.9, 1.55, 4.6]);
   assert.equal(message.tracks[0].yawRadians, 0.75);
   assert.deepEqual(message.tracks[0].poseJoints, []);
+  assert.equal(message.tracks[0].spatialMethod, 'raw-depth+terrain');
+  assert.equal(message.tracks[0].terrainY, 1.2);
+  assert.equal(message.tracks[0].depthConfidence, 0.91);
+  assert.equal(message.tracks[0].hitCount, 7);
 
   const legacy = parseClientMessage(JSON.stringify({
     type: 'track_batch', tracks: [{ id: 't1', label: 'bird', position: [0, 0, 0] }]
