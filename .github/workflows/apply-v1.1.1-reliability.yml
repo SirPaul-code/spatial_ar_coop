@@ -1,0 +1,82 @@
+name: Apply v1.1.1 reliability fix
+
+on:
+  push:
+    branches:
+      - fix/v1.1.1-demo-reliability
+    paths:
+      - '.github/upgrade/fix-v1.1.1.py'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-v1.1.1-reliability
+  cancel-in-progress: true
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK packages
+        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Apply patch
+        run: python3 .github/upgrade/fix-v1.1.1.py
+      - name: Diff sanity
+        run: git diff --check
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Server tests
+        working-directory: server
+        run: npm test
+      - name: Server syntax checks
+        working-directory: server
+        run: npm run check
+      - name: Server dependency audit
+        working-directory: server
+        run: npm audit --omit=dev --audit-level=high
+      - name: Build server container
+        run: docker build -t spatial-ar-coop-server:v1.1.1 ./server
+      - name: Android tests and debug APK
+        working-directory: android
+        env:
+          ARCORE_API_KEY: UNCONFIGURED
+          DEFAULT_SERVER_URL: http://10.0.2.2:8080
+          DEFAULT_API_TOKEN: ''
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
+      - name: Commit verified fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            android/app/build.gradle.kts \
+            android/app/src/main/java/com/sirpaul/spatialarcoop/ar/PointCloudRecorder.kt \
+            android/app/src/main/java/com/sirpaul/spatialarcoop/ar/CloudAnchorCoordinator.kt \
+            android/app/src/main/java/com/sirpaul/spatialarcoop/vision/ObjectDetectorEngine.kt \
+            server/package.json \
+            server/package-lock.json \
+            server/src/persistence.mjs \
+            server/src/admin-page.mjs \
+            server/test/scan-read.test.mjs
+          git diff --cached --check
+          git commit -m 'fix: restore live detection and localization reliability'
+          git push origin HEAD:${GITHUB_REF_NAME}
