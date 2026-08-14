@@ -165,7 +165,7 @@ tasks.named("preBuild").configure {
 
 dependencies {
     implementation("com.google.ar:core:1.54.0")
-    implementation("com.google.mediapipe:tasks-vision:0.10.35")
+    implementation("com.google.mediapipe:tasks-vision:1.0.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     implementation("com.google.zxing:core:3.5.4")
