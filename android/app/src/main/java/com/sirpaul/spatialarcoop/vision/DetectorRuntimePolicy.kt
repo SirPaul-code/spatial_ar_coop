@@ -41,10 +41,10 @@ class DetectorRuntimePolicy(
     fun observeLatency(latencyMs: Long, nowMs: Long): DetectorRuntimeProfile? {
         val value = latencyMs.coerceIn(1L, 5_000L).toFloat()
         ewmaLatencyMs = if (ewmaLatencyMs <= 0f) value else ewmaLatencyMs * 0.82f + value * 0.18f
-        if (ewmaLatencyMs > SLOW_LATENCY_MS) {
+        if (ewmaLatencyMs > slowLatencyThreshold()) {
             slowStreak += 1
             fastStreak = 0
-        } else if (ewmaLatencyMs < FAST_LATENCY_MS) {
+        } else if (ewmaLatencyMs < fastLatencyThreshold()) {
             fastStreak += 1
             slowStreak = 0
         } else {
@@ -67,6 +67,18 @@ class DetectorRuntimePolicy(
         return switchTo(profile.copy(delegate = DetectorDelegateProfile.CPU), nowMs, ignoreCooldown = true)
     }
 
+    private fun slowLatencyThreshold(): Float = when {
+        lowRamDevice -> LOW_RAM_SLOW_LATENCY_MS
+        profile.delegate == DetectorDelegateProfile.CPU -> CAPABLE_CPU_SLOW_LATENCY_MS
+        else -> GPU_SLOW_LATENCY_MS
+    }
+
+    private fun fastLatencyThreshold(): Float = when {
+        lowRamDevice -> LOW_RAM_FAST_LATENCY_MS
+        profile.delegate == DetectorDelegateProfile.CPU -> CAPABLE_CPU_FAST_LATENCY_MS
+        else -> GPU_FAST_LATENCY_MS
+    }
+
     private fun switchTo(
         newProfile: DetectorRuntimeProfile,
         nowMs: Long,
@@ -83,8 +95,12 @@ class DetectorRuntimePolicy(
     }
 
     companion object {
-        private const val SLOW_LATENCY_MS = 185f
-        private const val FAST_LATENCY_MS = 92f
+        private const val GPU_SLOW_LATENCY_MS = 185f
+        private const val GPU_FAST_LATENCY_MS = 92f
+        private const val LOW_RAM_SLOW_LATENCY_MS = 185f
+        private const val LOW_RAM_FAST_LATENCY_MS = 92f
+        private const val CAPABLE_CPU_SLOW_LATENCY_MS = 300f
+        private const val CAPABLE_CPU_FAST_LATENCY_MS = 150f
         private const val SLOW_STREAK_TO_DOWNGRADE = 6
         private const val FAST_STREAK_TO_UPGRADE = 36
 
