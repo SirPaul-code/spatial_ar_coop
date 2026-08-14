@@ -16,10 +16,10 @@ You are an execution-only build/deploy operator. The source implementation is al
 
 ## EXPECTED TARGET
 
-- base Android version: `1.2.0`
-- versionCode: `13`
+- base Android version: `1.2.1`
+- versionCode: `14`
 - installed debug package: `com.sirpaul.spatialarcoop.debug`
-- installed debug versionName: `1.2.0-debug`
+- installed debug versionName: `1.2.1-debug`
 - Cloud Anchors: compiled ENABLED
 - server `/ops`: hi-fi free-fly 3D COP
 
@@ -45,7 +45,7 @@ git log -1 --oneline
 Select-String -Path android/app/build.gradle.kts -Pattern "versionCode|versionName"
 ```
 
-STOP if the checked-out base version is not `1.2.0` / code `13`.
+STOP if the checked-out base version is not `1.2.1` / code `14`.
 
 ## 2. CLOUD ANCHOR BUILD GATE — MANDATORY
 
@@ -169,16 +169,16 @@ foreach ($serial in $wireless) {
 }
 ```
 
-Expected: `versionCode=13`, `versionName=1.2.0-debug`.
+Expected: `versionCode=14`, `versionName=1.2.1-debug`.
 
 ## FINAL OUTPUT
 
 ```text
 BUILD/DEPLOY SUCCESS
 CLOUD ANCHORS: ENABLED
-BASE VERSION: 1.2.0
-INSTALLED DEBUG VERSION: 1.2.0-debug
-VERSION CODE: 13
+BASE VERSION: 1.2.1
+INSTALLED DEBUG VERSION: 1.2.1-debug
+VERSION CODE: 14
 GIT: <origin/main SHA>
 APK: <absolute path>
 SHA256: <hash>
