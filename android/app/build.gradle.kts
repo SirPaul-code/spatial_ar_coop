@@ -36,8 +36,8 @@ android {
         applicationId = "com.sirpaul.spatialarcoop"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "1.1.2"
+        versionCode = 13
+        versionName = "1.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${defaultServerUrl.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
