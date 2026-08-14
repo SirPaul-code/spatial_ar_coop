@@ -1,5 +1,7 @@
 package com.sirpaul.spatialarcoop.vision
 
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.sqrt
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -129,6 +131,43 @@ class DetectionTrackerTest {
             assertEquals(stable.key, track.key)
             assertTrue("bad 3D samples must not walk the marker away", track.position[0] < 1.5f)
         }
+    }
+
+    @Test fun movingCarRebasesAfterConsistentPhysicallyPlausibleMeasurements() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 47_000L
+        assertTrue(tracker.update(listOf(car(0f, 7f, t0, "d-moving")), t0).isEmpty())
+        val stable = tracker.update(listOf(car(0.05f, 7.01f, t0 + 140, "d-moving")), t0 + 140).single()
+
+        val rejectedOne = tracker.update(listOf(car(8f, 7.05f, t0 + 740, "d-moving")), t0 + 740).single()
+        assertEquals(stable.key, rejectedOne.key)
+        assertTrue(rejectedOne.position[0] < 2f)
+
+        val rejectedTwo = tracker.update(listOf(car(9.5f, 7.08f, t0 + 880, "d-moving")), t0 + 880).single()
+        assertEquals(stable.key, rejectedTwo.key)
+        assertTrue(rejectedTwo.position[0] < 3f)
+
+        val reacquired = tracker.update(listOf(car(11f, 7.10f, t0 + 1_020, "d-moving")), t0 + 1_020).single()
+        assertEquals(stable.key, reacquired.key)
+        assertTrue("consistent moving-car evidence should rebase instead of freezing", reacquired.position[0] > 9f)
+        assertTrue("reacquired car should carry meaningful velocity", reacquired.velocity[0] > 3f)
+    }
+
+    @Test fun movingCarYawFollowsWorldMotionAndDoesNotSpinWithViewHeuristics() {
+        val tracker = DetectionTracker("phone-a")
+        val t0 = 49_000L
+        assertTrue(tracker.update(listOf(car(0f, 7f, t0, "d-yaw")), t0).isEmpty())
+        tracker.update(listOf(car(0.05f, 7f, t0 + 140, "d-yaw")), t0 + 140)
+        tracker.update(listOf(car(0.9f, 7f, t0 + 280, "d-yaw")), t0 + 280)
+        tracker.update(listOf(car(2.0f, 7f, t0 + 420, "d-yaw")), t0 + 420)
+        val moving = tracker.update(listOf(car(3.3f, 7f, t0 + 560, "d-yaw")), t0 + 560).single()
+
+        val expected = -(PI.toFloat() / 2f)
+        assertTrue("car yaw should converge toward its +X motion direction", abs(moving.yawRadians - expected) < 0.65f)
+
+        val badViewYaw = car(3.32f, 7f, t0 + 700, "d-yaw").copy(yawRadians = 2.6f)
+        val afterViewChange = tracker.update(listOf(badViewYaw), t0 + 700).single()
+        assertTrue("camera-side heuristic must not spin an established car", abs(afterViewChange.yawRadians - moving.yawRadians) < 0.35f)
     }
 
     @Test fun stationaryJitterDoesNotTurnIntoVelocityDrift() {
