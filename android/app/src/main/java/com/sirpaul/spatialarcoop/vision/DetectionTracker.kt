@@ -4,6 +4,7 @@ import com.sirpaul.spatialarcoop.data.PoseJoint
 import com.sirpaul.spatialarcoop.data.SpatialTrack
 import com.sirpaul.spatialarcoop.data.defaultTrackExtent
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -39,6 +40,8 @@ class DetectionTracker(private val sourceId: String) {
         var lastSeenAtMs: Long,
         var hitCount: Int,
         var rejectedMeasurements: Int,
+        var rejectedPosition: FloatArray?,
+        var rejectedAtMs: Long?,
         var poseJoints: List<PoseJoint>,
         var poseLastSeenAtMs: Long?,
         var spatialMethod: String,
@@ -77,6 +80,8 @@ class DetectionTracker(private val sourceId: String) {
                     lastSeenAtMs = observation.observedAtMs,
                     hitCount = 1,
                     rejectedMeasurements = 0,
+                    rejectedPosition = null,
+                    rejectedAtMs = null,
                     poseJoints = copyPose(observation.poseJoints),
                     poseLastSeenAtMs = observation.observedAtMs.takeIf { observation.poseJoints.isNotEmpty() },
                     spatialMethod = observation.spatialMethod,
@@ -141,25 +146,49 @@ class DetectionTracker(private val sourceId: String) {
         state.confidence = state.confidence * 0.38f + observation.confidence * 0.62f
 
         if (residualDistance > gate) {
-            state.position = predicted
+            if (shouldRebaseAfterRejectedMeasurements(state, observation)) {
+                rebaseObservation(state, observation)
+                return
+            }
+
             state.rejectedMeasurements += 1
-            val damping = if (state.rejectedMeasurements >= 2) 0f else 0.30f
+            state.rejectedPosition = observation.position.copyOf()
+            state.rejectedAtMs = observation.observedAtMs
+            val damping = when {
+                state.rejectedMeasurements >= 3 -> 0.65f
+                state.rejectedMeasurements >= 2 -> 0.78f
+                else -> 0.92f
+            }
             state.velocity = FloatArray(3) { index -> state.velocity[index] * damping }
             state.uncertaintyMeters = (maxOf(state.uncertaintyMeters, observation.uncertaintyMeters) + 0.10f)
                 .coerceAtMost(MAX_UNCERTAINTY_METERS)
-            state.lastSeenAtMs = observation.observedAtMs
+            // Important: a rejected 3D sample is not an accepted position update. Keeping the
+            // previous lastSeenAtMs lets a genuinely stale hypothesis expire instead of refreshing
+            // a frozen marker forever. A moving car can still rebase after repeated physically
+            // plausible measurements below.
             return
         }
 
-        state.rejectedMeasurements = 0
+        clearRejected(state)
         val apparentSpeed = residualDistance / dt
-        val alpha = positionAlpha(residualDistance, apparentSpeed, observation.uncertaintyMeters, observation.depthConfidence)
+        val alpha = positionAlpha(
+            observation.label,
+            residualDistance,
+            apparentSpeed,
+            observation.uncertaintyMeters,
+            observation.depthConfidence
+        )
         val corrected = FloatArray(3) { index -> predicted[index] + alpha * residual[index] }
         val groundContactMeasurement = isGroundContactMethod(observation.spatialMethod)
         if (groundContactMeasurement) corrected[1] = observation.position[1]
 
         val measuredVelocity = FloatArray(3) { index -> residual[index] / dt }
-        val beta = if (apparentSpeed > 1.2f) 0.28f else 0.16f
+        val beta = when {
+            observation.label == "car" && apparentSpeed > 1.2f -> 0.52f
+            observation.label == "car" -> 0.24f
+            apparentSpeed > 1.2f -> 0.28f
+            else -> 0.16f
+        }
         var velocity = FloatArray(3) { index ->
             state.velocity[index] * (1f - beta) + measuredVelocity[index] * beta
         }
@@ -176,10 +205,7 @@ class DetectionTracker(private val sourceId: String) {
             state.extentMeters.getOrElse(index) { observation.extentMeters[index] } * 0.68f +
                 observation.extentMeters[index] * 0.32f
         }
-        val motionYaw = if (observation.label == "car" && magnitude(velocity) > CAR_YAW_FROM_SPEED_METERS_PER_SECOND) {
-            -atan2(velocity[0], velocity[2])
-        } else null
-        state.yawRadians = blendAngle(state.yawRadians, motionYaw ?: observation.yawRadians, 0.26f)
+        updateYaw(state, observation, velocity)
         if (observation.poseJoints.isNotEmpty()) {
             state.poseJoints = blendPose(state.poseJoints, observation.poseJoints)
             state.poseLastSeenAtMs = observation.observedAtMs
@@ -190,6 +216,81 @@ class DetectionTracker(private val sourceId: String) {
         state.requiredHits = min(state.requiredHits, observation.requiredHits.coerceIn(2, 6))
         state.lastSeenAtMs = observation.observedAtMs
         state.hitCount += 1
+    }
+
+    private fun shouldRebaseAfterRejectedMeasurements(state: State, observation: SpatialObservation): Boolean {
+        if (observation.label != "car") return false
+        if (state.rejectedMeasurements < CAR_REBASE_REQUIRED_PRIOR_REJECTS) return false
+        if (observation.confidence < CAR_REBASE_MIN_CONFIDENCE) return false
+        val previousRejected = state.rejectedPosition ?: return false
+        val previousRejectedAtMs = state.rejectedAtMs ?: return false
+
+        val sampleDt = ((observation.observedAtMs - previousRejectedAtMs).coerceAtLeast(1L) / 1000f)
+            .coerceAtMost(1.0f)
+        val sampleStep = horizontalDistance(previousRejected, observation.position)
+        val maxSampleStep = CAR_REBASE_STEP_BASE_METERS + CAR_REACQUIRE_MAX_SPEED_METERS_PER_SECOND * sampleDt
+        if (sampleStep > maxSampleStep) return false
+
+        val acceptedDt = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f)
+            .coerceAtMost(2.0f)
+        val displacement = horizontalDistance(state.position, observation.position)
+        val maxDisplacement = CAR_REBASE_BASE_METERS + CAR_REACQUIRE_MAX_SPEED_METERS_PER_SECOND * acceptedDt
+        if (displacement > maxDisplacement) return false
+        if (abs(observation.position[1] - state.position[1]) > CAR_REBASE_MAX_VERTICAL_METERS) return false
+
+        return true
+    }
+
+    private fun rebaseObservation(state: State, observation: SpatialObservation) {
+        val dt = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f).coerceAtMost(2.0f)
+        var measuredVelocity = FloatArray(3) { index -> (observation.position[index] - state.position[index]) / dt }
+        measuredVelocity = clampMagnitude(measuredVelocity, maxSpeed(observation.label))
+        if (isGroundContactMethod(observation.spatialMethod)) measuredVelocity[1] *= 0.04f
+
+        state.position = observation.position.copyOf()
+        state.velocity = FloatArray(3) { index -> state.velocity[index] * 0.18f + measuredVelocity[index] * 0.82f }
+        state.uncertaintyMeters = maxOf(observation.uncertaintyMeters, state.uncertaintyMeters * 0.72f)
+            .coerceAtMost(MAX_UNCERTAINTY_METERS)
+        state.extentMeters = FloatArray(3) { index ->
+            state.extentMeters.getOrElse(index) { observation.extentMeters[index] } * 0.45f +
+                observation.extentMeters[index] * 0.55f
+        }
+        updateYaw(state, observation, state.velocity, forceMotion = true)
+        state.spatialMethod = observation.spatialMethod
+        state.terrainY = observation.terrainY
+        state.depthConfidence = observation.depthConfidence
+        state.requiredHits = min(state.requiredHits, observation.requiredHits.coerceIn(2, 6))
+        state.lastSeenAtMs = observation.observedAtMs
+        state.hitCount += 1
+        clearRejected(state)
+    }
+
+    private fun updateYaw(
+        state: State,
+        observation: SpatialObservation,
+        velocity: FloatArray,
+        forceMotion: Boolean = false
+    ) {
+        if (observation.label == "car") {
+            val speed = planarSpeed(velocity)
+            if (forceMotion || speed >= CAR_YAW_FROM_SPEED_METERS_PER_SECOND) {
+                if (speed >= CAR_MIN_VALID_MOTION_YAW_SPEED_METERS_PER_SECOND) {
+                    val target = -atan2(velocity[0], velocity[2])
+                    val alpha = (0.46f + (speed / 7f).coerceIn(0f, 1f) * 0.36f).coerceIn(0.46f, 0.82f)
+                    state.yawRadians = blendAngle(state.yawRadians, target, alpha)
+                }
+            }
+            // A 2D detector does not know the true yaw of a stationary car. Keep the last stable
+            // orientation instead of rotating the cuboid whenever the camera viewpoint changes.
+            return
+        }
+        state.yawRadians = blendAngle(state.yawRadians, observation.yawRadians, 0.26f)
+    }
+
+    private fun clearRejected(state: State) {
+        state.rejectedMeasurements = 0
+        state.rejectedPosition = null
+        state.rejectedAtMs = null
     }
 
     private fun blendPose(current: List<PoseJoint>, incoming: List<PoseJoint>): List<PoseJoint> {
@@ -212,16 +313,22 @@ class DetectionTracker(private val sourceId: String) {
         values.map { PoseJoint(it.index, it.offsetMeters.copyOf(), it.confidence) }
 
     private fun positionAlpha(
+        label: String,
         residualDistance: Float,
         apparentSpeed: Float,
         uncertaintyMeters: Float,
         depthConfidence: Float?
     ): Float {
-        if (residualDistance < POSITION_DEADBAND_METERS) return 0.08f
+        if (residualDistance < POSITION_DEADBAND_METERS) return if (label == "car") 0.12f else 0.08f
         val quality = (1f - (uncertaintyMeters / 1.5f)).coerceIn(0f, 1f)
         val depthBoost = (depthConfidence ?: 0f).coerceIn(0f, 1f) * 0.10f
-        val motionBoost = (apparentSpeed / 4f).coerceIn(0f, 1f) * 0.30f
-        return (0.24f + quality * 0.20f + depthBoost + motionBoost).coerceIn(0.22f, 0.78f)
+        return if (label == "car") {
+            val motionBoost = (apparentSpeed / 7f).coerceIn(0f, 1f) * 0.38f
+            (0.34f + quality * 0.18f + depthBoost + motionBoost).coerceIn(0.32f, 0.88f)
+        } else {
+            val motionBoost = (apparentSpeed / 4f).coerceIn(0f, 1f) * 0.30f
+            (0.24f + quality * 0.20f + depthBoost + motionBoost).coerceIn(0.22f, 0.78f)
+        }
     }
 
     private fun isGroundContactMethod(method: String): Boolean =
@@ -230,15 +337,16 @@ class DetectionTracker(private val sourceId: String) {
 
     private fun measurementGate(state: State, observation: SpatialObservation, dt: Float): Float {
         val base = when (observation.label) {
-            "car" -> 1.00f
+            "car" -> 1.25f
             "person" -> 0.74f
             "bird" -> 0.44f
             else -> 0.62f
         }
         val uncertainty = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.8f)
-        val motionAllowance = maxSpeed(observation.label) * dt * 0.55f
+        val motionScale = if (observation.label == "car") 0.72f else 0.55f
+        val motionAllowance = maxSpeed(observation.label) * dt * motionScale
         val maxGate = when (observation.label) {
-            "car" -> 3.5f
+            "car" -> 6.0f
             "person" -> 2.1f
             "bird" -> 1.25f
             else -> 1.9f
@@ -263,18 +371,20 @@ class DetectionTracker(private val sourceId: String) {
 
     private fun associationRadius(state: State, observation: SpatialObservation): Float {
         val ageSeconds = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f)
+        val uncertaintyAllowance = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.5f)
+        if (observation.label == "car") {
+            return (1.55f + ageSeconds * 7.5f + uncertaintyAllowance * 1.10f).coerceAtMost(7.0f)
+        }
         val base = when (observation.label) {
-            "car" -> 1.15f
             "person" -> 0.85f
             "bird" -> 0.46f
             else -> 0.75f
         }
-        val uncertaintyAllowance = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.5f)
         return (base + ageSeconds * 0.65f + uncertaintyAllowance).coerceAtMost(3.0f)
     }
 
     private fun reacquireRadius(label: String): Float = when (label) {
-        "car" -> 5.0f
+        "car" -> 8.0f
         "person" -> 2.8f
         "bird" -> 1.2f
         else -> 2.0f
@@ -302,6 +412,14 @@ class DetectionTracker(private val sourceId: String) {
         return sqrt(squared)
     }
 
+    private fun horizontalDistance(a: FloatArray, b: FloatArray): Float {
+        val dx = a[0] - b[0]
+        val dz = a[2] - b[2]
+        return sqrt(dx * dx + dz * dz)
+    }
+
+    private fun planarSpeed(vector: FloatArray): Float = sqrt(vector[0] * vector[0] + vector[2] * vector[2])
+
     private fun blendAngle(current: Float, target: Float, alpha: Float): Float {
         val delta = normalizeAngle(target - current)
         return normalizeAngle(current + delta * alpha)
@@ -315,13 +433,16 @@ class DetectionTracker(private val sourceId: String) {
         return result
     }
 
+    private fun trackTimeoutMs(label: String): Long = if (label == "car") CAR_TRACK_TIMEOUT_MS else TRACK_TIMEOUT_MS
+
     private fun expire(nowMs: Long) {
-        states.entries.removeIf { nowMs - it.value.lastSeenAtMs > TRACK_TIMEOUT_MS }
+        states.entries.removeIf { nowMs - it.value.lastSeenAtMs > trackTimeoutMs(it.value.label) }
     }
 
     private fun toPublicTrack(state: State, nowMs: Long): SpatialTrack {
         val ageMs = (nowMs - state.lastSeenAtMs).coerceAtLeast(0L)
-        val confidenceDecay = (1f - (ageMs.toFloat() / TRACK_TIMEOUT_MS) * 0.58f).coerceIn(0.30f, 1f)
+        val timeoutMs = trackTimeoutMs(state.label)
+        val confidenceDecay = (1f - (ageMs.toFloat() / timeoutMs) * 0.58f).coerceIn(0.30f, 1f)
         val poseAgeMs = state.poseLastSeenAtMs?.let { (nowMs - it).coerceAtLeast(0L) } ?: Long.MAX_VALUE
         return SpatialTrack(
             key = "$sourceId:${state.id}",
@@ -347,10 +468,18 @@ class DetectionTracker(private val sourceId: String) {
         private const val POSITION_DEADBAND_METERS = 0.05f
         private const val STATIONARY_RESIDUAL_METERS = 0.18f
         private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.35f
-        private const val CAR_YAW_FROM_SPEED_METERS_PER_SECOND = 0.85f
+        private const val CAR_YAW_FROM_SPEED_METERS_PER_SECOND = 0.55f
+        private const val CAR_MIN_VALID_MOTION_YAW_SPEED_METERS_PER_SECOND = 0.30f
+        private const val CAR_REACQUIRE_MAX_SPEED_METERS_PER_SECOND = 18f
+        private const val CAR_REBASE_BASE_METERS = 1.35f
+        private const val CAR_REBASE_STEP_BASE_METERS = 0.55f
+        private const val CAR_REBASE_MAX_VERTICAL_METERS = 2.0f
+        private const val CAR_REBASE_MIN_CONFIDENCE = 0.26f
+        private const val CAR_REBASE_REQUIRED_PRIOR_REJECTS = 2
         private const val MAX_UNCERTAINTY_METERS = 3.0f
         private const val MAX_PREDICTION_SECONDS = 0.45f
         private const val TRACK_TIMEOUT_MS = 1_500L
+        private const val CAR_TRACK_TIMEOUT_MS = 2_200L
         private const val REACQUIRE_RATIO = 0.70f
         private const val REACQUIRE_MARGIN_METERS = 0.20f
         private const val POSE_JOINT_ALPHA = 0.62f
