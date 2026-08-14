@@ -36,19 +36,38 @@ class TemporalDetectionTrackerTest {
         assertEquals(first.temporalId, third.temporalId)
     }
 
-    @Test fun borderlineCarDoesNotCreateGhostAndRealCarNeedsRepeatedEvidence() {
+    @Test fun weakCarNeedsTemporalEvidenceButCanAcquireNearFortyPercent() {
         val tracker = TemporalDetectionTracker(0.35f)
         val t0 = 20_000L
 
-        assertTrue(tracker.update(listOf(candidate("car", 0.49f, 40f, width = 180f)), t0).isEmpty())
+        assertTrue(tracker.update(listOf(candidate("car", 0.33f, 40f, width = 180f)), t0).isEmpty())
 
-        val first = tracker.update(listOf(candidate("car", 0.72f, 40f, width = 180f)), t0 + 120).single()
+        val first = tracker.update(listOf(candidate("car", 0.43f, 40f, width = 180f)), t0 + 120).single()
         assertFalse(first.confirmed)
-        val second = tracker.update(listOf(candidate("car", 0.66f, 44f, width = 181f)), t0 + 240).single()
-        assertFalse(second.confirmed)
-        val confirmed = tracker.update(listOf(candidate("car", 0.38f, 46f, width = 182f)), t0 + 360).single()
+        val confirmed = tracker.update(listOf(candidate("car", 0.31f, 46f, width = 184f)), t0 + 240).single()
         assertTrue(confirmed.confirmed)
         assertEquals(first.temporalId, confirmed.temporalId)
+    }
+
+    @Test fun movingCarKeepsIdentityAcrossLongerDetectorGapAndScaleChange() {
+        val tracker = TemporalDetectionTracker(0.35f)
+        val t0 = 25_000L
+        val first = tracker.update(listOf(candidate("car", 0.74f, 40f, width = 150f, height = 90f)), t0).single()
+        val confirmed = tracker.update(listOf(candidate("car", 0.61f, 58f, width = 168f, height = 96f)), t0 + 120).single()
+        assertTrue(confirmed.confirmed)
+        assertEquals(first.temporalId, confirmed.temporalId)
+
+        listOf(240L, 360L, 480L, 600L, 720L).forEach { offset ->
+            val coast = tracker.update(emptyList(), t0 + offset)
+            assertTrue(coast.isEmpty() || coast.single().temporalId == first.temporalId)
+        }
+
+        val reacquired = tracker.update(
+            listOf(candidate("car", 0.29f, 150f, width = 250f, height = 118f)),
+            t0 + 820
+        ).single()
+        assertEquals(first.temporalId, reacquired.temporalId)
+        assertTrue(reacquired.confirmed)
     }
 
     @Test fun nearbyBirdsKeepSeparateImageSpaceIdentities() {
