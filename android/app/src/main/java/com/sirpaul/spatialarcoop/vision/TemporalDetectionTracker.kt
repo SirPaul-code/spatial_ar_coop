@@ -2,6 +2,7 @@ package com.sirpaul.spatialarcoop.vision
 
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /** Pure image-space detection used before Android/ARCore objects enter the pipeline. */
@@ -35,10 +36,11 @@ data class TrackedDetection2D(
 /**
  * Lightweight ByteTrack-style front-end for detector output.
  *
- * Acquisition and maintenance deliberately use different thresholds. A low-confidence detection
- * may maintain an already-established identity through wire mesh/partial occlusion, but it may not
- * create a new visible/shared object. This prevents persistent background clutter from eventually
- * becoming a stable false car/bird merely because it was misclassified several times.
+ * Established objects are allowed to coast very briefly through detector misses. Motion is
+ * predicted in image space and then corrected when the next detector result arrives. This keeps
+ * boxes and downstream 3D association attached to moving people/cars instead of visibly snapping
+ * behind them at inference cadence. Weak observations may maintain an existing identity but cannot
+ * create a new object on their own.
  */
 class TemporalDetectionTracker(private val userThreshold: Float) {
     private data class State(
@@ -49,6 +51,10 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         var top: Float,
         var right: Float,
         var bottom: Float,
+        var velocityX: Float,
+        var velocityY: Float,
+        var velocityWidth: Float,
+        var velocityHeight: Float,
         var lastSeenAtMs: Long,
         var hitCount: Int,
         var strongHitCount: Int,
@@ -65,7 +71,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         expire(capturedAtMs)
         states.values.forEach { it.missedUpdates += 1 }
         val available = states.values.toMutableSet()
-        val outputs = mutableListOf<TrackedDetection2D>()
+        val outputs = linkedMapOf<String, TrackedDetection2D>()
 
         candidates.sortedByDescending { it.confidence }.forEach { candidate ->
             if (candidate.confidence < maintainThreshold(candidate.label)) return@forEach
@@ -73,7 +79,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
             val match = available
                 .asSequence()
                 .filter { it.label == candidate.label }
-                .map { state -> state to associationCost(state.box(), candidate) }
+                .map { state -> state to associationCost(predictedBox(state, capturedAtMs), candidate) }
                 .filter { (_, cost) -> cost.isFinite() }
                 .minByOrNull { it.second }
                 ?.first
@@ -93,6 +99,10 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
                     top = candidate.top,
                     right = candidate.right,
                     bottom = candidate.bottom,
+                    velocityX = 0f,
+                    velocityY = 0f,
+                    velocityWidth = 0f,
+                    velocityHeight = 0f,
                     lastSeenAtMs = capturedAtMs,
                     hitCount = 1,
                     strongHitCount = 1,
@@ -100,11 +110,23 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
                 ).also { states[it.id] = it }
             }
 
-            outputs += state.toOutput()
+            outputs[state.id] = state.toOutput(state.box(), state.confidence)
+        }
+
+        // A detector miss should not instantly drop a confirmed physical object. Coast only for a
+        // bounded window; confidence decays quickly and tentative tracks never coast visibly.
+        states.values.forEach { state ->
+            if (state.id in outputs || !isConfirmed(state)) return@forEach
+            val ageMs = (capturedAtMs - state.lastSeenAtMs).coerceAtLeast(0L)
+            if (state.missedUpdates > COAST_MAX_MISSES || ageMs > COAST_HOLD_MS) return@forEach
+            val decay = COAST_CONFIDENCE_DECAY.pow(state.missedUpdates.coerceAtLeast(1))
+            val coastConfidence = state.confidence * decay
+            if (coastConfidence < maintainThreshold(state.label)) return@forEach
+            outputs[state.id] = state.toOutput(predictedBox(state, capturedAtMs), coastConfidence)
         }
 
         expire(capturedAtMs)
-        return outputs
+        return outputs.values.toList()
     }
 
     @Synchronized
@@ -114,37 +136,72 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
 
     private fun updateState(state: State, candidate: DetectionCandidate2D, capturedAtMs: Long) {
         val old = state.box()
-        val normalizedMotion = normalizedCenterDistance(old, candidate)
+        val predicted = predictedBox(state, capturedAtMs)
+        val dt = ((capturedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f).coerceAtMost(0.6f)
+        val normalizedMotion = normalizedCenterDistance(predicted, candidate)
         val alpha = when {
-            normalizedMotion > 0.9f -> 0.78f
-            normalizedMotion > 0.4f -> 0.62f
-            else -> 0.42f
+            normalizedMotion > 0.85f -> 0.86f
+            normalizedMotion > 0.35f -> 0.72f
+            else -> 0.54f
         }
-        state.left = lerp(state.left, candidate.left, alpha)
-        state.top = lerp(state.top, candidate.top, alpha)
-        state.right = lerp(state.right, candidate.right, alpha)
-        state.bottom = lerp(state.bottom, candidate.bottom, alpha)
-        state.confidence = state.confidence * 0.42f + candidate.confidence * 0.58f
+
+        state.left = lerp(predicted.left, candidate.left, alpha)
+        state.top = lerp(predicted.top, candidate.top, alpha)
+        state.right = lerp(predicted.right, candidate.right, alpha)
+        state.bottom = lerp(predicted.bottom, candidate.bottom, alpha)
+
+        val measuredVx = (candidate.centerX - old.centerX) / dt
+        val measuredVy = (candidate.centerY - old.centerY) / dt
+        val measuredVw = (candidate.width - old.width) / dt
+        val measuredVh = (candidate.height - old.height) / dt
+        val velocityAlpha = if (normalizedMotion > 0.35f) 0.58f else 0.34f
+        val maxCenterSpeed = max(old.width, old.height) * MAX_CENTER_SPEED_BOXES_PER_SECOND
+        val maxSizeSpeed = max(old.width, old.height) * MAX_SIZE_SPEED_BOXES_PER_SECOND
+        state.velocityX = lerp(state.velocityX, measuredVx.coerceIn(-maxCenterSpeed, maxCenterSpeed), velocityAlpha)
+        state.velocityY = lerp(state.velocityY, measuredVy.coerceIn(-maxCenterSpeed, maxCenterSpeed), velocityAlpha)
+        state.velocityWidth = lerp(state.velocityWidth, measuredVw.coerceIn(-maxSizeSpeed, maxSizeSpeed), velocityAlpha)
+        state.velocityHeight = lerp(state.velocityHeight, measuredVh.coerceIn(-maxSizeSpeed, maxSizeSpeed), velocityAlpha)
+
+        state.confidence = state.confidence * 0.35f + candidate.confidence * 0.65f
         state.lastSeenAtMs = capturedAtMs
         state.hitCount += 1
         state.missedUpdates = 0
         if (candidate.confidence >= spawnThreshold(candidate.label)) state.strongHitCount += 1
     }
 
-    private fun State.toOutput() = TrackedDetection2D(
+    private fun predictedBox(state: State, atMs: Long): DetectionCandidate2D {
+        val dt = ((atMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f).coerceAtMost(MAX_IMAGE_PREDICTION_SECONDS)
+        if (dt <= 0f) return state.box()
+        val current = state.box()
+        val centerX = current.centerX + state.velocityX * dt
+        val centerY = current.centerY + state.velocityY * dt
+        val width = (current.width + state.velocityWidth * dt).coerceIn(current.width * 0.72f, current.width * 1.38f)
+        val height = (current.height + state.velocityHeight * dt).coerceIn(current.height * 0.72f, current.height * 1.38f)
+        return DetectionCandidate2D(
+            label = state.label,
+            confidence = state.confidence,
+            left = centerX - width * 0.5f,
+            top = centerY - height * 0.5f,
+            right = centerX + width * 0.5f,
+            bottom = centerY + height * 0.5f
+        )
+    }
+
+    private fun State.toOutput(box: DetectionCandidate2D, outputConfidence: Float) = TrackedDetection2D(
         temporalId = id,
         label = label,
-        confidence = confidence,
-        left = left,
-        top = top,
-        right = right,
-        bottom = bottom,
+        confidence = outputConfidence.coerceIn(0f, 1f),
+        left = box.left,
+        top = box.top,
+        right = box.right,
+        bottom = box.bottom,
         confirmed = isConfirmed(this),
         hitCount = hitCount
     )
 
     private fun isConfirmed(state: State): Boolean = when (state.label) {
-        "person", "car" -> state.hitCount >= PERSON_CAR_CONFIRMATION_HITS && state.strongHitCount >= 2
+        "person" -> state.hitCount >= PERSON_CONFIRMATION_HITS && state.strongHitCount >= 1
+        "car" -> state.hitCount >= CAR_CONFIRMATION_HITS && state.strongHitCount >= 2
         "bird" -> state.hitCount >= BIRD_CONFIRMATION_HITS && state.strongHitCount >= 1
         else -> state.hitCount >= OTHER_CONFIRMATION_HITS && state.strongHitCount >= 1
     }
@@ -160,7 +217,7 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
 
         val iouCost = 1f - iou
         val centerCost = (center / centerLimit).coerceIn(0f, 1.5f)
-        return iouCost * 0.72f + centerCost * 0.28f
+        return iouCost * 0.65f + centerCost * 0.35f
     }
 
     private fun normalizedCenterDistance(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
@@ -186,10 +243,10 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     }
 
     private fun spawnThreshold(label: String): Float = when (label) {
-        // Keep chicken acquisition below the generic preference, but never allow the old 10-15%
-        // weak path to create a bird. Low scores only maintain an already acquired bird.
         "bird" -> maxOf(BIRD_SPAWN_THRESHOLD, minOf(userThreshold, BIRD_USER_THRESHOLD_CAP))
-        "person" -> maxOf(userThreshold, PERSON_SPAWN_THRESHOLD)
+        // A person at demo distance often lands in the 0.4-0.6 range. Temporal confirmation still
+        // prevents a one-frame weak hit from becoming shared state.
+        "person" -> maxOf(minOf(userThreshold, PERSON_USER_THRESHOLD_CAP), PERSON_SPAWN_THRESHOLD)
         "car" -> maxOf(userThreshold, CAR_SPAWN_THRESHOLD)
         else -> maxOf(userThreshold, OTHER_SPAWN_THRESHOLD)
     }
@@ -213,21 +270,29 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     companion object {
         private const val BIRD_SPAWN_THRESHOLD = 0.24f
         private const val BIRD_USER_THRESHOLD_CAP = 0.28f
-        private const val PERSON_SPAWN_THRESHOLD = 0.60f
+        private const val PERSON_SPAWN_THRESHOLD = 0.44f
+        private const val PERSON_USER_THRESHOLD_CAP = 0.48f
         private const val CAR_SPAWN_THRESHOLD = 0.52f
         private const val OTHER_SPAWN_THRESHOLD = 0.50f
         private const val BIRD_MAINTAIN_THRESHOLD = 0.10f
-        private const val PERSON_CAR_MAINTAIN_THRESHOLD = 0.32f
-        private const val OTHER_MAINTAIN_THRESHOLD = 0.28f
-        private const val PERSON_CAR_CONFIRMATION_HITS = 3
+        private const val PERSON_CAR_MAINTAIN_THRESHOLD = 0.24f
+        private const val OTHER_MAINTAIN_THRESHOLD = 0.26f
+        private const val PERSON_CONFIRMATION_HITS = 2
+        private const val CAR_CONFIRMATION_HITS = 3
         private const val BIRD_CONFIRMATION_HITS = 3
         private const val OTHER_CONFIRMATION_HITS = 2
         private const val TENTATIVE_MAX_MISSES = 1
-        private const val MIN_ASSOCIATION_IOU = 0.08f
-        private const val GENERAL_CENTER_LIMIT = 1.10f
-        private const val BIRD_CENTER_LIMIT = 1.45f
-        private const val MAX_AREA_RATIO = 3.8f
+        private const val COAST_MAX_MISSES = 4
+        private const val COAST_HOLD_MS = 520L
+        private const val COAST_CONFIDENCE_DECAY = 0.82f
+        private const val MIN_ASSOCIATION_IOU = 0.05f
+        private const val GENERAL_CENTER_LIMIT = 1.30f
+        private const val BIRD_CENTER_LIMIT = 1.55f
+        private const val MAX_AREA_RATIO = 4.8f
         private const val MIN_NORMALIZATION_PIXELS = 24f
         private const val STATE_RETENTION_MS = 1_200L
+        private const val MAX_IMAGE_PREDICTION_SECONDS = 0.45f
+        private const val MAX_CENTER_SPEED_BOXES_PER_SECOND = 7.5f
+        private const val MAX_SIZE_SPEED_BOXES_PER_SECOND = 4.0f
     }
 }
