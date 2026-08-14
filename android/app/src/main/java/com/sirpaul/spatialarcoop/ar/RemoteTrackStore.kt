@@ -53,6 +53,11 @@ class RemoteTrackStore {
         markerExpirations[key] = expiresAtMs
     }
 
+    /**
+     * Returns a render-time snapshot with bounded motion extrapolation. The extrapolation horizon is
+     * deliberately longer than the network publish cadence so a moving object does not visually
+     * stop between packets, but an easing term prevents a stale high velocity from running away.
+     */
     fun snapshot(nowMs: Long = System.currentTimeMillis()): List<SpatialTrack> {
         tracks.entries.removeIf { (key, value) ->
             val markerExpiry = markerExpirations[key]
@@ -68,18 +73,21 @@ class RemoteTrackStore {
             } else {
                 (nowMs - track.serverReceivedAtMs).coerceIn(0L, MAX_EXTRAPOLATION_MS)
             }
-            val ageSeconds = extrapolationMs / 1000f
+            val rawSeconds = extrapolationMs / 1000f
+            val horizonFraction = (extrapolationMs.toFloat() / MAX_EXTRAPOLATION_MS).coerceIn(0f, 1f)
+            val easedSeconds = rawSeconds * (1f - 0.24f * horizonFraction)
             track.copy(
                 position = FloatArray(3) { index ->
-                    track.position[index] + track.velocity[index] * ageSeconds
-                }
+                    track.position[index] + track.velocity[index] * easedSeconds
+                },
+                uncertaintyMeters = track.uncertaintyMeters + horizonFraction * 0.08f
             )
         }
     }
 
     companion object {
         private const val REMOTE_TIMEOUT_MS = 4_000L
-        private const val MAX_EXTRAPOLATION_MS = 250L
-        private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.25f
+        private const val MAX_EXTRAPOLATION_MS = 450L
+        private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.20f
     }
 }
