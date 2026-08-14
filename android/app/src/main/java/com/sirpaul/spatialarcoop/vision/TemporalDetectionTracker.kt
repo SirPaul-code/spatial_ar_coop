@@ -116,8 +116,8 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         states.values.forEach { state ->
             if (state.id in outputs || !isConfirmed(state)) return@forEach
             val ageMs = (capturedAtMs - state.lastSeenAtMs).coerceAtLeast(0L)
-            if (state.missedUpdates > COAST_MAX_MISSES || ageMs > COAST_HOLD_MS) return@forEach
-            val decay = COAST_CONFIDENCE_DECAY.toDouble()
+            if (state.missedUpdates > coastMaxMisses(state.label) || ageMs > coastHoldMs(state.label)) return@forEach
+            val decay = coastConfidenceDecay(state.label).toDouble()
                 .pow(state.missedUpdates.coerceAtLeast(1).toDouble())
                 .toFloat()
             val coastConfidence = state.confidence * decay
@@ -137,9 +137,11 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     private fun updateState(state: State, candidate: DetectionCandidate2D, capturedAtMs: Long) {
         val old = state.box()
         val predicted = predictedBox(state, capturedAtMs)
-        val dt = ((capturedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f).coerceAtMost(0.6f)
+        val dt = ((capturedAtMs - state.lastSeenAtMs).coerceAtLeast(1L) / 1000f).coerceAtMost(0.9f)
         val normalizedMotion = normalizedCenterDistance(predicted, candidate)
         val alpha = when {
+            state.label == "car" && normalizedMotion > 0.65f -> 0.92f
+            state.label == "car" && normalizedMotion > 0.28f -> 0.80f
             normalizedMotion > 0.85f -> 0.86f
             normalizedMotion > 0.35f -> 0.72f
             else -> 0.54f
@@ -154,8 +156,13 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         val measuredVy = (candidate.centerY - old.centerY) / dt
         val measuredVw = (candidate.width - old.width) / dt
         val measuredVh = (candidate.height - old.height) / dt
-        val velocityAlpha = if (normalizedMotion > 0.35f) 0.58f else 0.34f
-        val maxCenterSpeed = max(old.width, old.height) * MAX_CENTER_SPEED_BOXES_PER_SECOND
+        val velocityAlpha = when {
+            state.label == "car" && normalizedMotion > 0.28f -> 0.70f
+            state.label == "car" -> 0.42f
+            normalizedMotion > 0.35f -> 0.58f
+            else -> 0.34f
+        }
+        val maxCenterSpeed = max(old.width, old.height) * maxCenterSpeedBoxesPerSecond(state.label)
         val maxSizeSpeed = max(old.width, old.height) * MAX_SIZE_SPEED_BOXES_PER_SECOND
         state.velocityX = lerp(state.velocityX, measuredVx.coerceIn(-maxCenterSpeed, maxCenterSpeed), velocityAlpha)
         state.velocityY = lerp(state.velocityY, measuredVy.coerceIn(-maxCenterSpeed, maxCenterSpeed), velocityAlpha)
@@ -170,13 +177,13 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     }
 
     private fun predictedBox(state: State, atMs: Long): DetectionCandidate2D {
-        val dt = ((atMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f).coerceAtMost(MAX_IMAGE_PREDICTION_SECONDS)
+        val dt = ((atMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f).coerceAtMost(maxImagePredictionSeconds(state.label))
         if (dt <= 0f) return state.box()
         val current = state.box()
         val centerX = current.centerX + state.velocityX * dt
         val centerY = current.centerY + state.velocityY * dt
-        val width = (current.width + state.velocityWidth * dt).coerceIn(current.width * 0.72f, current.width * 1.38f)
-        val height = (current.height + state.velocityHeight * dt).coerceIn(current.height * 0.72f, current.height * 1.38f)
+        val width = (current.width + state.velocityWidth * dt).coerceIn(current.width * 0.68f, current.width * 1.48f)
+        val height = (current.height + state.velocityHeight * dt).coerceIn(current.height * 0.68f, current.height * 1.48f)
         return DetectionCandidate2D(
             label = state.label,
             confidence = state.confidence,
@@ -201,23 +208,23 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
 
     private fun isConfirmed(state: State): Boolean = when (state.label) {
         "person" -> state.hitCount >= PERSON_CONFIRMATION_HITS && state.strongHitCount >= 1
-        "car" -> state.hitCount >= CAR_CONFIRMATION_HITS && state.strongHitCount >= 2
+        "car" -> state.hitCount >= CAR_CONFIRMATION_HITS && state.strongHitCount >= 1
         "bird" -> state.hitCount >= BIRD_CONFIRMATION_HITS && state.strongHitCount >= 1
         else -> state.hitCount >= OTHER_CONFIRMATION_HITS && state.strongHitCount >= 1
     }
 
     private fun associationCost(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
         val areaRatio = max(a.area, b.area) / min(a.area, b.area).coerceAtLeast(1f)
-        if (!areaRatio.isFinite() || areaRatio > MAX_AREA_RATIO) return Float.POSITIVE_INFINITY
+        if (!areaRatio.isFinite() || areaRatio > maxAreaRatio(a.label)) return Float.POSITIVE_INFINITY
 
         val iou = intersectionOverUnion(a, b)
         val center = normalizedCenterDistance(a, b)
-        val centerLimit = if (a.label == "bird") BIRD_CENTER_LIMIT else GENERAL_CENTER_LIMIT
+        val centerLimit = centerLimit(a.label)
         if (iou < MIN_ASSOCIATION_IOU && center > centerLimit) return Float.POSITIVE_INFINITY
 
         val iouCost = 1f - iou
         val centerCost = (center / centerLimit).coerceIn(0f, 1.5f)
-        return iouCost * 0.65f + centerCost * 0.35f
+        return iouCost * 0.60f + centerCost * 0.40f
     }
 
     private fun normalizedCenterDistance(a: DetectionCandidate2D, b: DetectionCandidate2D): Float {
@@ -245,19 +252,42 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     private fun spawnThreshold(label: String): Float = when (label) {
         "bird" -> maxOf(BIRD_SPAWN_THRESHOLD, minOf(userThreshold, BIRD_USER_THRESHOLD_CAP))
         "person" -> maxOf(minOf(userThreshold, PERSON_USER_THRESHOLD_CAP), PERSON_SPAWN_THRESHOLD)
-        "car" -> maxOf(userThreshold, CAR_SPAWN_THRESHOLD)
+        "car" -> maxOf(minOf(userThreshold, CAR_USER_THRESHOLD_CAP), CAR_SPAWN_THRESHOLD)
         else -> maxOf(userThreshold, OTHER_SPAWN_THRESHOLD)
     }
 
     private fun maintainThreshold(label: String): Float = when (label) {
         "bird" -> BIRD_MAINTAIN_THRESHOLD
-        "person", "car" -> PERSON_CAR_MAINTAIN_THRESHOLD
+        "car" -> CAR_MAINTAIN_THRESHOLD
+        "person" -> PERSON_MAINTAIN_THRESHOLD
         else -> OTHER_MAINTAIN_THRESHOLD
     }
 
+    private fun centerLimit(label: String): Float = when (label) {
+        "bird" -> BIRD_CENTER_LIMIT
+        "car" -> CAR_CENTER_LIMIT
+        else -> GENERAL_CENTER_LIMIT
+    }
+
+    private fun maxAreaRatio(label: String): Float = if (label == "car") CAR_MAX_AREA_RATIO else MAX_AREA_RATIO
+
+    private fun coastMaxMisses(label: String): Int = if (label == "car") CAR_COAST_MAX_MISSES else COAST_MAX_MISSES
+
+    private fun coastHoldMs(label: String): Long = if (label == "car") CAR_COAST_HOLD_MS else COAST_HOLD_MS
+
+    private fun coastConfidenceDecay(label: String): Float = if (label == "car") CAR_COAST_CONFIDENCE_DECAY else COAST_CONFIDENCE_DECAY
+
+    private fun maxImagePredictionSeconds(label: String): Float =
+        if (label == "car") CAR_MAX_IMAGE_PREDICTION_SECONDS else MAX_IMAGE_PREDICTION_SECONDS
+
+    private fun maxCenterSpeedBoxesPerSecond(label: String): Float =
+        if (label == "car") CAR_MAX_CENTER_SPEED_BOXES_PER_SECOND else MAX_CENTER_SPEED_BOXES_PER_SECOND
+
+    private fun stateRetentionMs(label: String): Long = if (label == "car") CAR_STATE_RETENTION_MS else STATE_RETENTION_MS
+
     private fun expire(nowMs: Long) {
         states.entries.removeIf { (_, state) ->
-            val stale = nowMs - state.lastSeenAtMs > STATE_RETENTION_MS
+            val stale = nowMs - state.lastSeenAtMs > stateRetentionMs(state.label)
             val tentativeLost = !isConfirmed(state) && state.missedUpdates > TENTATIVE_MAX_MISSES
             stale || tentativeLost
         }
@@ -270,27 +300,37 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
         private const val BIRD_USER_THRESHOLD_CAP = 0.28f
         private const val PERSON_SPAWN_THRESHOLD = 0.40f
         private const val PERSON_USER_THRESHOLD_CAP = 0.42f
-        private const val CAR_SPAWN_THRESHOLD = 0.52f
+        private const val CAR_SPAWN_THRESHOLD = 0.40f
+        private const val CAR_USER_THRESHOLD_CAP = 0.46f
         private const val OTHER_SPAWN_THRESHOLD = 0.50f
         private const val BIRD_MAINTAIN_THRESHOLD = 0.10f
-        private const val PERSON_CAR_MAINTAIN_THRESHOLD = 0.24f
+        private const val CAR_MAINTAIN_THRESHOLD = 0.18f
+        private const val PERSON_MAINTAIN_THRESHOLD = 0.24f
         private const val OTHER_MAINTAIN_THRESHOLD = 0.26f
         private const val PERSON_CONFIRMATION_HITS = 2
-        private const val CAR_CONFIRMATION_HITS = 3
+        private const val CAR_CONFIRMATION_HITS = 2
         private const val BIRD_CONFIRMATION_HITS = 3
         private const val OTHER_CONFIRMATION_HITS = 2
         private const val TENTATIVE_MAX_MISSES = 1
         private const val COAST_MAX_MISSES = 4
+        private const val CAR_COAST_MAX_MISSES = 7
         private const val COAST_HOLD_MS = 520L
+        private const val CAR_COAST_HOLD_MS = 900L
         private const val COAST_CONFIDENCE_DECAY = 0.82f
+        private const val CAR_COAST_CONFIDENCE_DECAY = 0.88f
         private const val MIN_ASSOCIATION_IOU = 0.05f
         private const val GENERAL_CENTER_LIMIT = 1.30f
         private const val BIRD_CENTER_LIMIT = 1.55f
+        private const val CAR_CENTER_LIMIT = 1.85f
         private const val MAX_AREA_RATIO = 4.8f
+        private const val CAR_MAX_AREA_RATIO = 7.5f
         private const val MIN_NORMALIZATION_PIXELS = 24f
         private const val STATE_RETENTION_MS = 1_200L
+        private const val CAR_STATE_RETENTION_MS = 2_000L
         private const val MAX_IMAGE_PREDICTION_SECONDS = 0.45f
+        private const val CAR_MAX_IMAGE_PREDICTION_SECONDS = 0.72f
         private const val MAX_CENTER_SPEED_BOXES_PER_SECOND = 7.5f
+        private const val CAR_MAX_CENTER_SPEED_BOXES_PER_SECOND = 10.0f
         private const val MAX_SIZE_SPEED_BOXES_PER_SECOND = 4.0f
     }
 }
