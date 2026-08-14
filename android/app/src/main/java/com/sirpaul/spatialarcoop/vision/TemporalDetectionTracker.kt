@@ -113,8 +113,6 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
             outputs[state.id] = state.toOutput(state.box(), state.confidence)
         }
 
-        // A detector miss should not instantly drop a confirmed physical object. Coast only for a
-        // bounded window; confidence decays quickly and tentative tracks never coast visibly.
         states.values.forEach { state ->
             if (state.id in outputs || !isConfirmed(state)) return@forEach
             val ageMs = (capturedAtMs - state.lastSeenAtMs).coerceAtLeast(0L)
@@ -246,8 +244,6 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
 
     private fun spawnThreshold(label: String): Float = when (label) {
         "bird" -> maxOf(BIRD_SPAWN_THRESHOLD, minOf(userThreshold, BIRD_USER_THRESHOLD_CAP))
-        // A person at demo distance often lands in the 0.4-0.6 range. Temporal confirmation still
-        // prevents a one-frame weak hit from becoming shared state.
         "person" -> maxOf(minOf(userThreshold, PERSON_USER_THRESHOLD_CAP), PERSON_SPAWN_THRESHOLD)
         "car" -> maxOf(userThreshold, CAR_SPAWN_THRESHOLD)
         else -> maxOf(userThreshold, OTHER_SPAWN_THRESHOLD)
@@ -272,8 +268,8 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
     companion object {
         private const val BIRD_SPAWN_THRESHOLD = 0.24f
         private const val BIRD_USER_THRESHOLD_CAP = 0.28f
-        private const val PERSON_SPAWN_THRESHOLD = 0.44f
-        private const val PERSON_USER_THRESHOLD_CAP = 0.48f
+        private const val PERSON_SPAWN_THRESHOLD = 0.40f
+        private const val PERSON_USER_THRESHOLD_CAP = 0.42f
         private const val CAR_SPAWN_THRESHOLD = 0.52f
         private const val OTHER_SPAWN_THRESHOLD = 0.50f
         private const val BIRD_MAINTAIN_THRESHOLD = 0.10f
