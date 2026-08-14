@@ -29,7 +29,7 @@ class PoseTrackingTest {
         poseJoints = pose
     )
 
-    @Test fun confirmedPersonPublishesSmoothedPoseAndBrieflyHoldsItAcrossPoseMiss() {
+    @Test fun confirmedPersonPublishesSmoothedPoseAndHoldsItAcrossShortPoseDropouts() {
         val tracker = DetectionTracker("phone-a")
         val t0 = 100_000L
 
@@ -46,8 +46,11 @@ class PoseTrackingTest {
         ).single()
         assertTrue("brief pose miss should retain the shared stick figure", missingPose.poseJoints.isNotEmpty())
 
-        val afterHold = tracker.current(t0 + 900).single()
-        assertTrue("stale articulation should fall back to the person cuboid", afterHold.poseJoints.isEmpty())
+        val stillHeld = tracker.current(t0 + 900).single()
+        assertTrue("articulation should survive a short landmark dropout", stillHeld.poseJoints.isNotEmpty())
+
+        val afterPoseHold = tracker.current(t0 + 1_640).single()
+        assertTrue("stale articulation should eventually fall back to the person volume", afterPoseHold.poseJoints.isEmpty())
     }
 
     @Test fun nonPersonTrackNeverPublishesPosePayload() {
