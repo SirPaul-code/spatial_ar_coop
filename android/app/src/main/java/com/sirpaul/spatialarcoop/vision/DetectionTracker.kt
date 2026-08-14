@@ -138,12 +138,12 @@ class DetectionTracker(private val sourceId: String) {
         val gate = measurementGate(state, observation, dt)
 
         state.associationKey = observation.associationKey ?: state.associationKey
-        state.confidence = state.confidence * 0.45f + observation.confidence * 0.55f
+        state.confidence = state.confidence * 0.38f + observation.confidence * 0.62f
 
         if (residualDistance > gate) {
             state.position = predicted
             state.rejectedMeasurements += 1
-            val damping = if (state.rejectedMeasurements >= 2) 0f else 0.25f
+            val damping = if (state.rejectedMeasurements >= 2) 0f else 0.30f
             state.velocity = FloatArray(3) { index -> state.velocity[index] * damping }
             state.uncertaintyMeters = (maxOf(state.uncertaintyMeters, observation.uncertaintyMeters) + 0.10f)
                 .coerceAtMost(MAX_UNCERTAINTY_METERS)
@@ -159,28 +159,27 @@ class DetectionTracker(private val sourceId: String) {
         if (groundContactMeasurement) corrected[1] = observation.position[1]
 
         val measuredVelocity = FloatArray(3) { index -> residual[index] / dt }
-        val beta = if (apparentSpeed > 1.5f) 0.20f else 0.10f
+        val beta = if (apparentSpeed > 1.2f) 0.28f else 0.16f
         var velocity = FloatArray(3) { index ->
             state.velocity[index] * (1f - beta) + measuredVelocity[index] * beta
         }
         velocity = clampMagnitude(velocity, maxSpeed(observation.label))
-        if (groundContactMeasurement) velocity[1] *= 0.08f
+        if (groundContactMeasurement) velocity[1] *= 0.06f
         if (residualDistance < STATIONARY_RESIDUAL_METERS && magnitude(velocity) < STATIONARY_SPEED_METERS_PER_SECOND) {
             velocity = floatArrayOf(0f, 0f, 0f)
         }
 
         state.position = corrected
         state.velocity = velocity
-        state.uncertaintyMeters = state.uncertaintyMeters * 0.55f + observation.uncertaintyMeters * 0.45f
+        state.uncertaintyMeters = state.uncertaintyMeters * 0.48f + observation.uncertaintyMeters * 0.52f
         state.extentMeters = FloatArray(3) { index ->
-            state.extentMeters.getOrElse(index) { observation.extentMeters[index] } * 0.78f +
-                observation.extentMeters[index] * 0.22f
+            state.extentMeters.getOrElse(index) { observation.extentMeters[index] } * 0.68f +
+                observation.extentMeters[index] * 0.32f
         }
         val motionYaw = if (observation.label == "car" && magnitude(velocity) > CAR_YAW_FROM_SPEED_METERS_PER_SECOND) {
-            // Renderer convention: local +Z has shared-site bearing -yaw.
             -atan2(velocity[0], velocity[2])
         } else null
-        state.yawRadians = blendAngle(state.yawRadians, motionYaw ?: observation.yawRadians, 0.16f)
+        state.yawRadians = blendAngle(state.yawRadians, motionYaw ?: observation.yawRadians, 0.26f)
         if (observation.poseJoints.isNotEmpty()) {
             state.poseJoints = blendPose(state.poseJoints, observation.poseJoints)
             state.poseLastSeenAtMs = observation.observedAtMs
@@ -188,8 +187,6 @@ class DetectionTracker(private val sourceId: String) {
         state.spatialMethod = observation.spatialMethod
         state.terrainY = observation.terrainY
         state.depthConfidence = observation.depthConfidence
-        // A later high-quality ground/plane measurement may reduce the confirmation requirement of
-        // a track that initially started from the conservative monocular fallback.
         state.requiredHits = min(state.requiredHits, observation.requiredHits.coerceIn(2, 6))
         state.lastSeenAtMs = observation.observedAtMs
         state.hitCount += 1
@@ -206,7 +203,7 @@ class DetectionTracker(private val sourceId: String) {
                     previous.offsetMeters.getOrElse(index) { fresh.offsetMeters[index] } * (1f - POSE_JOINT_ALPHA) +
                         fresh.offsetMeters[index] * POSE_JOINT_ALPHA
                 },
-                confidence = previous.confidence * 0.35f + fresh.confidence * 0.65f
+                confidence = previous.confidence * 0.28f + fresh.confidence * 0.72f
             )
         }
     }
@@ -220,11 +217,11 @@ class DetectionTracker(private val sourceId: String) {
         uncertaintyMeters: Float,
         depthConfidence: Float?
     ): Float {
-        if (residualDistance < POSITION_DEADBAND_METERS) return 0.06f
-        val quality = (1f - (uncertaintyMeters / 1.4f)).coerceIn(0f, 1f)
-        val depthBoost = (depthConfidence ?: 0f).coerceIn(0f, 1f) * 0.08f
-        val motionBoost = (apparentSpeed / 4f).coerceIn(0f, 1f) * 0.24f
-        return (0.18f + quality * 0.18f + depthBoost + motionBoost).coerceIn(0.16f, 0.62f)
+        if (residualDistance < POSITION_DEADBAND_METERS) return 0.08f
+        val quality = (1f - (uncertaintyMeters / 1.5f)).coerceIn(0f, 1f)
+        val depthBoost = (depthConfidence ?: 0f).coerceIn(0f, 1f) * 0.10f
+        val motionBoost = (apparentSpeed / 4f).coerceIn(0f, 1f) * 0.30f
+        return (0.24f + quality * 0.20f + depthBoost + motionBoost).coerceIn(0.22f, 0.78f)
     }
 
     private fun isGroundContactMethod(method: String): Boolean =
@@ -233,18 +230,18 @@ class DetectionTracker(private val sourceId: String) {
 
     private fun measurementGate(state: State, observation: SpatialObservation, dt: Float): Float {
         val base = when (observation.label) {
-            "car" -> 0.95f
-            "person" -> 0.68f
-            "bird" -> 0.40f
-            else -> 0.58f
+            "car" -> 1.00f
+            "person" -> 0.74f
+            "bird" -> 0.44f
+            else -> 0.62f
         }
         val uncertainty = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.8f)
-        val motionAllowance = maxSpeed(observation.label) * dt * 0.40f
+        val motionAllowance = maxSpeed(observation.label) * dt * 0.55f
         val maxGate = when (observation.label) {
-            "car" -> 3.2f
-            "person" -> 1.8f
-            "bird" -> 1.1f
-            else -> 1.7f
+            "car" -> 3.5f
+            "person" -> 2.1f
+            "bird" -> 1.25f
+            else -> 1.9f
         }
         return (base + uncertainty * 1.20f + motionAllowance).coerceAtMost(maxGate)
     }
@@ -267,20 +264,20 @@ class DetectionTracker(private val sourceId: String) {
     private fun associationRadius(state: State, observation: SpatialObservation): Float {
         val ageSeconds = ((observation.observedAtMs - state.lastSeenAtMs).coerceAtLeast(0L) / 1000f)
         val base = when (observation.label) {
-            "car" -> 1.05f
-            "person" -> 0.78f
-            "bird" -> 0.42f
-            else -> 0.68f
+            "car" -> 1.15f
+            "person" -> 0.85f
+            "bird" -> 0.46f
+            else -> 0.75f
         }
-        val uncertaintyAllowance = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.4f)
-        return (base + ageSeconds * 0.50f + uncertaintyAllowance).coerceAtMost(2.5f)
+        val uncertaintyAllowance = (state.uncertaintyMeters + observation.uncertaintyMeters).coerceAtMost(1.5f)
+        return (base + ageSeconds * 0.65f + uncertaintyAllowance).coerceAtMost(3.0f)
     }
 
     private fun reacquireRadius(label: String): Float = when (label) {
-        "car" -> 4.5f
-        "person" -> 2.4f
-        "bird" -> 1.0f
-        else -> 1.7f
+        "car" -> 5.0f
+        "person" -> 2.8f
+        "bird" -> 1.2f
+        else -> 2.0f
     }
 
     private fun maxSpeed(label: String): Float = when (label) {
@@ -347,16 +344,16 @@ class DetectionTracker(private val sourceId: String) {
     }
 
     companion object {
-        private const val POSITION_DEADBAND_METERS = 0.08f
-        private const val STATIONARY_RESIDUAL_METERS = 0.20f
-        private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.22f
-        private const val CAR_YAW_FROM_SPEED_METERS_PER_SECOND = 1.0f
+        private const val POSITION_DEADBAND_METERS = 0.05f
+        private const val STATIONARY_RESIDUAL_METERS = 0.18f
+        private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.35f
+        private const val CAR_YAW_FROM_SPEED_METERS_PER_SECOND = 0.85f
         private const val MAX_UNCERTAINTY_METERS = 3.0f
-        private const val MAX_PREDICTION_SECONDS = 0.25f
+        private const val MAX_PREDICTION_SECONDS = 0.45f
         private const val TRACK_TIMEOUT_MS = 1_500L
         private const val REACQUIRE_RATIO = 0.70f
         private const val REACQUIRE_MARGIN_METERS = 0.20f
-        private const val POSE_JOINT_ALPHA = 0.44f
-        private const val POSE_HOLD_MS = 700L
+        private const val POSE_JOINT_ALPHA = 0.62f
+        private const val POSE_HOLD_MS = 1_500L
     }
 }
