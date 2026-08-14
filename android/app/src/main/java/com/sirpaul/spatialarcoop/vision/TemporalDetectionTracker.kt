@@ -119,7 +119,9 @@ class TemporalDetectionTracker(private val userThreshold: Float) {
             if (state.id in outputs || !isConfirmed(state)) return@forEach
             val ageMs = (capturedAtMs - state.lastSeenAtMs).coerceAtLeast(0L)
             if (state.missedUpdates > COAST_MAX_MISSES || ageMs > COAST_HOLD_MS) return@forEach
-            val decay = COAST_CONFIDENCE_DECAY.pow(state.missedUpdates.coerceAtLeast(1))
+            val decay = COAST_CONFIDENCE_DECAY.toDouble()
+                .pow(state.missedUpdates.coerceAtLeast(1).toDouble())
+                .toFloat()
             val coastConfidence = state.confidence * decay
             if (coastConfidence < maintainThreshold(state.label)) return@forEach
             outputs[state.id] = state.toOutput(predictedBox(state, capturedAtMs), coastConfidence)
