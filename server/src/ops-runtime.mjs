@@ -1,5 +1,5 @@
 import { SpatialFusionEngine } from './fusion.mjs';
-import { opsPage } from './ops-page.mjs';
+import { opsPage } from './ops-page-hifi.mjs';
 
 export function installOpsLayer(app, {
   historyWindowMs = 10 * 60 * 1000,
@@ -42,6 +42,9 @@ export function installOpsLayer(app, {
   };
   app.server.on('request', wrappedHandler);
 
+  // Replay stays deliberately compact at ~2 Hz. The live /ops-state endpoint may be polled much
+  // faster by the browser and calls engine.ingest directly, so live rendering and replay storage
+  // have independent cadences.
   const sample = () => {
     const maps = app.store.listMaps();
     const liveMapIds = new Set();
