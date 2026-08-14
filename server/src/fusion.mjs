@@ -7,6 +7,9 @@ const DEFAULT_GATE_METERS = {
   unknown: 1.8
 };
 
+const MAX_POSE_JOINTS = 24;
+const MIN_FUSED_POSE_JOINTS = 6;
+
 export class SpatialFusionEngine {
   constructor({
     historyWindowMs = 10 * 60 * 1000,
@@ -117,6 +120,7 @@ export class SpatialFusionEngine {
       let bestScore = Infinity;
       for (const cluster of clusters) {
         if (cluster.label !== observation.label) continue;
+        // Never collapse two independent objects emitted by one source phone into one entity.
         if (cluster.sourceIds.has(observation.sourceId)) continue;
         const center = weightedVector(cluster.observations, 'position');
         const distance = distance3(center, observation.position);
@@ -146,8 +150,9 @@ export class SpatialFusionEngine {
         if (usedPrevious.has(i)) continue;
         const prior = previous[i];
         if (prior.label !== measurement.label) continue;
-        const distance = distance3(prior.position, measurement.position);
-        const gate = Math.max(1.5, fusionGate(measurement.label, prior.uncertaintyMeters, measurement.uncertaintyMeters) * 1.6);
+        const predicted = add3(prior.position, scale3(prior.velocity ?? [0, 0, 0], Math.min(.45, Math.max(0, (now - prior.lastSeenAtMs) / 1000))));
+        const distance = distance3(predicted, measurement.position);
+        const gate = Math.max(1.5, fusionGate(measurement.label, prior.uncertaintyMeters, measurement.uncertaintyMeters) * 1.7);
         if (distance <= gate && distance < matchDistance) {
           matchIndex = i;
           matchDistance = distance;
@@ -169,6 +174,7 @@ export class SpatialFusionEngine {
       id: track.id,
       label: track.label,
       position: [...track.position],
+      velocity: [...track.velocity],
       uncertaintyMeters: track.uncertaintyMeters,
       firstSeenAtMs: track.firstSeenAtMs,
       lastSeenAtMs: now
@@ -189,11 +195,12 @@ export class SpatialFusionEngine {
 function normalizeObservation(track) {
   if (!track || !finiteVector(track.position, 3)) return null;
   const uncertainty = finitePositive(track.uncertaintyMeters, 0.5);
+  const label = String(track.label ?? 'unknown').toLowerCase();
   return {
     key: String(track.key ?? `${track.sourceId ?? 'unknown'}:${track.id ?? 'track'}`),
     id: String(track.id ?? 'track'),
     sourceId: String(track.sourceId ?? 'unknown'),
-    label: String(track.label ?? 'unknown').toLowerCase(),
+    label,
     confidence: clamp(Number(track.confidence) || 0, 0, 1),
     position: track.position.map(Number),
     velocity: finiteVector(track.velocity, 3) ? track.velocity.map(Number) : [0, 0, 0],
@@ -205,8 +212,27 @@ function normalizeObservation(track) {
     spatialMethod: String(track.spatialMethod ?? 'unknown'),
     terrainY: Number.isFinite(Number(track.terrainY)) ? Number(track.terrainY) : null,
     depthConfidence: Number.isFinite(Number(track.depthConfidence)) ? clamp(Number(track.depthConfidence), 0, 1) : null,
-    hitCount: Math.max(0, Math.trunc(Number(track.hitCount) || 0))
+    hitCount: Math.max(0, Math.trunc(Number(track.hitCount) || 0)),
+    poseJoints: label === 'person' ? normalizePoseJoints(track.poseJoints) : []
   };
+}
+
+function normalizePoseJoints(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const joint of value.slice(0, MAX_POSE_JOINTS)) {
+    if (!Array.isArray(joint) || joint.length !== 5) continue;
+    const index = Math.trunc(Number(joint[0]));
+    const offset = joint.slice(1, 4).map(Number);
+    const confidence = Number(joint[4]);
+    if (index < 0 || index > 32 || seen.has(index)) continue;
+    if (!offset.every((component) => Number.isFinite(component) && component >= -4 && component <= 4)) continue;
+    if (!Number.isFinite(confidence)) continue;
+    seen.add(index);
+    out.push([index, ...offset, clamp(confidence, 0, 1)]);
+  }
+  return out;
 }
 
 function fuseCluster(cluster, now) {
@@ -224,6 +250,7 @@ function fuseCluster(cluster, now) {
   const best = observations.toSorted((a, b) => b.confidence - a.confidence)[0];
   const sourceIds = [...new Set(observations.map((observation) => observation.sourceId))].sort();
   const latestObservedAtMs = Math.max(...observations.map((observation) => observation.observedAtMs));
+  const poseJoints = cluster.label === 'person' ? fusePoseJoints(observations, position) : [];
 
   return {
     id: '',
@@ -243,6 +270,7 @@ function fuseCluster(cluster, now) {
     observedAtMs: latestObservedAtMs,
     serverReceivedAtMs: now,
     primarySpatialMethod: best?.spatialMethod ?? 'unknown',
+    poseJoints,
     observations: observations.map((observation) => ({
       key: observation.key,
       sourceId: observation.sourceId,
@@ -253,9 +281,53 @@ function fuseCluster(cluster, now) {
       depthConfidence: observation.depthConfidence,
       terrainY: observation.terrainY,
       hitCount: observation.hitCount,
-      position: observation.position
+      poseJointCount: observation.poseJoints.length,
+      position: [...observation.position]
     }))
   };
+}
+
+/**
+ * Fuse articulation in absolute shared-site coordinates, then store the result relative to the
+ * fused ground-contact root. This lets two phones viewing the same person contribute to one pose.
+ */
+function fusePoseJoints(observations, fusedRoot) {
+  const accumulators = new Map();
+  for (const observation of observations) {
+    for (const joint of observation.poseJoints ?? []) {
+      const index = joint[0];
+      const jointConfidence = clamp(Number(joint[4]) || 0, 0, 1);
+      if (jointConfidence <= 0) continue;
+      const absolute = [
+        observation.position[0] + joint[1],
+        observation.position[1] + joint[2],
+        observation.position[2] + joint[3]
+      ];
+      if (!finiteVector(absolute, 3)) continue;
+      const weight = observationWeight(observation) * Math.max(.08, jointConfidence);
+      let acc = accumulators.get(index);
+      if (!acc) {
+        acc = { sum: [0, 0, 0], weight: 0, missProduct: 1 };
+        accumulators.set(index, acc);
+      }
+      acc.weight += weight;
+      acc.sum[0] += absolute[0] * weight;
+      acc.sum[1] += absolute[1] * weight;
+      acc.sum[2] += absolute[2] * weight;
+      acc.missProduct *= 1 - clamp(observation.confidence * jointConfidence, 0, .98);
+    }
+  }
+
+  const joints = [];
+  for (const [index, acc] of accumulators) {
+    if (acc.weight <= 0) continue;
+    const absolute = acc.sum.map((component) => component / acc.weight);
+    const offset = absolute.map((component, axis) => component - fusedRoot[axis]);
+    if (!offset.every((component) => Number.isFinite(component) && component >= -4 && component <= 4)) continue;
+    joints.push([index, offset[0], offset[1], offset[2], clamp(1 - acc.missProduct, 0, .999)]);
+  }
+  joints.sort((a, b) => a[0] - b[0]);
+  return joints.length >= MIN_FUSED_POSE_JOINTS ? joints.slice(0, MAX_POSE_JOINTS) : [];
 }
 
 function compactFrame(latest) {
@@ -278,6 +350,7 @@ function compactFrame(latest) {
     velocity: [...track.velocity],
     extentMeters: [...track.extentMeters],
     sourceIds: [...track.sourceIds],
+    poseJoints: (track.poseJoints ?? []).map((joint) => [...joint]),
     observations: track.observations.map((observation) => ({
       ...observation,
       position: [...observation.position]
@@ -371,6 +444,14 @@ function distance3(a, b) {
   const dy = a[1] - b[1];
   const dz = a[2] - b[2];
   return Math.hypot(dx, dy, dz);
+}
+
+function add3(a, b) {
+  return [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+}
+
+function scale3(a, scalar) {
+  return [a[0] * scalar, a[1] * scalar, a[2] * scalar];
 }
 
 function clamp(value, min, max) {
