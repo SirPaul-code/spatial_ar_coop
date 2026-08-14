@@ -2,6 +2,7 @@ package com.sirpaul.spatialarcoop.ar
 
 import com.sirpaul.spatialarcoop.data.SpatialTrack
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteTrackStoreTest {
@@ -42,11 +43,15 @@ class RemoteTrackStoreTest {
         assertEquals(3f, store.snapshot(now + 1_000).single().position[0], 0.001f)
     }
 
-    @Test fun movingRemoteTrackExtrapolationIsCappedAtQuarterSecond() {
+    @Test fun movingRemoteTrackUsesBoundedEasedHiFiPrediction() {
         val now = 300_000L
         val store = RemoteTrackStore()
         store.update(listOf(track("phone-a", "person", 1f, now, velocityX = 2f)))
-        // 2 m/s * 0.25 s = 0.5 m maximum receiver-side prediction.
-        assertEquals(1.5f, store.snapshot(now + 1_000).single().position[0], 0.001f)
+
+        val predicted = store.snapshot(now + 1_000).single()
+        // The receiver may coast for at most 450 ms, then eases the final quarter of the horizon:
+        // effective dt = .45 * .76 = .342 s, so 2 m/s advances by .684 m.
+        assertEquals(1.684f, predicted.position[0], 0.001f)
+        assertTrue("prediction uncertainty should grow while coasting", predicted.uncertaintyMeters > 0.2f)
     }
 }
