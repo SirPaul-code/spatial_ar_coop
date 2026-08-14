@@ -459,12 +459,12 @@ class ObjectDetectorEngine(
         private const val BOTTOM_CENTER_INSET = 0.04f
         private const val MAX_RESULTS = 40
         private const val MAX_POSES = 4
-        private const val POSE_DETECTION_CONFIDENCE = 0.48f
-        private const val POSE_PRESENCE_CONFIDENCE = 0.45f
-        private const val POSE_TRACKING_CONFIDENCE = 0.50f
-        private const val POSE_BOX_CONFIDENCE = 0.28f
-        private const val POSE_GROUND_CONFIDENCE = 0.42f
-        private const val MIN_POSE_BOX_JOINTS = 8
-        private const val MIN_POSE_ASSOCIATION_SCORE = 0.12f
+        private const val POSE_DETECTION_CONFIDENCE = 0.36f
+        private const val POSE_PRESENCE_CONFIDENCE = 0.34f
+        private const val POSE_TRACKING_CONFIDENCE = 0.42f
+        private const val POSE_BOX_CONFIDENCE = 0.22f
+        private const val POSE_GROUND_CONFIDENCE = 0.30f
+        private const val MIN_POSE_BOX_JOINTS = 6
+        private const val MIN_POSE_ASSOCIATION_SCORE = 0.07f
     }
 }
