@@ -1,5 +1,6 @@
 import { SpatialFusionEngine } from './fusion.mjs';
 import { opsPage } from './ops-page-smooth.mjs';
+import { adminPage as smoothAdminPage } from './admin-page-smooth.mjs';
 
 export function installOpsLayer(app, {
   historyWindowMs = 10 * 60 * 1000,
@@ -70,6 +71,10 @@ export function installOpsLayer(app, {
 
 async function handleOpsRequest({ request, response, app, engine }) {
   const url = new URL(request.url, 'http://localhost');
+  if (request.method === 'GET' && url.pathname === '/') {
+    sendText(response, 200, smoothAdminPage(), 'text/html; charset=utf-8');
+    return true;
+  }
   if (request.method === 'GET' && url.pathname === '/ops') {
     sendText(response, 200, opsPage(), 'text/html; charset=utf-8');
     return true;
