@@ -1,5 +1,5 @@
 import { SpatialFusionEngine } from './fusion.mjs';
-import { opsPage } from './ops-page-hifi.mjs';
+import { opsPage } from './ops-page-smooth.mjs';
 
 export function installOpsLayer(app, {
   historyWindowMs = 10 * 60 * 1000,
