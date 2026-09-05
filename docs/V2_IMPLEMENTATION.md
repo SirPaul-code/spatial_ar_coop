@@ -8,7 +8,7 @@ V2 deliberately separates four problems:
 
 1. **Discovery / transport** — Wi‑Fi Aware.
 2. **Metric world alignment** — ARCore geometry + cross-view visual PnP.
-3. **Validation** — multi-frame consistency + RTT sanity + AR tracking state.
+3. **Validation** — multi-frame transform consensus + RTT sanity + AR tracking state.
 4. **UX** — room discovery, username identity, lock state, POI notification, and off-screen guidance.
 
 ## Transport state machine
@@ -86,8 +86,10 @@ A candidate needs:
 - median reprojection error <= 3.5 px,
 - image-space coverage >= 0.12,
 - aggregate confidence >= 0.22,
-- at least two consecutive transforms agreeing within 0.40 m translation and 8 degrees rotation,
+- at least **three** consecutive transforms agreeing within 0.40 m translation and 8 degrees rotation,
 - final confidence >= 0.28.
+
+Accepted transforms are retained in a seven-solve sliding window. The lock uses the **transform medoid** — the real candidate with minimum aggregate translational/rotational disagreement with the other recent candidates — rather than blindly following the newest solve. This suppresses single-frame pose jitter without averaging rotation matrices into an invalid transform.
 
 The peer also publishes its independent `ready` state. User POI placement is enabled only when both are ready.
 
