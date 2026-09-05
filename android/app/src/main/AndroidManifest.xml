@@ -6,19 +6,18 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
-    <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi.aware" android:required="true" />
     <uses-feature android:name="android.hardware.wifi.rtt" android:required="false" />
 
     <application
         android:allowBackup="false"
         android:hardwareAccelerated="true"
-        android:usesCleartextTraffic="true"
-        android:label="Spatial No-Map POC"
+        android:label="Spatial Sync"
         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
         <meta-data android:name="com.google.ar.core" android:value="required" />
         <activity
