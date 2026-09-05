@@ -171,4 +171,4 @@ docs/PROTOCOL.md            Direct SPV2 peer protocol
 docs/V2_IMPLEMENTATION.md   V2 implementation details and field checks
 ```
 
-The old `server/` folder is retained only as historical/reference code from the first server-assisted experiment. **Spatial Sync V2 does not call or require it at runtime.**
+The fresh V2 branch intentionally contains no FastAPI/Docker runtime. The alignment engine now lives on-device in the Android app.
