@@ -102,7 +102,7 @@ class WifiAwareRttRanger(
                 status("B searching for A over Wi-Fi Aware")
             }
 
-            override fun onServiceDiscovered(peerHandle: PeerHandle, serviceSpecificInfo: ByteArray?, matchFilter: List<ByteArray>?) {
+            override fun onServiceDiscovered(peerHandle: PeerHandle, serviceSpecificInfo: ByteArray?, matchFilter: MutableList<ByteArray>?) {
                 peer = peerHandle
                 status("B discovered A; starting peer-to-peer RTT")
                 rangeNow()
@@ -111,7 +111,7 @@ class WifiAwareRttRanger(
             override fun onServiceDiscoveredWithinRange(
                 peerHandle: PeerHandle,
                 serviceSpecificInfo: ByteArray?,
-                matchFilter: List<ByteArray>?,
+                matchFilter: MutableList<ByteArray>?,
                 distanceMm: Int,
             ) {
                 peer = peerHandle
@@ -141,7 +141,7 @@ class WifiAwareRttRanger(
                     scheduleNext()
                 }
 
-                override fun onRangingResults(results: List<RangingResult>) {
+                override fun onRangingResults(results: MutableList<RangingResult>) {
                     rangingBusy = false
                     val result = results.firstOrNull { it.status == RangingResult.STATUS_SUCCESS }
                     if (result != null) {
