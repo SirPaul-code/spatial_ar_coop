@@ -1,17 +1,141 @@
-# Runtime protocol and coordinate conventions
+# SPV2 direct peer protocol and coordinate conventions
 
-The POC uses one WebSocket room with two logical roles, `A` and `B`.
+Spatial Sync V2 does not use HTTP or WebSockets. After Wi‑Fi Aware discovery the two Android devices establish an encrypted Wi‑Fi Aware network data path and open one direct TCP stream.
+
+## Wire framing
+
+Every record is:
 
 ```text
-/ws/{room_id}/A
-/ws/{room_id}/B
+uint32 magic       = 0x53505632  // "SPV2"
+uint8  version     = 2
+uint8  type
+uint32 payloadSize
+byte[payloadSize] payload
 ```
+
+Maximum payload size is 8 MiB. Numeric fields use Java `DataOutputStream` / `DataInputStream` representation (big-endian). Camera JPEG bytes are carried as raw bytes on the wire even though `CapturedFrame` internally retains the legacy Base64 field.
+
+Message types:
+
+```text
+1 HELLO
+2 FRAME
+3 POI
+4 CLEAR_POI
+5 RANGE
+6 QUALITY
+```
+
+## Discovery / room handshake
+
+The creator publishes the Wi‑Fi Aware service:
+
+```text
+spatialnomap.v2
+```
+
+Service-specific info:
+
+```text
+V2|<ROOM>|<USERNAME>
+```
+
+The joining device subscribes to that service and shows matching rooms in the UI. When selected it sends an Aware discovery message:
+
+```text
+JOIN|<ROOM>|<USERNAME>
+```
+
+The publisher creates a TCP `ServerSocket`, requests an encrypted Wi‑Fi Aware data path, and transfers the selected server port through the Wi‑Fi Aware network specifier. It acknowledges readiness to the subscriber with:
+
+```text
+NDP|<ROOM>
+```
+
+The subscriber requests its matching data path and obtains the publisher's peer-scoped IPv6 address and port from `WifiAwareNetworkInfo`. It connects through that Aware `Network.socketFactory`; the socket is therefore bound to the direct peer network rather than arbitrary internet routing.
+
+The current prototype derives the NDP PSK from the random room code. This protects the direct link from unrelated peers but is not intended as a long-term authenticated identity system.
+
+## HELLO
+
+Payload:
+
+```text
+UTF username
+UTF deviceModel
+```
+
+Used to replace provisional discovery metadata with the connected peer identity.
+
+## FRAME
+
+Payload:
+
+```text
+int64 timestampNs
+float32 cameraTranslation[3]
+float32 cameraQuaternion[4] // x,y,z,w
+float32 fx, fy, cx, cy
+int32 imageWidth, imageHeight
+int32 jpegLength
+byte[jpegLength] grayscaleJpeg
+int32 metricPointCount
+float32 metricPoints[metricPointCount][5]
+```
+
+Metric point layout:
+
+```text
+[u_image, v_image, X_world, Y_world, Z_world]
+```
+
+Each phone sends frames continuously. The sender uses a latest-frame back-pressure queue: if processing/networking falls behind, stale camera frames are dropped instead of building latency.
+
+## POI
+
+Payload:
+
+```text
+int64 poiId
+UTF ownerUsername
+float32 pointWorld[3]
+int64 createdAtUnixMs
+```
+
+`pointWorld` is expressed in the sender's current ARCore world. The receiver transforms it through its locked `T_localWorld_remoteWorld` before rendering.
+
+## CLEAR_POI
+
+Empty payload. Clears the current POI on both peers.
+
+## RANGE
+
+Payload:
+
+```text
+float32 distanceM
+float32 stdDevM
+int32 successfulSamples
+```
+
+Source is peer Wi‑Fi Aware RTT. V2 does **not** use RTT to manufacture the metric scale of the visual solution. It is an independent consistency measurement: a PnP transform whose implied phone separation is grossly incompatible with RTT is penalized/rejected.
+
+## QUALITY
+
+Payload:
+
+```text
+float32 confidence
+int32 stableSolveCount
+bool ready
+```
+
+Each device solves alignment independently. POI placement is enabled only after both peers report a stable local lock.
 
 ## Coordinate systems
 
 ### ARCore camera
-
-Physical camera pose returned by ARCore is `T_W_C`, camera coordinates into the local ARCore world.
 
 ARCore/OpenGL camera axes:
 
@@ -21,9 +145,17 @@ ARCore/OpenGL camera axes:
 -z forward
 ```
 
+ARCore camera pose is:
+
+```text
+T_W_C
+```
+
+mapping camera coordinates into that device's local ARCore world.
+
 ### OpenCV camera
 
-OpenCV PnP/epipolar conventions use:
+PnP uses:
 
 ```text
 +x right
@@ -31,154 +163,41 @@ OpenCV PnP/epipolar conventions use:
 +z forward
 ```
 
-The axis conversion is:
+Output-axis conversion is:
 
 ```text
 S = diag(1, -1, -1)
-```
-
-For homogeneous transforms:
-
-```text
 S4 = diag(1, -1, -1, 1)
 ```
 
-### Shared transform
-
-The desired runtime alignment is:
+For a receiver B solving metric points from remote world A:
 
 ```text
-T_WB_WA
+solvePnP -> T_CVB_WA
+T_CB_WA = S4 * T_CVB_WA
+T_WB_WA = T_WB_CB * T_CB_WA
 ```
 
-which maps a point represented in A's ARCore world into B's ARCore world:
+A remote POI then becomes:
 
 ```text
 P_WB = T_WB_WA * P_WA
 ```
 
-## Frame message
+The receiver reprojects `P_WB` every render frame with its current ARCore view/projection matrices. If its projection is outside the viewport or behind the camera, the renderer instead derives a camera-space bearing and drives the edge-arrow UI.
 
-Each phone sends:
+## Alignment quality
 
-```json
-{
-  "type": "frame",
-  "session_id": "...",
-  "timestamp_ns": 123,
-  "pose": {
-    "t": [0.0, 0.0, 0.0],
-    "q": [0.0, 0.0, 0.0, 1.0]
-  },
-  "intrinsics": {
-    "fx": 1000.0,
-    "fy": 1000.0,
-    "cx": 640.0,
-    "cy": 360.0,
-    "width": 1280,
-    "height": 720
-  },
-  "jpeg_b64": "...",
-  "metric_points": [
-    [512.0, 341.0, 0.4, -0.1, -2.8]
-  ]
-}
-```
+The current V2 gate combines:
 
-`pose` is the ARCore physical-camera pose in that phone's local world.
+- SIFT ratio-filtered feature matches,
+- metric support association,
+- PnP RANSAC inlier count,
+- median reprojection error,
+- image-space inlier coverage,
+- consecutive transform consistency,
+- peer readiness exchange,
+- optional RTT distance consistency,
+- ARCore tracking continuity.
 
-`metric_points` are A-side support samples:
-
-```text
-[u_cpu, v_cpu, X_worldA, Y_worldA, Z_worldA]
-```
-
-The JPEG and intrinsics are scaled together. The support pixel coordinates are scaled by the same factor.
-
-## Target message
-
-A sends a target after a hit/depth lookup:
-
-```json
-{
-  "type": "target",
-  "point_wa": [1.0, 0.2, -4.0],
-  "selected_pixel": [812.0, 514.0]
-}
-```
-
-The target is already metric in `World_A`.
-
-## Range message
-
-B may send direct peer RTT:
-
-```json
-{
-  "type": "range",
-  "source": "wifi_aware_rtt",
-  "distance_m": 2.31,
-  "stddev_m": 0.12,
-  "successful_measurements": 7
-}
-```
-
-The current POC uses this only as the metric scale for the essential-matrix fallback. Production fusion should model it as a probabilistic factor rather than replacing the visual estimate.
-
-## Alignment result
-
-The server reports:
-
-```json
-{
-  "type": "alignment",
-  "ok": true,
-  "method": "metric_depth_pnp",
-  "inliers": 42,
-  "correspondences": 58,
-  "median_reprojection_px": 0.91,
-  "confidence": 0.72
-}
-```
-
-## Primary PnP composition
-
-`solvePnP` returns a transform from `World_A` object coordinates into OpenCV B-camera coordinates:
-
-```text
-T_CVB_WA
-```
-
-Convert its output coordinates to the ARCore B-camera convention:
-
-```text
-T_CB_WA = S4 * T_CVB_WA
-```
-
-B also supplies:
-
-```text
-T_WB_CB
-```
-
-Therefore:
-
-```text
-T_WB_WA = T_WB_CB * S4 * T_CVB_WA
-```
-
-## Essential-matrix fallback composition
-
-`recoverPose` returns relative OpenCV camera motion, with translation only up to scale. After applying a range estimate to `|t|`:
-
-```text
-T_CB_CA = S4 * T_CVB_CVA * S4
-```
-
-and:
-
-```text
-T_WB_WA = T_WB_CB * T_CB_CA * inverse(T_WA_CA)
-```
-
-This fallback is intrinsically weaker: the RF distance is a scalar antenna-to-antenna measurement, not an optical-camera-baseline vector, and asynchronous motion plus antenna/camera lever arms become material at decimeter targets.
+This protocol deliberately transports diagnostics separately from POI data so future solvers (LightGlue, LoFTR, UWB/Channel Sounding factors, multi-peer factor graphs) can replace the current SIFT/PnP implementation without changing the user-facing POI model.
