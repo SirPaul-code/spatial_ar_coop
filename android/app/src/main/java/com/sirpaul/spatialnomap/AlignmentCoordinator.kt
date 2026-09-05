@@ -1,5 +1,6 @@
 package com.sirpaul.spatialnomap
 
+import java.util.ArrayDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -34,6 +35,7 @@ class AlignmentCoordinator(
     private val localFrame = AtomicReference<CapturedFrame?>(null)
     private val remoteFrame = AtomicReference<CapturedFrame?>(null)
     private val solveSerial = AtomicLong(0)
+    private val stableHistory = ArrayDeque<DoubleArray>()
 
     @Volatile private var lockedTransform: DoubleArray? = null
     @Volatile private var candidateTransform: DoubleArray? = null
@@ -121,7 +123,9 @@ class AlignmentCoordinator(
     @Synchronized private fun acceptResult(result: AlignmentEngine.Result?) {
         if (result == null) {
             if (lockedTransform == null) {
-                stableCount = 0; localConfidence = 0f
+                stableCount = 0
+                stableHistory.clear()
+                localConfidence = 0f
                 transport.sendQuality(0f, 0, false)
                 emitQuality()
             }
@@ -141,25 +145,43 @@ class AlignmentCoordinator(
             result.medianReprojectionPx <= 3.5 && result.imageCoverage >= 0.12 && confidence >= 0.22f
 
         if (!passes) {
-            if (lockedTransform == null) { stableCount = 0; localConfidence = confidence; transport.sendQuality(confidence, 0, false) }
+            if (lockedTransform == null) {
+                stableCount = 0
+                stableHistory.clear()
+                localConfidence = confidence
+                transport.sendQuality(confidence, 0, false)
+            }
             latestQuality = Quality(confidence, result.inliers, result.correspondences, result.medianReprojectionPx,
                 result.imageCoverage, stableCount, lockedTransform != null, peerReady, latestRangeM, rangeDelta)
             listener.onAlignmentQuality(latestQuality)
             return
         }
 
+        val candidate = result.transformLocalFromRemote
         val previous = candidateTransform
         if (previous == null) {
-            candidateTransform = result.transformLocalFromRemote; stableCount = 1
+            candidateTransform = candidate
+            stableHistory.clear()
+            stableHistory.addLast(candidate.copyOf())
+            stableCount = 1
         } else {
-            val (translationDelta, rotationDeltaDeg) = AlignmentEngine.transformDelta(previous, result.transformLocalFromRemote)
+            val (translationDelta, rotationDeltaDeg) = AlignmentEngine.transformDelta(previous, candidate)
             if (translationDelta <= 0.40 && rotationDeltaDeg <= 8.0) {
-                candidateTransform = result.transformLocalFromRemote; stableCount++
+                candidateTransform = candidate
+                stableHistory.addLast(candidate.copyOf())
+                while (stableHistory.size > CONSENSUS_WINDOW) stableHistory.removeFirst()
+                stableCount += 1
             } else {
-                candidateTransform = result.transformLocalFromRemote; stableCount = 1
+                candidateTransform = candidate
+                stableHistory.clear()
+                stableHistory.addLast(candidate.copyOf())
+                stableCount = 1
             }
         }
-        if (stableCount >= 2 && confidence >= 0.28f) lockedTransform = result.transformLocalFromRemote.copyOf()
+
+        if (stableCount >= REQUIRED_STABLE_SOLVES && confidence >= 0.28f) {
+            lockedTransform = consensusMedoid(stableHistory)
+        }
         localConfidence = confidence
         val ready = lockedTransform != null
         transport.sendQuality(confidence, stableCount, ready)
@@ -167,6 +189,26 @@ class AlignmentCoordinator(
             result.imageCoverage, stableCount, ready, peerReady, latestRangeM, rangeDelta)
         listener.onAlignmentQuality(latestQuality)
         publishPendingPoiIfPossible()
+    }
+
+    private fun consensusMedoid(history: Collection<DoubleArray>): DoubleArray {
+        if (history.size <= 1) return history.first().copyOf()
+        val transforms = history.toList()
+        var bestIndex = 0
+        var bestCost = Double.POSITIVE_INFINITY
+        for (i in transforms.indices) {
+            var cost = 0.0
+            for (j in transforms.indices) {
+                if (i == j) continue
+                val (translation, rotationDeg) = AlignmentEngine.transformDelta(transforms[i], transforms[j])
+                cost += translation + rotationDeg * ROTATION_TO_METERS_WEIGHT
+            }
+            if (cost < bestCost) {
+                bestCost = cost
+                bestIndex = i
+            }
+        }
+        return transforms[bestIndex].copyOf()
     }
 
     private fun publishPendingPoiIfPossible() {
@@ -178,7 +220,12 @@ class AlignmentCoordinator(
 
     @Synchronized private fun resetAlignment() {
         solveSerial.incrementAndGet()
-        lockedTransform = null; candidateTransform = null; stableCount = 0; localConfidence = 0f; peerReady = false
+        lockedTransform = null
+        candidateTransform = null
+        stableHistory.clear()
+        stableCount = 0
+        localConfidence = 0f
+        peerReady = false
         latestQuality = Quality(rangeM = latestRangeM)
         if (transport.connected) transport.sendQuality(0f, 0, false)
         listener.onAlignmentQuality(latestQuality)
@@ -188,5 +235,11 @@ class AlignmentCoordinator(
         latestQuality = latestQuality.copy(confidence = localConfidence, stableCount = stableCount,
             localReady = lockedTransform != null, peerReady = peerReady, rangeM = latestRangeM)
         listener.onAlignmentQuality(latestQuality)
+    }
+
+    companion object {
+        private const val REQUIRED_STABLE_SOLVES = 3
+        private const val CONSENSUS_WINDOW = 7
+        private const val ROTATION_TO_METERS_WEIGHT = 0.015
     }
 }
