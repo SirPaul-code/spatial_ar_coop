@@ -4,49 +4,62 @@ import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Session
+import org.opencv.android.OpenCVLoader
+import java.security.SecureRandom
 
-class MainActivity : Activity(), NetworkClient.Callbacks {
+class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoordinator.Listener {
     private lateinit var surface: GLSurfaceView
     private lateinit var overlay: TargetOverlayView
     private lateinit var renderer: ArRenderer
-    private lateinit var network: NetworkClient
-    private lateinit var ranger: WifiAwareRttRanger
-    private lateinit var statusView: TextView
-    private lateinit var roleButton: Button
-    private lateinit var serverEdit: EditText
-    private lateinit var roomEdit: EditText
-
+    private lateinit var transport: WifiAwarePeerTransport
+    private lateinit var coordinator: AlignmentCoordinator
+    private lateinit var setupCard: LinearLayout
+    private lateinit var usernameEdit: EditText
+    private lateinit var roomList: LinearLayout
+    private lateinit var setupStatus: TextView
+    private lateinit var transportPill: TextView
+    private lateinit var syncPill: TextView
+    private lateinit var detailPill: TextView
+    private lateinit var banner: LinearLayout
+    private lateinit var bannerTitle: TextView
+    private lateinit var bannerSubtitle: TextView
+    private lateinit var clearButton: TextView
     private var session: Session? = null
     private var installRequested = false
-    private var role = "A"
     private var surfaceResumed = false
+    private var peerConnectedOnce = false
+    private var openCvReady = false
+    private val random = SecureRandom()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.BLACK
-
-        network = NetworkClient(this)
+        openCvReady = OpenCVLoader.initLocal()
+        transport = WifiAwarePeerTransport(this, this)
+        coordinator = AlignmentCoordinator(transport, this)
         overlay = TargetOverlayView(this)
-        renderer = ArRenderer(network, overlay, ::setStatus, ::displayRotation)
-        ranger = WifiAwareRttRanger(this, network, ::setStatus)
-
+        renderer = ArRenderer(coordinator, overlay, ::username, ::setTechnicalStatus, ::displayRotation)
         surface = GLSurfaceView(this).apply {
             setPreserveEGLContextOnPause(true)
             setEGLContextClientVersion(2)
@@ -54,183 +67,163 @@ class MainActivity : Activity(), NetworkClient.Callbacks {
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             setOnTouchListener { _, event ->
-                if (event.action == MotionEvent.ACTION_UP && role == "A") {
-                    renderer.queueTap(event.x, event.y)
-                    true
+                if (event.action == MotionEvent.ACTION_UP && setupCard.visibility != View.VISIBLE) {
+                    renderer.queueTap(event.x, event.y); true
                 } else false
             }
         }
-
         val root = FrameLayout(this)
         root.addView(surface, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        root.addView(buildControls(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        root.addView(buildHud(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        setupCard = buildSetupCard()
+        root.addView(setupCard, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply { leftMargin = dp(22); rightMargin = dp(22) })
+        clearButton = buildClearButton()
+        root.addView(clearButton, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(30) })
+        banner = buildBanner()
+        root.addView(banner, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply { leftMargin = dp(18); rightMargin = dp(18); topMargin = dp(88) })
         setContentView(root)
+        refreshCapabilities()
     }
 
-    private fun buildControls(): LinearLayout {
-        val prefs = getSharedPreferences("poc", MODE_PRIVATE)
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(18, 18, 18, 14)
-            setBackgroundColor(0xaa111111.toInt())
-        }
-        statusView = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            text = "Starting ARCore..."
-        }
-        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        roleButton = Button(this).apply {
-            text = "ROLE A (tap target)"
-            setOnClickListener {
-                role = if (role == "A") "B" else "A"
-                renderer.role = role
-                text = if (role == "A") "ROLE A (tap target)" else "ROLE B (receiver)"
-                network.disconnect()
-                ranger.stop()
-                setStatus("role changed to $role; press CONNECT")
-            }
-        }
-        serverEdit = EditText(this).apply {
-            setTextColor(Color.WHITE)
-            setHintTextColor(0xffaaaaaa.toInt())
-            hint = "server, e.g. 192.168.1.10:8000"
-            setSingleLine(true)
-            setText(prefs.getString("server", "192.168.1.10:8000"))
-        }
-        roomEdit = EditText(this).apply {
-            setTextColor(Color.WHITE)
-            setHintTextColor(0xffaaaaaa.toInt())
-            hint = "room"
-            setSingleLine(true)
-            setText(prefs.getString("room", "field-test"))
-        }
-        val connect = Button(this).apply {
-            text = "CONNECT"
-            setOnClickListener {
-                if (!ensurePermissions()) return@setOnClickListener
-                prefs.edit().putString("server", serverEdit.text.toString()).putString("room", roomEdit.text.toString()).apply()
-                network.connect(serverEdit.text.toString(), roomEdit.text.toString(), role)
-                ranger.start(role)
-            }
-        }
-        val clear = Button(this).apply {
-            text = "CLEAR"
-            setOnClickListener { network.clearTarget(); renderer.setRemoteTarget(null, "") }
-        }
-        row1.addView(roleButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row1.addView(connect, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        row1.addView(clear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        panel.addView(statusView)
-        panel.addView(serverEdit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        panel.addView(roomEdit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        panel.addView(row1)
-        return panel
+    private fun buildHud(): LinearLayout {
+        val out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(14), dp(14), dp(8)) }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        transportPill = pill("OFFLINE", 0xcc1d2228.toInt()); syncPill = pill("NOT SYNCED", 0xcc1d2228.toInt())
+        row.addView(transportPill, LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(8) }); row.addView(syncPill, LinearLayout.LayoutParams(0, dp(42), 1f))
+        detailPill = TextView(this).apply { setTextColor(0xffd6dde4.toInt()); textSize = 12f; gravity = Gravity.CENTER; text = "Direct peer AR • no AP • no cloud"; background = rounded(0x99111418.toInt(), 18f); setPadding(dp(12), dp(5), dp(12), dp(5)) }
+        out.addView(row); out.addView(detailPill, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(32)).apply { topMargin = dp(7) }); return out
     }
 
-    override fun onResume() {
-        super.onResume()
-        startArIfPossible()
+    private fun buildSetupCard(): LinearLayout {
+        val prefs = getSharedPreferences("spatial-v2", MODE_PRIVATE)
+        val card = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(22), dp(22), dp(22), dp(20)); background = rounded(0xf0161b20.toInt(), 28f, 0x334fffc3, 1) }
+        card.addView(TextView(this).apply { text = "SPATIAL SYNC"; setTextColor(Color.WHITE); textSize = 27f; setTypeface(typeface, android.graphics.Typeface.BOLD) })
+        card.addView(TextView(this).apply { text = "Two phones. One shared point. No router."; setTextColor(0xff9eabb5.toInt()); textSize = 14f }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(3); bottomMargin = dp(18) })
+        usernameEdit = EditText(this).apply { hint = "Username"; setSingleLine(true); setText(prefs.getString("username", Build.MODEL.replace("SM-", "Galaxy "))); setTextColor(Color.WHITE); setHintTextColor(0xff6f7b84.toInt()); textSize = 16f; background = rounded(0xff22292f.toInt(), 18f, 0x334fffc3, 1); setPadding(dp(16), 0, dp(16), 0) }
+        card.addView(usernameEdit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)))
+        card.addView(primaryButton("CREATE SPACE") {
+            if (ensurePeerPermissions()) { saveUsername(); roomList.removeAllViews(); val code = generateRoomCode(); setupStatus.text = "Creating room $code…"; transport.createRoom(username(), code) }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)).apply { topMargin = dp(14) })
+        card.addView(secondaryButton("JOIN NEARBY") {
+            if (ensurePeerPermissions()) { saveUsername(); roomList.removeAllViews(); setupStatus.text = "Scanning nearby rooms…"; transport.scanRooms(username()) }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply { topMargin = dp(10) })
+        setupStatus = TextView(this).apply { setTextColor(0xffb9c5cd.toInt()); textSize = 13f; text = "Choose CREATE on one phone and JOIN NEARBY on the other."; setPadding(dp(2), dp(14), dp(2), dp(8)) }
+        card.addView(setupStatus)
+        roomList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(ScrollView(this).apply { addView(roomList) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(144)))
+        return card
     }
 
+    private fun buildBanner(): LinearLayout {
+        val view = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(14), dp(18), dp(14)); background = rounded(0xee1a2126.toInt(), 24f, 0x664fffc3, 1); alpha = 0f; visibility = View.GONE }
+        bannerTitle = TextView(this).apply { setTextColor(Color.WHITE); textSize = 16f; setTypeface(typeface, android.graphics.Typeface.BOLD) }
+        bannerSubtitle = TextView(this).apply { setTextColor(0xffaebbc4.toInt()); textSize = 13f }
+        view.addView(bannerTitle); view.addView(bannerSubtitle); return view
+    }
+
+    private fun buildClearButton() = TextView(this).apply {
+        text = "CLEAR POI"; gravity = Gravity.CENTER; setTextColor(Color.WHITE); textSize = 13f; setTypeface(typeface, android.graphics.Typeface.BOLD); setPadding(dp(22), 0, dp(22), 0)
+        background = rounded(0xd91b2228.toInt(), 24f, 0x445f6a72, 1); visibility = View.GONE
+        setOnClickListener { coordinator.clearPoi(true); renderer.setRemoteTarget(null); showBanner("POI cleared", "Removed from both devices") }
+    }
+
+    private fun primaryButton(label: String, action: () -> Unit) = Button(this).apply { text = label; setTextColor(0xff071713.toInt()); textSize = 14f; setTypeface(typeface, android.graphics.Typeface.BOLD); stateListAnimator = null; background = rounded(0xff4fffc3.toInt(), 18f); setOnClickListener { action() } }
+    private fun secondaryButton(label: String, action: () -> Unit) = Button(this).apply { text = label; setTextColor(Color.WHITE); textSize = 14f; setTypeface(typeface, android.graphics.Typeface.BOLD); stateListAnimator = null; background = rounded(0xff252d33.toInt(), 18f, 0x445f6a72, 1); setOnClickListener { action() } }
+    private fun pill(label: String, color: Int) = TextView(this).apply { text = label; gravity = Gravity.CENTER; setTextColor(Color.WHITE); textSize = 12f; setTypeface(typeface, android.graphics.Typeface.BOLD); background = rounded(color, 20f) }
+    private fun rounded(fill: Int, radiusDp: Float, strokeColor: Int? = null, strokeWidth: Int = 0) = GradientDrawable().apply { shape = GradientDrawable.RECTANGLE; setColor(fill); cornerRadius = dp(radiusDp).toFloat(); if (strokeColor != null && strokeWidth > 0) setStroke(dp(strokeWidth), strokeColor) }
+
+    override fun onResume() { super.onResume(); startArIfPossible() }
     private fun startArIfPossible() {
-        if (!ensurePermissions(cameraOnly = true)) return
+        if (!ensureCameraPermission()) return
         try {
             if (session == null) {
                 when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
-                    ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
-                        installRequested = true
-                        return
-                    }
+                    ArCoreApk.InstallStatus.INSTALL_REQUESTED -> { installRequested = true; return }
                     ArCoreApk.InstallStatus.INSTALLED -> Unit
                 }
-                val s = Session(this)
-                val cfg = Config(s).apply {
-                    planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                    updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                    focusMode = Config.FocusMode.AUTO
-                    if (s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
-                        depthMode = Config.DepthMode.AUTOMATIC
-                    }
-                }
-                s.configure(cfg)
-                session = s
-                renderer.session = s
-                setStatus("ARCore ready; depth=${cfg.depthMode}")
+                val s = Session(this); val config = Config(s).apply { planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL; updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE; focusMode = Config.FocusMode.AUTO; if (s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) depthMode = Config.DepthMode.AUTOMATIC }
+                s.configure(config); session = s; renderer.session = s; setTechnicalStatus("AR ready • depth=${config.depthMode}")
             }
-            session?.resume()
-            if (!surfaceResumed) {
-                surface.onResume()
-                surfaceResumed = true
-            }
-        } catch (t: Throwable) {
-            setStatus("ARCore start failed: ${t.javaClass.simpleName}: ${t.message}")
-        }
+            session?.resume(); if (!surfaceResumed) { surface.onResume(); surfaceResumed = true }
+        } catch (t: Throwable) { setTechnicalStatus("AR start failed: ${t.message}"); showBanner("ARCore failed", t.message ?: t.javaClass.simpleName) }
     }
+    override fun onPause() { if (surfaceResumed) { surface.onPause(); surfaceResumed = false }; session?.pause(); super.onPause() }
+    override fun onDestroy() { coordinator.close(); transport.close(); session?.close(); session = null; super.onDestroy() }
 
-    override fun onPause() {
-        if (surfaceResumed) {
-            surface.onPause()
-            surfaceResumed = false
-        }
-        session?.pause()
-        super.onPause()
+    private fun ensureCameraPermission(): Boolean {
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) return true
+        requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA); return false
     }
-
-    override fun onDestroy() {
-        ranger.stop()
-        network.disconnect()
-        session?.close()
-        session = null
-        super.onDestroy()
-    }
-
-    private fun ensurePermissions(cameraOnly: Boolean = false): Boolean {
+    private fun ensurePeerPermissions(): Boolean {
         val needed = ArrayList<String>()
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.CAMERA)
-        }
-        if (!cameraOnly) {
-            if (Build.VERSION.SDK_INT >= 33) {
-                if (checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
-                    needed.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-                }
-            } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-        }
-        if (needed.isNotEmpty()) {
-            requestPermissions(needed.toTypedArray(), if (cameraOnly) REQ_CAMERA else REQ_ALL)
-            return false
-        }
-        return true
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.CAMERA
+        if (Build.VERSION.SDK_INT >= 33) { if (checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.NEARBY_WIFI_DEVICES }
+        else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.ACCESS_FINE_LOCATION
+        if (needed.isEmpty()) return true
+        requestPermissions(needed.toTypedArray(), REQ_PEER); return false
     }
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.any { it != PackageManager.PERMISSION_GRANTED }) {
-            Toast.makeText(this, "Camera / nearby-device permissions are required for the requested path", Toast.LENGTH_LONG).show()
-            return
-        }
+        if (grantResults.any { it != PackageManager.PERMISSION_GRANTED }) { showBanner("Permission required", "Camera and Nearby devices are required for direct spatial sync"); return }
         if (requestCode == REQ_CAMERA) startArIfPossible()
     }
 
-    override fun onNetworkStatus(text: String) = setStatus(text)
+    override fun onTransportStatus(text: String) { runOnUiThread { setupStatus.text = text; detailPill.text = text } }
+    override fun onRoomFound(room: WifiAwarePeerTransport.NearbyRoom) { runOnUiThread {
+        val tagValue = "room:${room.code}"; roomList.findViewWithTag<View>(tagValue)?.let { roomList.removeView(it) }
+        val distance = room.distanceM?.let { " • %.1f m".format(it) } ?: ""
+        val button = secondaryButton("${room.username}   ${room.code}$distance") { transport.joinRoom(room.code) }.apply { tag = tagValue }
+        roomList.addView(button, 0, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply { bottomMargin = dp(7) }); setupStatus.text = "Nearby room found. Tap to join."
+    } }
+    override fun onConnected(peerUsername: String) { runOnUiThread {
+        transportPill.text = "DIRECT • $peerUsername"; transportPill.background = rounded(0xdd163b31.toInt(), 20f, 0x664fffc3, 1); clearButton.visibility = View.VISIBLE
+        if (!peerConnectedOnce) { peerConnectedOnce = true; coordinator.onConnected(); hideSetup(); showBanner("Connected to $peerUsername", "Direct Wi‑Fi Aware link • no access point") }
+    } }
+    override fun onDisconnected(reason: String) { runOnUiThread {
+        if (!peerConnectedOnce) return@runOnUiThread
+        peerConnectedOnce = false; coordinator.onDisconnected(); renderer.setRemoteTarget(null); clearButton.visibility = View.GONE
+        transportPill.text = "OFFLINE"; transportPill.background = rounded(0xcc1d2228.toInt(), 20f); syncPill.text = "NOT SYNCED"; syncPill.background = rounded(0xcc1d2228.toInt(), 20f)
+        showSetup(); showBanner("Peer disconnected", reason)
+    } }
+    override fun onWireMessage(message: WireMessage) { when (message) {
+        is WireMessage.Frame -> coordinator.onRemoteFrame(message.frame)
+        is WireMessage.Poi -> coordinator.onRemotePoi(message)
+        WireMessage.ClearPoi -> coordinator.clearPoi(false)
+        is WireMessage.Quality -> coordinator.onPeerQuality(message)
+        is WireMessage.Range -> coordinator.onRange(message.distanceM, message.stdDevM, message.samples)
+        is WireMessage.Hello -> Unit
+    } }
+    override fun onRange(distanceM: Float, stdDevM: Float, samples: Int) { coordinator.onRange(distanceM, stdDevM, samples) }
 
-    override fun onRemoteTarget(pointWb: FloatArray?, detail: String) {
-        renderer.setRemoteTarget(pointWb, detail)
+    override fun onAlignmentQuality(quality: AlignmentCoordinator.Quality) { runOnUiThread {
+        val range = quality.rangeM?.let { " • RTT %.2f m".format(it) } ?: ""
+        when {
+            quality.bothReady -> { syncPill.text = "LOCKED • ${(quality.confidence * 100).toInt()}%"; syncPill.background = rounded(0xdd164739.toInt(), 20f, 0x884fffc3.toInt(), 1); detailPill.text = "READY — tap a physical point to sync POI$range" }
+            quality.localReady -> { syncPill.text = "LOCKED LOCAL • WAIT PEER"; syncPill.background = rounded(0xdd5a4719.toInt(), 20f); detailPill.text = "Keep both phones on the same textured area for one more moment$range" }
+            else -> { syncPill.text = if (quality.inliers > 0) "ALIGNING • ${quality.inliers} INLIERS" else "ALIGNING"; syncPill.background = rounded(0xdd413718.toInt(), 20f); detailPill.text = "Look at the same static scene and move both phones slightly$range" }
+        }
+    } }
+    override fun onRemotePoi(pointLocal: FloatArray?, owner: String, confidence: Float) { runOnUiThread { renderer.setRemoteTarget(pointLocal, owner, confidence); if (pointLocal != null) showBanner("POI added from $owner", "Follow the edge arrow until the marker enters view") } }
+    override fun onPoiCleared() { runOnUiThread { renderer.setRemoteTarget(null) } }
+
+    private fun refreshCapabilities() {
+        val caps = transport.capabilities(); val awareText = if (caps.awareSupported) "Aware ✓" else "Aware ✕"; val rttText = if (caps.rttSupported) "RTT ✓" else "RTT —"
+        setupStatus.text = "$awareText   •   $rttText   •   OpenCV ${if (openCvReady) "✓" else "✕"}"
+        if (!openCvReady) showBanner("Alignment unavailable", "OpenCV failed to initialize on this build")
     }
-
-    private fun setStatus(text: String) {
-        runOnUiThread { if (::statusView.isInitialized) statusView.text = text }
+    private fun setTechnicalStatus(text: String) { runOnUiThread { if (!coordinator.quality().bothReady) detailPill.text = text } }
+    private fun hideSetup() { setupCard.animate().alpha(0f).scaleX(0.97f).scaleY(0.97f).setDuration(220).withEndAction { setupCard.visibility = View.GONE }.start() }
+    private fun showSetup() { setupCard.visibility = View.VISIBLE; setupCard.alpha = 0f; setupCard.scaleX = 0.97f; setupCard.scaleY = 0.97f; setupCard.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220).start() }
+    private fun showBanner(title: String, subtitle: String) {
+        banner.animate().cancel(); bannerTitle.text = title; bannerSubtitle.text = subtitle; banner.visibility = View.VISIBLE; banner.alpha = 0f; banner.translationY = -dp(14).toFloat(); banner.animate().alpha(1f).translationY(0f).setDuration(180).start()
+        banner.postDelayed({ if (!isFinishing) banner.animate().alpha(0f).translationY(-dp(10).toFloat()).setDuration(220).withEndAction { banner.visibility = View.GONE }.start() }, 3200L)
     }
-
-    @Suppress("DEPRECATION")
-    private fun displayRotation(): Int = windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
-
-    companion object {
-        private const val REQ_CAMERA = 41
-        private const val REQ_ALL = 42
-    }
+    private fun saveUsername() { getSharedPreferences("spatial-v2", MODE_PRIVATE).edit().putString("username", username()).apply() }
+    private fun username() = usernameEdit.text?.toString()?.trim().orEmpty().ifBlank { Build.MODEL }.take(32)
+    private fun generateRoomCode(): String { val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; return buildString(6) { repeat(6) { append(alphabet[random.nextInt(alphabet.length)]) } } }
+    private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
+    private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
+    @Suppress("DEPRECATION") private fun displayRotation(): Int = windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
+    companion object { private const val REQ_CAMERA = 41; private const val REQ_PEER = 42 }
 }
