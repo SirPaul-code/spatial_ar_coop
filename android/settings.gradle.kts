@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SpatialArCoop"
+rootProject.name = "SpatialNoMap"
 include(":app")

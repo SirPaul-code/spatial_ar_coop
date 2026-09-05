@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 GRADLE_VERSION=8.11.1
-CACHE_ROOT="${GRADLE_USER_HOME:-$HOME/.gradle}/spatial-wrapper"
+CACHE_ROOT="${GRADLE_USER_HOME:-$HOME/.gradle}/spatial-nomap-wrapper"
 DIST_DIR="$CACHE_ROOT/gradle-$GRADLE_VERSION"
 ZIP_FILE="$CACHE_ROOT/gradle-$GRADLE_VERSION-bin.zip"
 if [ ! -x "$DIST_DIR/bin/gradle" ]; then

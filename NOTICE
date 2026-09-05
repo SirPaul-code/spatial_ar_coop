@@ -1,9 +1,0 @@
-Spatial AR Coop
-Copyright 2026 SirPaul-code contributors
-
-This project uses Google ARCore, MediaPipe Tasks, AndroidX, Material Components,
-and OkHttp under their respective licenses. The object detector model is fetched
-from Google's official MediaPipe model bucket during the Android build.
-
-This project is independent and is not affiliated with, endorsed by, or a
-reimplementation of any commercial defense platform.

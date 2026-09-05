@@ -1,33 +1,13 @@
-# Android / Gradle
 .gradle/
-**/build/
-android/local.properties
-*.apk
-*.aab
-*.jks
-*.keystore
-android/app/src/main/assets/efficientdet-lite0.tflite
-android/app/src/main/assets/efficientdet-lite0.tflite.download
-android/app/src/main/assets/efficientdet-lite2.tflite
-android/app/src/main/assets/efficientdet-lite2.tflite.download
-android/app/src/main/assets/pose_landmarker_full.task
-android/app/src/main/assets/pose_landmarker_full.task.download
-
-# Node dependencies
-server/node_modules/
-
-# Runtime state
-.env
-server/data/*
-!server/data/.gitkeep
-
-# IDE / OS
 .idea/
+local.properties
 *.iml
+android/app/build/
+android/build/
+server/.venv/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
 .DS_Store
-Thumbs.db
-
-# Logs / temporary files
-*.log
-*.tmp
-.tmp-*
+.env
