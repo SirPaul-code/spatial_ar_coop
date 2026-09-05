@@ -14,46 +14,36 @@ import com.google.ar.core.TrackingState
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.atan2
+import kotlin.math.sqrt
 
 class ArRenderer(
-    private val network: NetworkClient,
+    private val coordinator: AlignmentCoordinator,
     private val overlay: TargetOverlayView,
+    private val usernameProvider: () -> String,
     private val status: (String) -> Unit,
     private val rotationProvider: () -> Int,
 ) : GLSurfaceView.Renderer {
+    private data class RemoteTarget(val point: FloatArray, val owner: String, val confidence: Float)
     @Volatile var session: Session? = null
-    @Volatile var role: String = "A"
-
     private val background = CameraBackgroundRenderer()
     private val pendingTap = AtomicReference<FloatArray?>(null)
-    private val remoteTarget = AtomicReference<FloatArray?>(null)
-    @Volatile private var remoteDetail: String = ""
+    private val remoteTarget = AtomicReference<RemoteTarget?>(null)
     private var width = 1
     private var height = 1
     private var textureBoundSession: Session? = null
     private var lastCaptureNs = 0L
     private var lastTrackingText = ""
 
-    fun queueTap(x: Float, y: Float) {
-        if (role == "A") pendingTap.set(floatArrayOf(x, y))
+    fun queueTap(x: Float, y: Float) { pendingTap.set(floatArrayOf(x, y)) }
+    fun setRemoteTarget(pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
+        remoteTarget.set(pointLocalWorld?.let { RemoteTarget(it.copyOf(3), owner, confidence) })
+        if (pointLocalWorld == null) overlay.setTarget(null)
     }
 
-    fun setRemoteTarget(pointWb: FloatArray?, detail: String) {
-        remoteTarget.set(pointWb)
-        remoteDetail = detail
-        if (pointWb == null) overlay.setTarget(null, null)
-    }
-
-    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        GLES20.glClearColor(0f, 0f, 0f, 1f)
-        background.createOnGlThread()
-    }
-
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) { GLES20.glClearColor(0f, 0f, 0f, 1f); background.createOnGlThread() }
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-        this.width = width
-        this.height = height
-        GLES20.glViewport(0, 0, width, height)
-        session?.setDisplayGeometry(rotationProvider(), width, height)
+        this.width = width; this.height = height; GLES20.glViewport(0, 0, width, height); session?.setDisplayGeometry(rotationProvider(), width, height)
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -61,92 +51,62 @@ class ArRenderer(
         val s = session ?: return
         try {
             if (textureBoundSession !== s) {
-                s.setCameraTextureName(background.textureId)
-                textureBoundSession = s
-                s.setDisplayGeometry(rotationProvider(), width, height)
+                s.setCameraTextureName(background.textureId); textureBoundSession = s; s.setDisplayGeometry(rotationProvider(), width, height)
             }
-            val frame = s.update()
-            background.draw(frame)
-            val camera = frame.camera
-            val trackingText = "AR ${camera.trackingState}${if (camera.trackingState != TrackingState.TRACKING) " / ${camera.trackingFailureReason}" else ""}"
-            if (trackingText != lastTrackingText) {
-                lastTrackingText = trackingText
-                status(trackingText)
-            }
-            if (camera.trackingState != TrackingState.TRACKING) return
-
-            handleTap(frame, camera)
-            captureIfDue(frame, camera)
-            projectRemoteTarget(camera)
-        } catch (t: Throwable) {
-            status("AR frame error: ${t.message}")
-        }
+            val frame = s.update(); background.draw(frame); val camera = frame.camera
+            val tracking = camera.trackingState == TrackingState.TRACKING
+            coordinator.onTrackingState(tracking)
+            val text = if (tracking) "AR tracking" else "AR ${camera.trackingState} / ${camera.trackingFailureReason}"
+            if (text != lastTrackingText) { lastTrackingText = text; status(text) }
+            if (!tracking) return
+            handleTap(frame, camera); captureIfDue(frame, camera); projectRemoteTarget(camera)
+        } catch (t: Throwable) { status("AR frame error: ${t.javaClass.simpleName}: ${t.message}") }
     }
 
     private fun handleTap(frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
+        if (!coordinator.canPlacePoi()) { status("SYNCING — both phones need a stable visual lock before placing a POI"); return }
         val imagePixel = FloatArray(2)
         frame.transformCoordinates2d(Coordinates2d.VIEW, tap, Coordinates2d.IMAGE_PIXELS, imagePixel)
-
-        var pointWa: FloatArray? = null
-        for (hit in frame.hitTest(tap[0], tap[1])) {
-            val trackable = hit.trackable
-            val usable = when (trackable) {
-                is DepthPoint -> true
-                is Plane -> trackable.isPoseInPolygon(hit.hitPose)
-                is Point -> trackable.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
-                else -> false
-            }
-            if (usable) {
-                pointWa = hit.hitPose.translation
-                break
+        var pointWorld = MetricSupportSampler.pointAtCpuPixel(frame, camera, imagePixel[0], imagePixel[1])
+        if (pointWorld == null) {
+            for (hit in frame.hitTest(tap[0], tap[1])) {
+                val trackable = hit.trackable
+                val usable = when (trackable) {
+                    is DepthPoint -> true
+                    is Plane -> trackable.isPoseInPolygon(hit.hitPose)
+                    is Point -> trackable.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
+                    else -> false
+                }
+                if (usable) { pointWorld = hit.hitPose.translation; break }
             }
         }
-        if (pointWa == null) {
-            pointWa = MetricSupportSampler.pointAtCpuPixel(frame, camera, imagePixel[0], imagePixel[1])
-        }
-        if (pointWa == null) {
-            status("tap has no metric depth/ARCore hit; move phone slightly and retry")
-            return
-        }
-
-        FrameCapture.capture(frame, camera)?.let {
-            network.sendFrame(it)
-            lastCaptureNs = System.nanoTime()
-        }
-        network.sendTarget(pointWa, imagePixel)
-        status("target WA = ${"%.2f".format(pointWa[0])}, ${"%.2f".format(pointWa[1])}, ${"%.2f".format(pointWa[2])}")
+        if (pointWorld == null) { status("No reliable metric depth at the tap. Move the phone slightly and tap again."); return }
+        if (coordinator.sendPoi(pointWorld, usernameProvider())) status("POI sent") else status("POI blocked: sync confidence is not ready")
     }
 
     private fun captureIfDue(frame: Frame, camera: Camera) {
-        if (!network.connected) return
-        val now = System.nanoTime()
-        if (now - lastCaptureNs < 800_000_000L) return
-        val packet = FrameCapture.capture(frame, camera) ?: return
-        network.sendFrame(packet)
-        lastCaptureNs = now
+        val now = System.nanoTime(); if (now - lastCaptureNs < 650_000_000L) return
+        val packet = FrameCapture.capture(frame, camera, maxWidth = 960) ?: return
+        coordinator.onLocalFrame(packet); lastCaptureNs = now
     }
 
     private fun projectRemoteTarget(camera: Camera) {
-        if (role != "B") return
-        val p = remoteTarget.get() ?: return
-        val view = FloatArray(16)
-        val projection = FloatArray(16)
-        camera.getViewMatrix(view, 0)
-        camera.getProjectionMatrix(projection, 0, 0.05f, 500f)
-        val world = floatArrayOf(p[0], p[1], p[2], 1f)
-        val cameraV = FloatArray(4)
-        val clip = FloatArray(4)
-        Matrix.multiplyMV(cameraV, 0, view, 0, world, 0)
-        Matrix.multiplyMV(clip, 0, projection, 0, cameraV, 0)
-        if (clip[3] <= 1e-5f) {
-            overlay.setTarget(null, null)
-            return
+        val target = remoteTarget.get() ?: return
+        val p = target.point
+        val view = FloatArray(16); val projection = FloatArray(16)
+        camera.getViewMatrix(view, 0); camera.getProjectionMatrix(projection, 0, 0.05f, 500f)
+        val world = floatArrayOf(p[0], p[1], p[2], 1f); val cameraV = FloatArray(4); val clip = FloatArray(4)
+        Matrix.multiplyMV(cameraV, 0, view, 0, world, 0); Matrix.multiplyMV(clip, 0, projection, 0, cameraV, 0)
+        val inFront = cameraV[2] < -0.05f
+        val bearing = atan2(cameraV[0], -cameraV[2])
+        var x = Float.NaN; var y = Float.NaN
+        if (inFront && kotlin.math.abs(clip[3]) > 1e-5f) {
+            val ndcX = clip[0] / clip[3]; val ndcY = clip[1] / clip[3]
+            x = (ndcX + 1f) * 0.5f * width; y = (1f - ndcY) * 0.5f * height
         }
-        val ndcX = clip[0] / clip[3]
-        val ndcY = clip[1] / clip[3]
-        val x = (ndcX + 1f) * 0.5f * width
-        val y = (1f - ndcY) * 0.5f * height
-        overlay.setTarget(x, y, remoteDetail)
+        val dx = p[0] - camera.pose.tx(); val dy = p[1] - camera.pose.ty(); val dz = p[2] - camera.pose.tz()
+        val distance = sqrt(dx * dx + dy * dy + dz * dz)
+        overlay.setTarget(TargetOverlayView.Target(x, y, inFront, bearing, distance, target.owner, target.confidence))
     }
 }
