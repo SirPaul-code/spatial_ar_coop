@@ -6,6 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.Base64
 
 class PeerProtocolTest {
     private fun roundTrip(message: WireMessage): WireMessage {
@@ -19,6 +20,53 @@ class PeerProtocolTest {
         val result = roundTrip(WireMessage.Hello("Pavol", "SM-S938B")) as WireMessage.Hello
         assertEquals("Pavol", result.username)
         assertEquals("SM-S938B", result.deviceModel)
+    }
+
+    @Test
+    fun frameRoundTripPreservesCameraGeometryAndMetricSupports() {
+        val jpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 1, 2, 3, 4, 0xff.toByte(), 0xd9.toByte())
+        val original = CapturedFrame(
+            timestampNs = 987654321L,
+            pose = PosePacket(
+                floatArrayOf(1.1f, -2.2f, 3.3f),
+                floatArrayOf(0.1f, 0.2f, 0.3f, 0.9f),
+            ),
+            intrinsics = IntrinsicsPacket(
+                fx = 711.5f,
+                fy = 709.25f,
+                cx = 479.8f,
+                cy = 269.7f,
+                width = 960,
+                height = 540,
+            ),
+            jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
+            metricPoints = listOf(
+                floatArrayOf(100f, 120f, 1f, 2f, 3f),
+                floatArrayOf(500f, 220f, -4f, 0.5f, 8f),
+            ),
+        )
+
+        val result = (roundTrip(WireMessage.Frame(original)) as WireMessage.Frame).frame
+        assertEquals(original.timestampNs, result.timestampNs)
+        original.pose.t.indices.forEach { assertEquals(original.pose.t[it], result.pose.t[it], 1e-6f) }
+        original.pose.q.indices.forEach { assertEquals(original.pose.q[it], result.pose.q[it], 1e-6f) }
+        assertEquals(original.intrinsics.fx, result.intrinsics.fx, 1e-6f)
+        assertEquals(original.intrinsics.fy, result.intrinsics.fy, 1e-6f)
+        assertEquals(original.intrinsics.cx, result.intrinsics.cx, 1e-6f)
+        assertEquals(original.intrinsics.cy, result.intrinsics.cy, 1e-6f)
+        assertEquals(original.intrinsics.width, result.intrinsics.width)
+        assertEquals(original.intrinsics.height, result.intrinsics.height)
+        assertEquals(jpeg.toList(), Base64.getDecoder().decode(result.jpegBase64).toList())
+        assertEquals(2, result.metricPoints.size)
+        for (pointIndex in original.metricPoints.indices) {
+            for (valueIndex in 0 until 5) {
+                assertEquals(
+                    original.metricPoints[pointIndex][valueIndex],
+                    result.metricPoints[pointIndex][valueIndex],
+                    1e-6f,
+                )
+            }
+        }
     }
 
     @Test
