@@ -15,22 +15,24 @@ sealed class WireMessage {
     data class Poi(val id: Long, val owner: String, val pointWorld: FloatArray, val createdAtMs: Long) : WireMessage()
     data object ClearPoi : WireMessage()
     data class Range(val distanceM: Float, val stdDevM: Float, val samples: Int) : WireMessage()
-    data class Quality(val confidence: Float, val stableCount: Int, val ready: Boolean) : WireMessage()
-    data class ResetAlignment(val reason: String) : WireMessage()
 
     /**
-     * A sender that solved T_senderWorld_from_peerWorld shares the actual SE(3)
-     * transform, not just a boolean "ready" flag. The receiver can invert it to
-     * obtain T_receiverWorld_from_senderWorld. This means one strong solve is
-     * enough to bootstrap both phones and the second solve becomes verification.
+     * Quality normally carries only scalar readiness. Once a sender has solved
+     * T_senderWorld_from_peerWorld it can attach that SE(3) here. The receiver
+     * inverts and physically validates it, so one strong solve can bootstrap both
+     * phones instead of requiring two independent locks.
      */
-    data class AlignmentTransform(
-        val senderFromPeer: DoubleArray,
+    data class Quality(
         val confidence: Float,
-        val inliers: Int,
-        val medianReprojectionPx: Float,
-        val source: String,
+        val stableCount: Int,
+        val ready: Boolean,
+        val senderFromPeer: DoubleArray? = null,
+        val transformInliers: Int = 0,
+        val transformMedianReprojectionPx: Float = Float.NaN,
+        val transformSource: String = "",
     ) : WireMessage()
+
+    data class ResetAlignment(val reason: String) : WireMessage()
 }
 
 object PeerProtocol {
@@ -44,7 +46,6 @@ object PeerProtocol {
     private const val T_RANGE = 5
     private const val T_QUALITY = 6
     private const val T_RESET_ALIGNMENT = 7
-    private const val T_ALIGNMENT_TRANSFORM = 8
 
     fun write(output: OutputStream, message: WireMessage) {
         val payload = ByteArrayOutputStream()
@@ -71,16 +72,17 @@ object PeerProtocol {
                     out.writeFloat(message.confidence)
                     out.writeInt(message.stableCount)
                     out.writeBoolean(message.ready)
+                    val transform = message.senderFromPeer
+                    out.writeBoolean(transform != null)
+                    if (transform != null) {
+                        require(transform.size >= 16) { "alignment transform must contain 16 values" }
+                        repeat(16) { out.writeDouble(transform[it]) }
+                        out.writeInt(message.transformInliers)
+                        out.writeFloat(message.transformMedianReprojectionPx)
+                        out.writeUTF(message.transformSource.take(48))
+                    }
                 }
                 is WireMessage.ResetAlignment -> out.writeUTF(message.reason.take(128))
-                is WireMessage.AlignmentTransform -> {
-                    require(message.senderFromPeer.size >= 16) { "alignment transform must contain 16 values" }
-                    repeat(16) { out.writeDouble(message.senderFromPeer[it]) }
-                    out.writeFloat(message.confidence)
-                    out.writeInt(message.inliers)
-                    out.writeFloat(message.medianReprojectionPx)
-                    out.writeUTF(message.source.take(48))
-                }
             }
         }
 
@@ -94,7 +96,6 @@ object PeerProtocol {
             is WireMessage.Range -> T_RANGE
             is WireMessage.Quality -> T_QUALITY
             is WireMessage.ResetAlignment -> T_RESET_ALIGNMENT
-            is WireMessage.AlignmentTransform -> T_ALIGNMENT_TRANSFORM
         }
 
         val out = DataOutputStream(output)
@@ -134,15 +135,26 @@ object PeerProtocol {
                 )
                 T_CLEAR -> WireMessage.ClearPoi
                 T_RANGE -> WireMessage.Range(data.readFloat(), data.readFloat(), data.readInt())
-                T_QUALITY -> WireMessage.Quality(data.readFloat(), data.readInt(), data.readBoolean())
+                T_QUALITY -> {
+                    val confidence = data.readFloat()
+                    val stableCount = data.readInt()
+                    val ready = data.readBoolean()
+                    val hasTransform = data.readBoolean()
+                    if (hasTransform) {
+                        WireMessage.Quality(
+                            confidence = confidence,
+                            stableCount = stableCount,
+                            ready = ready,
+                            senderFromPeer = DoubleArray(16) { data.readDouble() },
+                            transformInliers = data.readInt(),
+                            transformMedianReprojectionPx = data.readFloat(),
+                            transformSource = data.readUTF(),
+                        )
+                    } else {
+                        WireMessage.Quality(confidence, stableCount, ready)
+                    }
+                }
                 T_RESET_ALIGNMENT -> WireMessage.ResetAlignment(data.readUTF())
-                T_ALIGNMENT_TRANSFORM -> WireMessage.AlignmentTransform(
-                    senderFromPeer = DoubleArray(16) { data.readDouble() },
-                    confidence = data.readFloat(),
-                    inliers = data.readInt(),
-                    medianReprojectionPx = data.readFloat(),
-                    source = data.readUTF(),
-                )
                 else -> throw IllegalArgumentException("unknown wire type $type")
             }
         }
