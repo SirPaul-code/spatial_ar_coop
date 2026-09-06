@@ -9,6 +9,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.ScanResult
 import android.net.wifi.aware.AttachCallback
 import android.net.wifi.aware.DiscoverySessionCallback
 import android.net.wifi.aware.PeerHandle
@@ -41,18 +42,18 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Direct Wi-Fi Aware/NDP transport for exactly two nearby phones.
  *
- * V6 removes the old host/client timing dependency:
+ * Production transport rules:
+ * - Android 13+ Instant Communication is enabled for the first 30 seconds when
+ *   hardware reports support, accelerating discovery and data-path setup.
  * - the publisher pre-arms an Android 12+ any-peer NDP responder immediately;
  * - the subscriber starts its NDP request immediately after JOIN is selected;
- * - discovery messages are only lossy signalling/identity, not a prerequisite
- *   for the actual network request;
- * - RTT starts only after the TCP socket exists, and only on the subscriber,
- *   avoiding NAN/RTT resource contention during data-path bring-up;
- * - every data-path generation is tagged so callbacks/threads from a stale
- *   attempt can never tear down a newer successful connection.
- *
- * A peer-specific responder remains as an automatic fallback for vendor stacks
- * which reject the modern any-peer responder path.
+ * - discovery messages are lossy signalling/identity, not a prerequisite for NDP;
+ * - discovery is NOT RTT-geofenced: Samsung can otherwise spend ranging resources
+ *   while NDP is negotiating. Direct RTT begins only after TCP is established;
+ * - every data-path generation is tagged so stale callbacks can never tear down
+ *   a newer successful connection;
+ * - peer-specific responder is an automatic fallback for vendor NAN stacks that
+ *   reject or stall the modern any-peer responder path.
  */
 @SuppressLint("MissingPermission")
 class WifiAwarePeerTransport(
@@ -161,13 +162,19 @@ class WifiAwarePeerTransport(
         startCommon(name)
         hostRole = true
         roomCode = normalizeRoom(code)
-        attachAware { publish(it, allowRanging = capabilities().rttAvailable) }
+        attachAware {
+            publish(
+                session = it,
+                allowRanging = capabilities().rttAvailable,
+                allowInstant = instantAwareSupported(),
+            )
+        }
     }
 
     fun scanRooms(name: String) {
         startCommon(name)
         hostRole = false
-        attachAware { subscribe(it, allowRanging = capabilities().rttAvailable) }
+        attachAware { subscribe(it, allowInstant = instantAwareSupported()) }
     }
 
     fun joinRoom(code: String) {
@@ -192,8 +199,6 @@ class WifiAwarePeerTransport(
         status("Connecting to $peerUsername / $normalized…")
         joinAttempt = 0
 
-        // The host responder is pre-armed. Do not wait for a second discovery
-        // message before requesting the NDP: JOIN is identity/signalling only.
         requestClientNetwork(peer)
         scheduleJoinHandshake(0L)
     }
@@ -339,23 +344,21 @@ class WifiAwarePeerTransport(
         }
     }
 
-    private fun publish(session: WifiAwareSession, allowRanging: Boolean) {
+    private fun publish(session: WifiAwareSession, allowRanging: Boolean, allowInstant: Boolean) {
         val info = "V6|$roomCode|${safeToken(username)}".toByteArray(StandardCharsets.UTF_8)
-        val config = PublishConfig.Builder()
+        val builder = PublishConfig.Builder()
             .setServiceName(SERVICE)
             .setServiceSpecificInfo(info)
             .setPublishType(PublishConfig.PUBLISH_TYPE_UNSOLICITED)
             .setRangingEnabled(allowRanging)
-            .build()
+        if (Build.VERSION.SDK_INT >= 33 && allowInstant) {
+            builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ)
+        }
 
         try {
-            session.publish(config, object : DiscoverySessionCallback() {
+            session.publish(builder.build(), object : DiscoverySessionCallback() {
                 override fun onPublishStarted(session: PublishDiscoverySession) {
                     publishSession = session
-
-                    // Android 12+ supports a responder which accepts any peer.
-                    // Arm it now, before a subscriber sends JOIN, eliminating the
-                    // responder/initiator race seen when the S26 was CREATE/host.
                     armHostResponder(preferAnyPeer = true, peer = null)
                     status("Room $roomCode ready — waiting for nearby user")
                 }
@@ -373,44 +376,46 @@ class WifiAwarePeerTransport(
 
                         ensureHostResponderHealthy(peerHandle, now)
                         announceNdp(peerHandle)
-                        // Do not start RTT on the publisher. Subscriber -> publisher
-                        // ranging is the supported/useful direction and is started
-                        // only once the direct socket is up.
                     } catch (t: Throwable) {
                         reportError("Peer join handling failed", t)
                     }
                 }
 
                 override fun onSessionConfigFailed() {
-                    if (allowRanging && running.get()) {
-                        status("Retrying room without RTT discovery filter…")
-                        try {
-                            publish(session = awareSession ?: return, allowRanging = false)
-                        } catch (t: Throwable) {
-                            reportError("Wi-Fi Aware publish failed", t)
+                    when {
+                        allowInstant && running.get() -> {
+                            status("Instant Wi-Fi Aware mode rejected — retrying standard discovery…")
+                            publish(session = awareSession ?: return, allowRanging = allowRanging, allowInstant = false)
                         }
-                    } else {
-                        status("Wi-Fi Aware publish configuration failed")
+                        allowRanging && running.get() -> {
+                            status("Retrying room without RTT advertising…")
+                            publish(session = awareSession ?: return, allowRanging = false, allowInstant = false)
+                        }
+                        else -> status("Wi-Fi Aware publish configuration failed")
                     }
                 }
             }, main)
         } catch (t: Throwable) {
-            if (allowRanging) {
-                status("RTT-enabled publish rejected; retrying plain Wi-Fi Aware…")
-                publish(session, allowRanging = false)
-            } else {
-                throw t
+            when {
+                allowInstant -> {
+                    status("Instant Wi-Fi Aware mode threw — retrying standard discovery…")
+                    publish(session, allowRanging = allowRanging, allowInstant = false)
+                }
+                allowRanging -> {
+                    status("RTT-enabled publish rejected; retrying plain Wi-Fi Aware…")
+                    publish(session, allowRanging = false, allowInstant = false)
+                }
+                else -> throw t
             }
         }
     }
 
-    private fun subscribe(session: WifiAwareSession, allowRanging: Boolean) {
+    private fun subscribe(session: WifiAwareSession, allowInstant: Boolean) {
         val builder = SubscribeConfig.Builder()
             .setServiceName(SERVICE)
             .setSubscribeType(SubscribeConfig.SUBSCRIBE_TYPE_ACTIVE)
-        if (allowRanging) {
-            @Suppress("DEPRECATION")
-            builder.setMaxDistanceMm(100_000)
+        if (Build.VERSION.SDK_INT >= 33 && allowInstant) {
+            builder.setInstantCommunicationModeEnabled(true, ScanResult.WIFI_BAND_5_GHZ)
         }
 
         try {
@@ -434,6 +439,8 @@ class WifiAwarePeerTransport(
                     matchFilter: MutableList<ByteArray>?,
                     distanceMm: Int,
                 ) {
+                    // Kept for vendor stacks which may still surface this callback,
+                    // but discovery itself is no longer RTT-geofenced.
                     registerRoom(peerHandle, serviceSpecificInfo, distanceMm / 1000f)
                 }
 
@@ -450,22 +457,18 @@ class WifiAwarePeerTransport(
                 }
 
                 override fun onSessionConfigFailed() {
-                    if (allowRanging && running.get()) {
-                        status("Retrying scan without RTT distance filter…")
-                        try {
-                            subscribe(session = awareSession ?: return, allowRanging = false)
-                        } catch (t: Throwable) {
-                            reportError("Wi-Fi Aware scan failed", t)
-                        }
+                    if (allowInstant && running.get()) {
+                        status("Instant Wi-Fi Aware scan rejected — retrying standard discovery…")
+                        subscribe(session = awareSession ?: return, allowInstant = false)
                     } else {
                         status("Wi-Fi Aware scan configuration failed")
                     }
                 }
             }, main)
         } catch (t: Throwable) {
-            if (allowRanging) {
-                status("RTT-enabled scan rejected; retrying plain Wi-Fi Aware…")
-                subscribe(session, allowRanging = false)
+            if (allowInstant) {
+                status("Instant Wi-Fi Aware scan threw — retrying standard discovery…")
+                subscribe(session, allowInstant = false)
             } else {
                 throw t
             }
@@ -518,8 +521,6 @@ class WifiAwarePeerTransport(
                 Log.w(TAG, "JOIN retry failed", t)
             }
 
-            // Every retry also guarantees that the real NDP request exists. We
-            // no longer depend on receiving NDP|... from the publisher first.
             if (!clientConnectStarted.get() && running.get() && !connected) {
                 requestClientNetwork(peer)
             }
@@ -542,9 +543,6 @@ class WifiAwarePeerTransport(
         val waited = now - peerJoinAtMs
         if (waited <= HOST_MODE_FALLBACK_MS) return
 
-        // Samsung/vendor safety net: alternate between the modern any-peer
-        // responder and the older peer-specific responder. The client keeps its
-        // own NDP request alive/retrying, so no app restart is ever required.
         peerJoinAtMs = now
         when (hostResponderMode) {
             HostResponderMode.ANY_PEER -> {
@@ -791,8 +789,6 @@ class WifiAwarePeerTransport(
         safeCallback { callbacks.onConnected(peerUsername) }
         io.execute { readLoop(s, epoch) }
 
-        // Wi-Fi Aware ranging is initiated by the subscriber toward the
-        // ranging-enabled publisher, and only after NDP/TCP is stable.
         if (!hostRole) scheduleRanging()
     }
 
@@ -835,7 +831,7 @@ class WifiAwarePeerTransport(
     }
 
     @Synchronized private fun cleanupDataPath() {
-        dataPathEpoch.incrementAndGet() // invalidate every outstanding callback/thread first
+        dataPathEpoch.incrementAndGet()
         connected = false
         socketConnected.set(false)
         clientConnectStarted.set(false)
@@ -940,6 +936,12 @@ class WifiAwarePeerTransport(
                 status("Wi-Fi RTT failed: $error — continuing with fused alignment")
             }
         }
+    }
+
+    private fun instantAwareSupported(): Boolean {
+        if (Build.VERSION.SDK_INT < 31) return false
+        return runCatching { aware?.characteristics?.isInstantCommunicationModeSupported == true }
+            .getOrDefault(false)
     }
 
     private fun missingPeerPermissions(): List<String> {
