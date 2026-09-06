@@ -138,7 +138,7 @@ class BlePeerRanger(
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             if (!running) return
             val serviceData = result.scanRecord?.getServiceData(serviceUuid) ?: return
-            val text = runCatching { serviceData.toString(StandardCharsets.US_ASCII) }.getOrNull() ?: return
+            val text = runCatching { String(serviceData, StandardCharsets.US_ASCII) }.getOrNull() ?: return
             val parts = text.split('|', limit = 2)
             if (parts.size != 2 || normalizeRoom(parts[0]) != activeRoom || parts[1] == ownToken) return
 
@@ -156,7 +156,6 @@ class BlePeerRanger(
 
             val advertisedTx = result.txPower.takeIf { it in -100..20 } ?: DEFAULT_TX_POWER_DBM
             val distance = rssiToDistanceM(filteredRssi, advertisedTx.toFloat())
-            // BLE RSSI multipath error is intentionally modeled very loosely.
             val std = max(0.85f, distance * 0.70f)
             callback.onBleRange(distance, std, filteredRssi.toInt())
         }
@@ -183,7 +182,9 @@ class BlePeerRanger(
     }
 
     companion object {
-        private val SERVICE_UUID: UUID = UUID.fromString("62e5a812-7bb4-4c78-8a46-3b5880fcb4f1")
+        // 16-bit vendor-specific UUID form keeps the legacy advertisement below
+        // the 31-byte limit even with room code, device token and TX power.
+        private val SERVICE_UUID: UUID = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
         private const val DEFAULT_TX_POWER_DBM = -59
         private const val PATH_LOSS_EXPONENT = 2.25f
     }
