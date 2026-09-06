@@ -130,7 +130,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             clipToPadding = false
             addView(
                 setupCard,
-                ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
             )
         }
         root.addView(
@@ -214,8 +214,6 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                 banner.layoutParams = it
             }
 
-            // Cap the connection sheet so it always fits above HUD + bottom
-            // controls on short displays. Its contents remain scrollable.
             root.post {
                 if (!isFinishing && root.height > 0) {
                     val maxHeight = (root.height - safe.top - safe.bottom - dp(190)).coerceAtLeast(dp(220))
@@ -725,8 +723,6 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         val fineMissing =
             checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
 
-        // Android 12+ requires FINE and COARSE to be requested together. Even if
-        // coarse was already granted, include both when upgrading to Precise.
         if (coarseMissing || fineMissing) {
             out += Manifest.permission.ACCESS_COARSE_LOCATION
             out += Manifest.permission.ACCESS_FINE_LOCATION
