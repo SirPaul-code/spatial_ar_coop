@@ -71,7 +71,7 @@ class AlignmentCoordinator(
     @Volatile private var localConfidence = 0f
     @Volatile private var peerReady = false
     @Volatile private var peerTransformVerified = false
-    @Volatile private var pendingPeerTransform: WireMessage.AlignmentTransform? = null
+    @Volatile private var pendingPeerTransform: WireMessage.Quality? = null
     @Volatile private var latestRangeM: Float? = null
     @Volatile private var latestRangeStdM: Float? = null
     @Volatile private var latestRangeSource = "NONE"
@@ -153,20 +153,13 @@ class AlignmentCoordinator(
 
     fun onPeerQuality(message: WireMessage.Quality) {
         peerReady = message.ready
-        if (!message.ready) peerTransformVerified = false
-        emitQuality()
-    }
-
-    /**
-     * One good solve is enough for both phones. If A has T_A_from_B, B receives
-     * it, inverts it to T_B_from_A, validates it against gravity/compass/ranging,
-     * and can adopt it immediately. B's own visual solve then acts as an
-     * independent verification/refinement instead of being a second hard gate.
-     */
-    fun onPeerAlignmentTransform(message: WireMessage.AlignmentTransform) {
-        pendingPeerTransform = message
-        peerReady = true
-        tryAdoptOrVerifyPeerTransform()
+        if (!message.ready) {
+            peerTransformVerified = false
+            pendingPeerTransform = null
+        } else if (message.senderFromPeer != null) {
+            pendingPeerTransform = message
+            tryAdoptOrVerifyPeerTransform()
+        }
         emitQuality()
     }
 
@@ -404,8 +397,8 @@ class AlignmentCoordinator(
 
     @Synchronized private fun tryAdoptOrVerifyPeerTransform() {
         val message = pendingPeerTransform ?: return
-        if (message.senderFromPeer.size < 16 || message.confidence < 0.14f) return
-        val peerSenderFromLocal = message.senderFromPeer
+        val peerSenderFromLocal = message.senderFromPeer ?: return
+        if (peerSenderFromLocal.size < 16 || message.confidence < 0.14f) return
         if (!isRigidTransform(peerSenderFromLocal)) return
 
         val localFromPeerSender = invertRigid(peerSenderFromLocal) ?: return
@@ -444,21 +437,19 @@ class AlignmentCoordinator(
 
         val existing = lockedTransform
         if (existing == null) {
-            // Do not wait for the receiver to independently solve the same 6DoF.
-            // The sender already passed visual+sensor gates; after local physical
-            // checks, the inverse is the exact reciprocal world transform.
+            // The sender already passed visual+sensor gates. Once the reciprocal
+            // transform passes local physical checks, a second independent 6DoF
+            // solve is not required just to unlock the UI.
             lockedTransform = localFromPeerSender.copyOf()
             localConfidence = (message.confidence * 0.94f).coerceIn(0.14f, 0.96f)
             stableCount = max(stableCount, 1)
-            coarseSource = "PEER:${message.source}"
+            coarseSource = "PEER:${message.transformSource.ifBlank { "FUSED" }}"
             peerTransformVerified = true
             transport.sendQuality(localConfidence, stableCount, true)
         } else {
             val (translationDelta, rotationDelta) = AlignmentEngine.transformDelta(existing, localFromPeerSender)
             if (translationDelta <= PEER_VERIFY_TRANSLATION_M && rotationDelta <= PEER_VERIFY_ROTATION_DEG) {
                 peerTransformVerified = true
-                // Use the higher-confidence estimate as medoid. We intentionally
-                // avoid component-wise matrix averaging, which can leave SE(3).
                 if (message.confidence > localConfidence + 0.08f) {
                     lockedTransform = localFromPeerSender.copyOf()
                     localConfidence = (message.confidence * 0.96f).coerceAtMost(0.98f)
