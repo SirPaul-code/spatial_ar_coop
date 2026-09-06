@@ -41,11 +41,18 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Direct Wi-Fi Aware/NDP transport for exactly two nearby phones.
  *
- * The discovery messages are deliberately treated as lossy signalling. JOIN and
- * NDP announcements are retried until the real TCP socket is alive, and a failed
- * NDP request is torn down without destroying the Wi-Fi Aware discovery session.
- * This avoids the old state where one phone was DIRECT while the other stayed
- * LINKING until both apps were restarted.
+ * V6 removes the old host/client timing dependency:
+ * - the publisher pre-arms an Android 12+ any-peer NDP responder immediately;
+ * - the subscriber starts its NDP request immediately after JOIN is selected;
+ * - discovery messages are only lossy signalling/identity, not a prerequisite
+ *   for the actual network request;
+ * - RTT starts only after the TCP socket exists, and only on the subscriber,
+ *   avoiding NAN/RTT resource contention during data-path bring-up;
+ * - every data-path generation is tagged so callbacks/threads from a stale
+ *   attempt can never tear down a newer successful connection.
+ *
+ * A peer-specific responder remains as an automatic fallback for vendor stacks
+ * which reject the modern any-peer responder path.
  */
 @SuppressLint("MissingPermission")
 class WifiAwarePeerTransport(
@@ -77,6 +84,8 @@ class WifiAwarePeerTransport(
         fun onRange(distanceM: Float, stdDevM: Float, samples: Int)
     }
 
+    private enum class HostResponderMode { NONE, ANY_PEER, SPECIFIC_PEER }
+
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newCachedThreadPool()
     private val writer = Executors.newSingleThreadExecutor()
@@ -107,13 +116,17 @@ class WifiAwarePeerTransport(
     private val rangingBusy = AtomicBoolean(false)
     private val recoveryScheduled = AtomicBoolean(false)
     private val messageId = AtomicInteger(100)
+    private val dataPathEpoch = AtomicInteger(0)
     private val latestFrame = AtomicReference<CapturedFrame?>(null)
     private val framePumpRunning = AtomicBoolean(false)
     private val writeLock = Any()
 
     private var networkRequestedAtMs = 0L
+    private var peerJoinAtMs = 0L
+    private var hostModeStartedAtMs = 0L
     private var joinAttempt = 0
     private var lastRangingError = ""
+    private var hostResponderMode = HostResponderMode.NONE
 
     @Volatile var connected = false
         private set
@@ -178,8 +191,11 @@ class WifiAwarePeerTransport(
         peerUsername = rooms[normalized]?.username ?: "Peer"
         status("Connecting to $peerUsername / $normalized…")
         joinAttempt = 0
+
+        // The host responder is pre-armed. Do not wait for a second discovery
+        // message before requesting the NDP: JOIN is identity/signalling only.
+        requestClientNetwork(peer)
         scheduleJoinHandshake(0L)
-        scheduleRanging()
     }
 
     fun sendFrame(frame: CapturedFrame) {
@@ -193,7 +209,7 @@ class WifiAwarePeerTransport(
         writer.execute {
             try {
                 val next = latestFrame.getAndSet(null)
-                if (next != null && connected) writeMessage(next = WireMessage.Frame(next))
+                if (next != null && connected) writeMessage(WireMessage.Frame(next))
             } finally {
                 framePumpRunning.set(false)
                 if (connected && latestFrame.get() != null) scheduleFramePump()
@@ -257,6 +273,9 @@ class WifiAwarePeerTransport(
         roomPeers.clear()
         roomCode = ""
         hostRole = false
+        peerJoinAtMs = 0L
+        hostModeStartedAtMs = 0L
+        hostResponderMode = HostResponderMode.NONE
 
         if (wasRunning && wasConnected) safeCallback { callbacks.onDisconnected(reason) }
     }
@@ -321,7 +340,7 @@ class WifiAwarePeerTransport(
     }
 
     private fun publish(session: WifiAwareSession, allowRanging: Boolean) {
-        val info = "V5|$roomCode|${safeToken(username)}".toByteArray(StandardCharsets.UTF_8)
+        val info = "V6|$roomCode|${safeToken(username)}".toByteArray(StandardCharsets.UTF_8)
         val config = PublishConfig.Builder()
             .setServiceName(SERVICE)
             .setServiceSpecificInfo(info)
@@ -333,6 +352,11 @@ class WifiAwarePeerTransport(
             session.publish(config, object : DiscoverySessionCallback() {
                 override fun onPublishStarted(session: PublishDiscoverySession) {
                     publishSession = session
+
+                    // Android 12+ supports a responder which accepts any peer.
+                    // Arm it now, before a subscriber sends JOIN, eliminating the
+                    // responder/initiator race seen when the S26 was CREATE/host.
+                    armHostResponder(preferAnyPeer = true, peer = null)
                     status("Room $roomCode ready — waiting for nearby user")
                 }
 
@@ -340,12 +364,18 @@ class WifiAwarePeerTransport(
                     try {
                         val parts = message.toString(StandardCharsets.UTF_8).split('|', limit = 3)
                         if (parts.size < 3 || parts[0] != "JOIN" || normalizeRoom(parts[1]) != roomCode) return
+
                         currentPeer = peerHandle
                         peerUsername = parts[2].ifBlank { "Peer" }.take(32)
-                        status("$peerUsername joined — negotiating direct Wi-Fi link…")
-                        ensureHostNetwork(peerHandle)
+                        val now = SystemClock.elapsedRealtime()
+                        if (peerJoinAtMs == 0L) peerJoinAtMs = now
+                        status("$peerUsername joined — direct Wi-Fi negotiation in progress…")
+
+                        ensureHostResponderHealthy(peerHandle, now)
                         announceNdp(peerHandle)
-                        scheduleRanging()
+                        // Do not start RTT on the publisher. Subscriber -> publisher
+                        // ranging is the supported/useful direction and is started
+                        // only once the direct socket is up.
                     } catch (t: Throwable) {
                         reportError("Peer join handling failed", t)
                     }
@@ -445,7 +475,7 @@ class WifiAwarePeerTransport(
     private fun registerRoom(peer: PeerHandle, info: ByteArray?, distanceM: Float?) {
         try {
             val parts = info?.toString(StandardCharsets.UTF_8)?.split('|', limit = 3) ?: return
-            if (parts.size < 3 || parts[0] != "V5") return
+            if (parts.size < 3 || parts[0] != "V6") return
             val code = normalizeRoom(parts[1])
             val room = NearbyRoom(
                 code = code,
@@ -473,7 +503,7 @@ class WifiAwarePeerTransport(
 
             val now = SystemClock.elapsedRealtime()
             if (clientConnectStarted.get() && networkRequestedAtMs > 0L && now - networkRequestedAtMs > NDP_REQUEST_TIMEOUT_MS) {
-                status("Direct link handshake timed out — retrying without app restart…")
+                status("Direct link handshake timed out — rebuilding data path…")
                 cleanupDataPath()
             }
 
@@ -488,66 +518,144 @@ class WifiAwarePeerTransport(
                 Log.w(TAG, "JOIN retry failed", t)
             }
 
+            // Every retry also guarantees that the real NDP request exists. We
+            // no longer depend on receiving NDP|... from the publisher first.
+            if (!clientConnectStarted.get() && running.get() && !connected) {
+                requestClientNetwork(peer)
+            }
+
             if (running.get() && !connected) {
                 main.postDelayed(this, if (joinAttempt < 8) 700L else 1200L)
             }
         }
     }
 
-    private fun ensureHostNetwork(peer: PeerHandle) {
+    private fun ensureHostResponderHealthy(peer: PeerHandle, now: Long) {
         if (!running.get() || connected) return
-        val publish = publishSession ?: return
-        val now = SystemClock.elapsedRealtime()
 
-        if (networkCallback != null) {
-            if (networkRequestedAtMs > 0L && now - networkRequestedAtMs > NDP_REQUEST_TIMEOUT_MS) {
-                status("Refreshing stale Wi-Fi Aware data path…")
-                cleanupDataPath()
-            } else {
-                return
-            }
+        if (networkCallback == null || serverSocket == null) {
+            armHostResponder(preferAnyPeer = true, peer = peer)
+            peerJoinAtMs = now
+            return
         }
 
+        val waited = now - peerJoinAtMs
+        if (waited <= HOST_MODE_FALLBACK_MS) return
+
+        // Samsung/vendor safety net: alternate between the modern any-peer
+        // responder and the older peer-specific responder. The client keeps its
+        // own NDP request alive/retrying, so no app restart is ever required.
+        peerJoinAtMs = now
+        when (hostResponderMode) {
+            HostResponderMode.ANY_PEER -> {
+                status("Host responder did not converge — trying peer-specific NDP…")
+                cleanupDataPath()
+                armHostResponder(preferAnyPeer = false, peer = peer)
+            }
+            HostResponderMode.SPECIFIC_PEER -> {
+                status("Refreshing host responder using modern any-peer NDP…")
+                cleanupDataPath()
+                armHostResponder(preferAnyPeer = true, peer = peer)
+            }
+            HostResponderMode.NONE -> armHostResponder(preferAnyPeer = true, peer = peer)
+        }
+    }
+
+    private fun armHostResponder(preferAnyPeer: Boolean, peer: PeerHandle?) {
+        if (!running.get() || connected || !hostRole) return
+        if (networkCallback != null || serverSocket != null) return
+        val publish = publishSession ?: return
+
+        val ss = try {
+            ServerSocket(0).apply { reuseAddress = true }
+        } catch (t: Throwable) {
+            recoverDataPath("Host socket create failed: ${errorText(t)}")
+            return
+        }
+        serverSocket = ss
+
+        val useAnyPeer = preferAnyPeer || peer == null
+        val epoch = dataPathEpoch.incrementAndGet()
+        hostResponderMode = if (useAnyPeer) HostResponderMode.ANY_PEER else HostResponderMode.SPECIFIC_PEER
+        hostModeStartedAtMs = SystemClock.elapsedRealtime()
+
         try {
-            val ss = ServerSocket(0)
-            serverSocket = ss
-            val spec = WifiAwareNetworkSpecifier.Builder(publish, peer)
+            val specBuilder = if (useAnyPeer) {
+                WifiAwareNetworkSpecifier.Builder(publish)
+            } else {
+                WifiAwareNetworkSpecifier.Builder(publish, peer ?: return)
+            }
+            val spec = specBuilder
                 .setPskPassphrase(psk(roomCode))
                 .setPort(ss.localPort)
-                .setTransportProtocol(6)
+                .setTransportProtocol(TCP_PROTOCOL)
                 .build()
             val request = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE)
                 .setNetworkSpecifier(spec)
                 .build()
+
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    status("Direct Wi-Fi link up — opening peer socket…")
-                    if (!hostAcceptStarted.compareAndSet(false, true)) return
-                    io.execute {
-                        try {
-                            attachSocket(ss.accept().apply { tcpNoDelay = true })
-                        } catch (t: Throwable) {
-                            hostAcceptStarted.set(false)
-                            if (running.get() && !connected) recoverDataPath("Host socket failed: ${errorText(t)}")
-                        }
-                    }
+                    if (!isCurrentEpoch(epoch)) return
+                    status("Direct Wi-Fi path ready — waiting for peer socket…")
                 }
 
                 override fun onLost(network: Network) {
-                    if (running.get()) recoverDataPath("Direct Wi-Fi link lost")
+                    if (isCurrentEpoch(epoch) && running.get() && !connected) {
+                        recoverDataPath("Host Wi-Fi Aware path lost", epoch)
+                    } else if (isCurrentEpoch(epoch) && running.get() && connected) {
+                        recoverDataPath("Direct Wi-Fi link lost", epoch)
+                    }
                 }
 
                 override fun onUnavailable() {
-                    if (running.get()) recoverDataPath("Direct Wi-Fi data path unavailable")
+                    if (!isCurrentEpoch(epoch) || !running.get()) return
+                    val knownPeer = currentPeer
+                    if (useAnyPeer && knownPeer != null) {
+                        status("Any-peer responder unavailable — switching to peer-specific NDP…")
+                        cleanupDataPath()
+                        armHostResponder(preferAnyPeer = false, peer = knownPeer)
+                        announceNdp(knownPeer)
+                    } else {
+                        recoverDataPath("Host Wi-Fi Aware data path unavailable", epoch)
+                    }
                 }
             }
+
             networkCallback = callback
-            networkRequestedAtMs = now
+            networkRequestedAtMs = hostModeStartedAtMs
             connectivity.requestNetwork(request, callback)
+            startHostAccept(ss, epoch)
         } catch (t: Throwable) {
-            Log.e(TAG, "Host data path failed", t)
-            recoverDataPath("Host data path failed: ${errorText(t)}")
+            Log.e(TAG, "Host responder setup failed", t)
+            if (useAnyPeer && peer != null) {
+                cleanupDataPath()
+                status("Modern host responder rejected — using peer-specific fallback…")
+                armHostResponder(preferAnyPeer = false, peer = peer)
+            } else {
+                recoverDataPath("Host data path failed: ${errorText(t)}", epoch)
+            }
+        }
+    }
+
+    private fun startHostAccept(ss: ServerSocket, epoch: Int) {
+        if (!hostAcceptStarted.compareAndSet(false, true)) return
+        io.execute {
+            try {
+                val accepted = ss.accept().apply {
+                    tcpNoDelay = true
+                    keepAlive = true
+                }
+                attachSocket(accepted, epoch)
+            } catch (t: Throwable) {
+                if (isCurrentEpoch(epoch)) {
+                    hostAcceptStarted.set(false)
+                    if (running.get() && !connected) {
+                        main.post { recoverDataPath("Host socket failed: ${errorText(t)}", epoch) }
+                    }
+                }
+            }
         }
     }
 
@@ -561,12 +669,12 @@ class WifiAwarePeerTransport(
                 "NDP|$roomCode".toByteArray(StandardCharsets.UTF_8),
             )
         } catch (t: Throwable) {
-            Log.w(TAG, "NDP announcement failed; JOIN retry will request another", t)
+            Log.w(TAG, "NDP announcement failed; client retries independently", t)
         }
     }
 
     private fun requestClientNetwork(peer: PeerHandle) {
-        if (!running.get() || connected) return
+        if (!running.get() || connected || hostRole) return
         val now = SystemClock.elapsedRealtime()
         if (clientConnectStarted.get()) {
             if (networkRequestedAtMs > 0L && now - networkRequestedAtMs > NDP_REQUEST_TIMEOUT_MS) {
@@ -582,6 +690,7 @@ class WifiAwarePeerTransport(
             return
         }
 
+        val epoch = dataPathEpoch.incrementAndGet()
         try {
             val spec = WifiAwareNetworkSpecifier.Builder(subscribe, peer)
                 .setPskPassphrase(psk(roomCode))
@@ -592,20 +701,22 @@ class WifiAwarePeerTransport(
                 .build()
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
+                    if (!isCurrentEpoch(epoch)) return
                     status("Direct Wi-Fi link up — resolving peer endpoint…")
-                    resolveClientEndpoint(network)
+                    resolveClientEndpoint(network, epoch)
                 }
 
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                    resolveClientEndpoint(network)
+                    if (!isCurrentEpoch(epoch)) return
+                    resolveClientEndpoint(network, epoch)
                 }
 
                 override fun onLost(network: Network) {
-                    if (running.get()) recoverDataPath("Direct Wi-Fi link lost")
+                    if (isCurrentEpoch(epoch) && running.get()) recoverDataPath("Direct Wi-Fi link lost", epoch)
                 }
 
                 override fun onUnavailable() {
-                    if (running.get()) recoverDataPath("Direct Wi-Fi data path unavailable")
+                    if (isCurrentEpoch(epoch) && running.get()) recoverDataPath("Direct Wi-Fi data path unavailable", epoch)
                 }
             }
             networkCallback = callback
@@ -614,16 +725,16 @@ class WifiAwarePeerTransport(
         } catch (t: Throwable) {
             clientConnectStarted.set(false)
             Log.e(TAG, "Client data path failed", t)
-            recoverDataPath("Client data path failed: ${errorText(t)}")
+            recoverDataPath("Client data path failed: ${errorText(t)}", epoch)
         }
     }
 
-    private fun resolveClientEndpoint(network: Network) {
-        if (!running.get() || connected || !endpointResolveBusy.compareAndSet(false, true)) return
+    private fun resolveClientEndpoint(network: Network, epoch: Int) {
+        if (!isCurrentEpoch(epoch) || !running.get() || connected || !endpointResolveBusy.compareAndSet(false, true)) return
         io.execute {
             try {
                 repeat(ENDPOINT_RESOLVE_ATTEMPTS) {
-                    if (!running.get() || connected) return@execute
+                    if (!isCurrentEpoch(epoch) || !running.get() || connected) return@execute
                     val caps = runCatching { connectivity.getNetworkCapabilities(network) }.getOrNull()
                     val info = caps?.transportInfo as? WifiAwareNetworkInfo
                     val address = info?.peerIpv6Addr
@@ -631,8 +742,11 @@ class WifiAwarePeerTransport(
                     if (address != null && port > 0) {
                         if (!socketConnected.compareAndSet(false, true)) return@execute
                         try {
-                            val peerSocket = network.socketFactory.createSocket(address, port).apply { tcpNoDelay = true }
-                            attachSocket(peerSocket)
+                            val peerSocket = network.socketFactory.createSocket(address, port).apply {
+                                tcpNoDelay = true
+                                keepAlive = true
+                            }
+                            attachSocket(peerSocket, epoch)
                             return@execute
                         } catch (t: Throwable) {
                             socketConnected.set(false)
@@ -642,19 +756,21 @@ class WifiAwarePeerTransport(
                     Thread.sleep(ENDPOINT_RESOLVE_SLEEP_MS)
                 }
 
-                if (running.get() && !connected) {
-                    main.post { recoverDataPath("Peer endpoint was not published in time") }
+                if (isCurrentEpoch(epoch) && running.get() && !connected) {
+                    main.post { recoverDataPath("Peer endpoint was not published in time", epoch) }
                 }
             } catch (t: Throwable) {
-                if (running.get() && !connected) main.post { recoverDataPath("Peer endpoint resolution failed: ${errorText(t)}") }
+                if (isCurrentEpoch(epoch) && running.get() && !connected) {
+                    main.post { recoverDataPath("Peer endpoint resolution failed: ${errorText(t)}", epoch) }
+                }
             } finally {
-                endpointResolveBusy.set(false)
+                if (isCurrentEpoch(epoch)) endpointResolveBusy.set(false)
             }
         }
     }
 
-    @Synchronized private fun attachSocket(s: Socket) {
-        if (!running.get()) {
+    @Synchronized private fun attachSocket(s: Socket, epoch: Int) {
+        if (!running.get() || !isCurrentEpoch(epoch)) {
             try { s.close() } catch (_: Throwable) {}
             return
         }
@@ -669,15 +785,20 @@ class WifiAwarePeerTransport(
         networkRequestedAtMs = 0L
         recoveryScheduled.set(false)
         main.removeCallbacks(joinRetryRunnable)
+        main.removeCallbacks(rangeRunnable)
         status("Connected directly to $peerUsername — no AP / no server")
         writeMessage(WireMessage.Hello(username, Build.MODEL))
         safeCallback { callbacks.onConnected(peerUsername) }
-        io.execute { readLoop(s) }
+        io.execute { readLoop(s, epoch) }
+
+        // Wi-Fi Aware ranging is initiated by the subscriber toward the
+        // ranging-enabled publisher, and only after NDP/TCP is stable.
+        if (!hostRole) scheduleRanging()
     }
 
-    private fun readLoop(s: Socket) {
+    private fun readLoop(s: Socket, epoch: Int) {
         try {
-            while (running.get() && connected && !s.isClosed) {
+            while (running.get() && connected && socket === s && isCurrentEpoch(epoch) && !s.isClosed) {
                 when (val message = PeerProtocol.read(s.getInputStream()) ?: break) {
                     is WireMessage.Hello -> {
                         peerUsername = message.username.ifBlank { peerUsername }
@@ -689,22 +810,24 @@ class WifiAwarePeerTransport(
                     else -> safeCallback { callbacks.onWireMessage(message) }
                 }
             }
-            if (running.get() && connected) recoverDataPath("Peer socket closed")
+            if (running.get() && connected && socket === s && isCurrentEpoch(epoch)) {
+                recoverDataPath("Peer socket closed", epoch)
+            }
         } catch (t: Throwable) {
-            if (running.get() && connected) {
+            if (running.get() && connected && socket === s && isCurrentEpoch(epoch)) {
                 Log.e(TAG, "Peer read loop failed", t)
-                recoverDataPath("Peer link error: ${errorText(t)}")
+                recoverDataPath("Peer link error: ${errorText(t)}", epoch)
             }
         }
     }
 
-    private fun writeMessage(next: WireMessage) {
+    private fun writeMessage(message: WireMessage) {
         val s = socket ?: return
         if (!connected || s.isClosed) return
         try {
-            synchronized(writeLock) { PeerProtocol.write(s.getOutputStream(), next) }
+            synchronized(writeLock) { PeerProtocol.write(s.getOutputStream(), message) }
         } catch (t: Throwable) {
-            if (running.get() && connected) {
+            if (running.get() && connected && socket === s) {
                 Log.e(TAG, "Peer send failed", t)
                 recoverDataPath("Send failed: ${errorText(t)}")
             }
@@ -712,6 +835,7 @@ class WifiAwarePeerTransport(
     }
 
     @Synchronized private fun cleanupDataPath() {
+        dataPathEpoch.incrementAndGet() // invalidate every outstanding callback/thread first
         connected = false
         socketConnected.set(false)
         clientConnectStarted.set(false)
@@ -719,6 +843,8 @@ class WifiAwarePeerTransport(
         hostAcceptStarted.set(false)
         networkRequestedAtMs = 0L
         latestFrame.set(null)
+        main.removeCallbacks(rangeRunnable)
+        rangingBusy.set(false)
 
         try { socket?.close() } catch (_: Throwable) {}
         try { serverSocket?.close() } catch (_: Throwable) {}
@@ -729,10 +855,13 @@ class WifiAwarePeerTransport(
             try { connectivity.unregisterNetworkCallback(it) } catch (_: Throwable) {}
         }
         networkCallback = null
+        hostResponderMode = HostResponderMode.NONE
     }
 
-    private fun recoverDataPath(reason: String) {
+    private fun recoverDataPath(reason: String, expectedEpoch: Int? = null) {
         if (!running.get()) return
+        if (expectedEpoch != null && !isCurrentEpoch(expectedEpoch)) return
+
         val wasConnected = connected
         cleanupDataPath()
         if (wasConnected) safeCallback { callbacks.onDisconnected(reason) }
@@ -742,18 +871,21 @@ class WifiAwarePeerTransport(
         main.postDelayed({
             recoveryScheduled.set(false)
             if (!running.get() || connected) return@postDelayed
-            val peer = currentPeer ?: return@postDelayed
+            val peer = currentPeer
             if (hostRole) {
-                ensureHostNetwork(peer)
-                announceNdp(peer)
-            } else {
+                armHostResponder(preferAnyPeer = true, peer = peer)
+                if (peer != null) announceNdp(peer)
+            } else if (peer != null) {
+                requestClientNetwork(peer)
                 scheduleJoinHandshake(0L)
             }
         }, RECOVERY_DELAY_MS)
     }
 
+    private fun isCurrentEpoch(epoch: Int): Boolean = epoch == dataPathEpoch.get()
+
     private fun scheduleRanging() {
-        if (running.get()) {
+        if (running.get() && connected && !hostRole) {
             main.removeCallbacks(rangeRunnable)
             main.post(rangeRunnable)
         }
@@ -761,12 +893,14 @@ class WifiAwarePeerTransport(
 
     private val rangeRunnable = object : Runnable {
         override fun run() {
+            if (!running.get() || !connected || hostRole) return
             rangeOnce()
-            if (running.get()) main.postDelayed(this, 1200L)
+            if (running.get() && connected && !hostRole) main.postDelayed(this, RTT_PERIOD_MS)
         }
     }
 
     private fun rangeOnce() {
+        if (!connected || hostRole) return
         val peer = currentPeer ?: return
         val manager = rtt ?: return
         if (missingPeerPermissions().isNotEmpty()) return
@@ -856,14 +990,17 @@ class WifiAwarePeerTransport(
     private fun safeToken(value: String) =
         value.replace('|', '_').replace('\n', ' ').replace('\r', ' ').trim().take(32)
 
-    private fun psk(code: String) = "Spatial-${normalizeRoom(code)}-V5"
+    private fun psk(code: String) = "Spatial-${normalizeRoom(code)}-V6"
 
     companion object {
-        private const val SERVICE = "spatialnomap.v5"
+        private const val SERVICE = "spatialnomap.v6"
         private const val TAG = "SpatialAware"
+        private const val TCP_PROTOCOL = 6
         private const val NDP_REQUEST_TIMEOUT_MS = 8_000L
-        private const val RECOVERY_DELAY_MS = 650L
-        private const val ENDPOINT_RESOLVE_ATTEMPTS = 36
+        private const val HOST_MODE_FALLBACK_MS = 5_500L
+        private const val RECOVERY_DELAY_MS = 500L
+        private const val ENDPOINT_RESOLVE_ATTEMPTS = 50
         private const val ENDPOINT_RESOLVE_SLEEP_MS = 100L
+        private const val RTT_PERIOD_MS = 1_500L
     }
 }
