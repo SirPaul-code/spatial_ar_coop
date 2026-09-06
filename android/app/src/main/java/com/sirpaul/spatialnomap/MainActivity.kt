@@ -32,7 +32,6 @@ import com.google.ar.core.Config
 import com.google.ar.core.Session
 import org.opencv.android.OpenCVLoader
 import java.security.SecureRandom
-import kotlin.math.min
 
 class MainActivity : Activity(),
     WifiAwarePeerTransport.Callbacks,
@@ -247,7 +246,7 @@ class MainActivity : Activity(),
                 if (setupShell.visibility == View.VISIBLE) hideSetup() else showSetup()
             }
         }
-        syncPill = pill("AR STARTING", 0xc91b2025.toInt())
+        syncPill = pill("STARTING", 0xc91b2025.toInt())
         row.addView(transportPill, LinearLayout.LayoutParams(0, dp(38), 1f).apply { rightMargin = dp(7) })
         row.addView(syncPill, LinearLayout.LayoutParams(0, dp(38), 1f))
 
@@ -256,7 +255,7 @@ class MainActivity : Activity(),
             textSize = 11.5f
             gravity = Gravity.CENTER
             maxLines = 2
-            text = "Starting local AR…"
+            text = "Starting spatial tracking…"
             background = rounded(0x9f101418.toInt(), 16f)
             setPadding(dp(11), dp(4), dp(11), dp(4))
         }
@@ -464,7 +463,7 @@ class MainActivity : Activity(),
             haptic()
             showBanner(
                 "Camera ${choice.label}",
-                "${choice.detail} • depth ${configured.depthMode} • intrinsics/world transform reset; re-fusing both phones",
+                "${choice.detail} • depth ${configured.depthMode} • spatial tracking reacquiring",
             )
         } catch (t: Throwable) {
             renderer.detachSession()
@@ -580,7 +579,7 @@ class MainActivity : Activity(),
                 cameraChoices.getOrNull(activeCameraIndex)?.let { cameraButton.text = it.label }
 
                 val configured = configureBestAvailable(s)
-                setTechnicalStatus("AR configured • ${cameraButton.text} • depth ${configured.depthMode}")
+                setTechnicalStatus("Spatial camera ready • ${cameraButton.text} • depth ${configured.depthMode}")
             }
 
             val s = session ?: return
@@ -591,15 +590,15 @@ class MainActivity : Activity(),
             arRetryCount = 0
             arTrackingStable = false
             renderArReadiness()
-            setTechnicalStatus("Move the phone slightly to initialize tracking")
+            setTechnicalStatus("Move the phone gently to initialize spatial tracking")
         } catch (t: Throwable) {
             renderer.detachSession()
             disposeArSession()
             arTrackingStable = false
-            syncPill.text = "AR ERROR"
+            syncPill.text = "TRACKING ERROR"
             syncPill.background = rounded(0xd0581f27.toInt(), 18f)
             setTechnicalStatus("AR start failed: ${errorText(t)}")
-            showErrorBanner("ARCore failed", t)
+            showErrorBanner("Spatial tracking failed", t)
             scheduleArRetry(immediate = false)
         } finally {
             arStarting = false
@@ -623,7 +622,9 @@ class MainActivity : Activity(),
     private fun buildArConfig(s: Session, enableDepth: Boolean) = Config(s).apply {
         planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-        focusMode = Config.FocusMode.AUTO
+        // ARCore recommends its default/fixed-focus behavior for tracking. Do not
+        // continuously hunt focus while extracting cross-device correspondences.
+        focusMode = Config.FocusMode.FIXED
         depthMode = if (enableDepth) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
     }
 
@@ -870,7 +871,7 @@ class MainActivity : Activity(),
                         bleRanger.start(code)
                         hideSetup()
                         haptic()
-                        showBanner("Space $code starting", "Wi-Fi Aware + RTT + camera/IMU fusion starting…")
+                        showBanner("Space $code ready", "Waiting for the nearby phone")
                     }
                     .onFailure {
                         activeRoomCode = null
@@ -894,7 +895,7 @@ class MainActivity : Activity(),
                     .onSuccess {
                         activeRoomCode = code
                         bleRanger.start(code)
-                        transportPill.text = "LINKING • $code"
+                        transportPill.text = "CONNECTING • $code"
                         hideSetup()
                         haptic()
                     }
@@ -915,12 +916,12 @@ class MainActivity : Activity(),
     override fun onTransportStatus(text: String) {
         runOnUiThread {
             setupStatus.text = text
-            if (!coordinator.quality().bothReady) detailPill.text = text
+            if (!coordinator.quality().bothReady && setupShell.visibility == View.VISIBLE) detailPill.text = text
             val lower = text.lowercase()
             val isError = listOf("failed", "unavailable", "lost", "exception", "permission", "denied").any { it in lower }
             if (isError && text != lastTransportError) {
                 lastTransportError = text
-                showBanner("Direct link", text, 8500L)
+                showBanner("Connection", text, 8500L)
             }
             if ("room " in lower && "ready" in lower) {
                 showBanner("Room ready", text, 3500L)
@@ -958,8 +959,8 @@ class MainActivity : Activity(),
                 haptic()
                 showBanner(
                     "Connected to $peerUsername",
-                    "Direct Wi-Fi Aware • RTT/BLE ranging • compass/IMU/GPS priors • visual 3D refinement",
-                    5200L,
+                    "Private direct phone-to-phone link established",
+                    3600L,
                 )
             }
         }
@@ -989,7 +990,7 @@ class MainActivity : Activity(),
             is WireMessage.Range -> coordinator.onRange(message.distanceM, message.stdDevM, message.samples)
             is WireMessage.ResetAlignment -> {
                 coordinator.onPeerAlignmentReset(message.reason)
-                runOnUiThread { showBanner("Peer AR changed", "Re-fusing geometry: ${message.reason}") }
+                runOnUiThread { showBanner("Reacquiring", "The other phone changed its spatial tracking state") }
             }
             is WireMessage.Hello -> Unit
         }
@@ -1016,58 +1017,33 @@ class MainActivity : Activity(),
 
     override fun onAlignmentQuality(quality: AlignmentCoordinator.Quality) {
         runOnUiThread {
-            val range = quality.rangeM?.let {
-                "${quality.rangeSource} %.2fm".format(it)
-            } ?: "radio —"
-            val heading = if (quality.headingResidualDeg.isFinite()) {
-                "HΔ %.0f°".format(quality.headingResidualDeg)
-            } else if (quality.sensorPriorConfidence > 0f) {
-                "compass ✓"
-            } else {
-                "compass —"
-            }
-            val gravity = if (quality.gravityTiltDeg.isFinite()) {
-                "GΔ %.0f°".format(quality.gravityTiltDeg)
-            } else {
-                "gravity ✓"
-            }
-            val keyframes = "KF ${quality.keyframesLocal}/${quality.keyframesRemote}"
-
+            val range = quality.rangeM?.let { "%.1f m".format(it) }
             when {
                 quality.bothReady -> {
-                    syncPill.text = "READY • ${(quality.confidence * 100).toInt()}%"
+                    syncPill.text = "LOCKED"
                     syncPill.background = rounded(0xd11a4b3c.toInt(), 18f, 0x7755f0bd, 1)
-                    detailPill.text = "Tap a physical point • $range • $heading • $gravity"
+                    detailPill.text = buildString {
+                        append("Tap a physical point")
+                        if (range != null) append(" • peer $range")
+                    }
                 }
                 quality.localReady -> {
-                    syncPill.text = "VERIFYING PEER"
+                    syncPill.text = "CONFIRMING"
                     syncPill.background = rounded(0xcf584719.toInt(), 18f)
-                    detailPill.text = "Local transform locked • waiting for peer confirmation • $range"
+                    detailPill.text = "Spatial lock found • confirming the second phone"
                 }
                 peerConnectedOnce -> {
-                    val progress = fusionProgress(quality)
-                    syncPill.text = "FUSING • $progress%"
+                    syncPill.text = "ALIGNING"
                     syncPill.background = rounded(0xcf493b18.toInt(), 18f)
-                    detailPill.text = if (quality.inliers > 0) {
-                        "Vision ${quality.inliers}/${quality.correspondences} • $heading • $gravity • $range • $keyframes"
-                    } else if (quality.fusionSource != "NONE" && quality.fusionSource != "VISION") {
-                        "${quality.fusionSource} seed ${(quality.fusionSeedConfidence * 100).toInt()}% • point both cameras at one shared detailed area"
-                    } else {
-                        "Point both cameras at the same detailed area for 1–2 s • $range • $keyframes"
+                    detailPill.text = when {
+                        quality.inliers >= 7 -> "Hold on the same detailed area for a moment"
+                        quality.keyframesLocal < 2 || quality.keyframesRemote < 2 -> "Point both cameras at the same detailed area"
+                        else -> "Move both phones slowly while keeping some shared detail in view"
                     }
                 }
                 else -> renderArReadiness()
             }
         }
-    }
-
-    private fun fusionProgress(quality: AlignmentCoordinator.Quality): Int {
-        val visual = (min(quality.inliers, 16) / 16f) * 46f
-        val consensus = (min(quality.stableCount, 3) / 3f) * 26f
-        val sensors = quality.sensorPriorConfidence.coerceIn(0f, 1f) * 14f
-        val coarse = quality.fusionSeedConfidence.coerceIn(0f, 1f) * 12f
-        val history = (min(quality.keyframesLocal, quality.keyframesRemote).coerceAtMost(6) / 6f) * 6f
-        return (visual + consensus + sensors + coarse + history).toInt().coerceIn(1, 96)
     }
 
     override fun onRemotePoi(pointLocal: FloatArray?, owner: String, confidence: Float) {
@@ -1107,7 +1083,7 @@ class MainActivity : Activity(),
 
     private fun setTechnicalStatus(text: String) {
         runOnUiThread {
-            if (!coordinator.quality().bothReady) detailPill.text = text
+            if (!coordinator.quality().bothReady && setupShell.visibility == View.VISIBLE) detailPill.text = text
             when {
                 text == "AR tracking" -> {
                     if (!arTrackingStable) {
@@ -1123,19 +1099,19 @@ class MainActivity : Activity(),
                 }
                 text.startsWith("AR frame error") && text != lastArError -> {
                     lastArError = text
-                    showBanner("AR frame error", text.removePrefix("AR frame error: "), 8500L)
+                    showBanner("Tracking issue", "Reacquiring camera tracking…", 4200L)
                 }
                 text.startsWith("SYNCING") -> {
                     showBanner(
-                        "Spatial lock not ready yet",
-                        "Keep both cameras on one overlapping detailed area. The app is fusing vision, ARCore/IMU gravity, compass and radio ranging.",
-                        4200L,
+                        "Aligning space",
+                        "Keep some shared detailed geometry visible on both phones and move slowly.",
+                        3600L,
                     )
                 }
                 text.startsWith("No reliable metric depth") -> {
-                    showBanner("No surface depth at tap", "Move the phone slightly so ARCore can build depth, then tap the surface again.", 4200L)
+                    showBanner("Move slightly", "Keep the surface in view for a moment, then tap again.", 3600L)
                 }
-                text == "POI sent" -> showBanner("POI sent", "Shared metric point transmitted to the peer", 2300L)
+                text == "POI sent" -> showBanner("POI shared", "Visible on the connected phone", 2200L)
             }
         }
     }
@@ -1144,16 +1120,18 @@ class MainActivity : Activity(),
         if (peerConnectedOnce || coordinator.quality().localReady) return
         when {
             !renderer.sessionResumed -> {
-                syncPill.text = "AR STARTING"
+                syncPill.text = "STARTING"
                 syncPill.background = rounded(0xc91b2025.toInt(), 18f)
             }
             arTrackingStable -> {
-                syncPill.text = "AR READY"
+                syncPill.text = "TRACKING"
                 syncPill.background = rounded(0xc928343b.toInt(), 18f)
+                detailPill.text = "Spatial tracking ready"
             }
             else -> {
-                syncPill.text = "AR ACQUIRING"
+                syncPill.text = "ACQUIRING"
                 syncPill.background = rounded(0xc9443818.toInt(), 18f)
+                detailPill.text = "Move the phone gently"
             }
         }
     }
