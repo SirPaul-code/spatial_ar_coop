@@ -1,5 +1,7 @@
 package com.sirpaul.spatialnomap
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
@@ -33,6 +35,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
+/**
+ * All public entry points are reached after MainActivity's permission flow, but
+ * the transport also checks the permission itself. The SuppressLint annotation
+ * only tells static analysis about that cross-method invariant; it is not the
+ * runtime safety mechanism.
+ */
+@SuppressLint("MissingPermission")
 class WifiAwarePeerTransport(
     private val context: Context,
     private val callbacks: Callbacks,
@@ -110,6 +119,10 @@ class WifiAwarePeerTransport(
     }
 
     fun joinRoom(code: String) {
+        if (!hasPeerPermission()) {
+            status("Nearby devices permission was revoked. Re-open connection setup.")
+            return
+        }
         val normalized = normalizeRoom(code)
         val peer = roomPeers[normalized]
         val session = subscribeSession
@@ -209,6 +222,9 @@ class WifiAwarePeerTransport(
     private fun startCommon(name: String) {
         stop("restart")
         username = name.trim().ifBlank { Build.MODEL }.take(32)
+        if (!hasPeerPermission()) {
+            throw SecurityException("Nearby devices permission is required for direct peer discovery")
+        }
         val caps = capabilities()
         if (!caps.awareSupported || aware == null) {
             throw IllegalStateException("Wi-Fi Aware is not supported on this device")
@@ -531,6 +547,7 @@ class WifiAwarePeerTransport(
     private fun rangeOnce() {
         val peer = currentPeer ?: return
         val manager = rtt ?: return
+        if (!hasPeerPermission()) return
         if (!capabilities().rttAvailable || !rangingBusy.compareAndSet(false, true)) return
         try {
             val request = RangingRequest.Builder()
@@ -565,6 +582,12 @@ class WifiAwarePeerTransport(
         socket = null
         safeCallback { callbacks.onDisconnected(reason) }
         status(reason)
+    }
+
+    private fun hasPeerPermission(): Boolean = if (Build.VERSION.SDK_INT >= 33) {
+        context.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+    } else {
+        context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun status(text: String) = safeCallback { callbacks.onTransportStatus(text) }
