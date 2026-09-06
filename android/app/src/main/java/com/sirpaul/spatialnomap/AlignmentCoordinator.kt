@@ -199,6 +199,11 @@ class AlignmentCoordinator(
         solveExecutor.shutdownNow()
     }
 
+    /**
+     * Keep a spatially diverse micro-map, but do not promote obviously high-angular
+     * velocity frames just because the timer elapsed. Those frames are commonly
+     * motion-blurred on phones and poison cross-view feature matching.
+     */
     private fun addDiverseKeyframe(window: ArrayDeque<CapturedFrame>, frame: CapturedFrame) {
         val last = window.peekLast()
         if (last == null) {
@@ -206,18 +211,21 @@ class AlignmentCoordinator(
             return
         }
 
+        val motionQuality = frameMotionQuality(frame)
+        val lastMotionQuality = frameMotionQuality(last)
         val (translationM, rotationDeg) = cameraPoseDelta(last.pose, frame.pose)
         val lastNs = frameClockNs(last)
         val nowNs = frameClockNs(frame)
         val elapsedNs = if (lastNs > 0L && nowNs > lastNs) nowNs - lastNs else Long.MAX_VALUE
         val materiallyBetterDepth = frame.metricPoints.size >= max(32, (last.metricPoints.size * 1.30).toInt())
-        val calmer = frameMotionQuality(frame) > frameMotionQuality(last) + 0.18
+        val calmer = motionQuality > lastMotionQuality + 0.18
         val spatiallyNew = translationM >= KEYFRAME_TRANSLATION_M || rotationDeg >= KEYFRAME_ROTATION_DEG
         val temporallyNew = elapsedNs >= KEYFRAME_MAX_INTERVAL_NS
+        val motionUsable = motionQuality >= MIN_KEYFRAME_MOTION_QUALITY
 
-        if (spatiallyNew || temporallyNew) {
+        if (motionUsable && (spatiallyNew || temporallyNew)) {
             window.addLast(frame)
-        } else if (materiallyBetterDepth || calmer) {
+        } else if (motionUsable && (materiallyBetterDepth || calmer)) {
             window.removeLast()
             window.addLast(frame)
         }
@@ -308,6 +316,13 @@ class AlignmentCoordinator(
         )
     }
 
+    /**
+     * Frames from different phones do not share a monotonic clock, but both windows
+     * advance at roughly the same cadence. Prefer similar relative ages while still
+     * considering depth support, motion quality and recency. This prevents the top
+     * solve budget from repeatedly testing unrelated old/new views and missing the
+     * pair which actually shares scene overlap.
+     */
     private fun buildFramePairs(): List<FramePair> {
         val locals: List<CapturedFrame>
         val remotes: List<CapturedFrame>
@@ -319,11 +334,14 @@ class AlignmentCoordinator(
 
         val out = ArrayList<FramePair>(locals.size * remotes.size)
         for ((li, local) in locals.withIndex()) {
+            val localAge = (li + 1).toDouble() / locals.size
             for ((ri, remote) in remotes.withIndex()) {
-                val recency = (li + 1).toDouble() / locals.size + (ri + 1).toDouble() / remotes.size
+                val remoteAge = (ri + 1).toDouble() / remotes.size
+                val recency = localAge + remoteAge
+                val temporalAffinity = (1.0 - abs(localAge - remoteAge)).coerceIn(0.0, 1.0)
                 val support = min(remote.metricPoints.size, 1800) / 1800.0
                 val motionScore = min(frameMotionQuality(local), frameMotionQuality(remote))
-                val score = recency * 0.45 + support * 1.02 + motionScore * 0.48
+                val score = recency * 0.34 + temporalAffinity * 0.72 + support * 0.95 + motionScore * 0.52
                 out += FramePair(remote, local, score)
             }
         }
@@ -363,7 +381,9 @@ class AlignmentCoordinator(
             val cluster = strongestCluster(candidateHistory, CLUSTER_TRANSLATION_M, CLUSTER_ROTATION_DEG)
             stableCount = cluster.size
             val singleStrong = isSingleFrameLockQuality(result)
-            val clustered = cluster.size >= 2 && result.inliers >= 9 && confidence >= 0.13f
+            val robustCandidate = result.inliers >= 9 && confidence >= 0.13f
+            val requiredConsensus = if (robustCandidate) 2 else 3
+            val clustered = cluster.size >= requiredConsensus
 
             if (singleStrong || clustered) {
                 lockedTransform = consensusMedoid(if (cluster.isNotEmpty()) cluster else candidateHistory.toList())
@@ -892,9 +912,10 @@ class AlignmentCoordinator(
         private const val KEYFRAME_TRANSLATION_M = 0.08
         private const val KEYFRAME_ROTATION_DEG = 5.0
         private const val KEYFRAME_MAX_INTERVAL_NS = 1_500_000_000L
+        private const val MIN_KEYFRAME_MOTION_QUALITY = 0.50
         private const val SOLVE_MIN_INTERVAL_MS = 330L
         private const val REFINEMENT_SOLVE_INTERVAL_MS = 1_800L
-        private const val MAX_PAIR_ATTEMPTS = 7
+        private const val MAX_PAIR_ATTEMPTS = 10
         private const val REFINEMENT_PAIR_ATTEMPTS = 3
         private const val CANDIDATE_WINDOW = 14
         private const val REFINEMENT_HISTORY = 8
@@ -919,10 +940,10 @@ class AlignmentCoordinator(
         private const val MIN_PEER_TRANSFORM_CONFIDENCE = 0.10f
         private const val ACK_VERIFY_TRANSLATION_M = 0.18
         private const val ACK_VERIFY_ROTATION_DEG = 3.5
-        private const val MIN_LOCK_INLIERS = 8
-        private const val MIN_LOCK_CORRESPONDENCES = 8
-        private const val MAX_LOCK_REPROJECTION_PX = 4.6
-        private const val MIN_LOCK_COVERAGE = 0.055
-        private const val MIN_LOCK_CONFIDENCE = 0.11f
+        private const val MIN_LOCK_INLIERS = 7
+        private const val MIN_LOCK_CORRESPONDENCES = 7
+        private const val MAX_LOCK_REPROJECTION_PX = 5.0
+        private const val MIN_LOCK_COVERAGE = 0.045
+        private const val MIN_LOCK_CONFIDENCE = 0.10f
     }
 }
