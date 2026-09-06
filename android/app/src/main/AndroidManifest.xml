@@ -24,6 +24,7 @@
     <uses-feature android:name="android.hardware.wifi.rtt" android:required="false" />
 
     <application
+        android:name=".SpatialSyncApplication"
         android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:label="Spatial Sync"
