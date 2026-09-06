@@ -14,6 +14,10 @@ import java.util.Locale
  * Tracking quality has priority over CPU-image resolution. ARCore itself ranks
  * stereo usage first, then 60 fps, then hardware depth; keep the same ordering
  * when collapsing duplicate CPU-stream variants for one physical camera ID.
+ *
+ * A fresh Session may expose a conservative default CameraConfig. After ranking,
+ * explicitly apply the best tracking config for that same physical default camera
+ * so the quality policy is active even before a user ever opens the camera menu.
  */
 class ArCameraCatalog(
     context: Context,
@@ -83,6 +87,13 @@ class ArCameraCatalog(
                 .thenBy { it.approximateZoom ?: Float.MAX_VALUE }
                 .thenBy { it.cameraId },
         )
+
+        // Session is still paused while this catalog is constructed, which is the
+        // valid point to replace its CameraConfig. Preserve the physical camera ID
+        // but activate the highest-ranked tracking stream combination for it.
+        choices.firstOrNull { it.cameraId == defaultCameraId }?.let { bestDefault ->
+            runCatching { session.cameraConfig = bestDefault.config }
+        }
     }
 
     fun indexForCameraId(cameraId: String?): Int =
