@@ -94,7 +94,11 @@ class ArRenderer(
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
-            coordinator.onTrackingState(tracking)
+            // ARCore can temporarily report PAUSED during fast motion, motion blur,
+            // low texture or exposure changes. PAUSED does not mean the AR world
+            // coordinate system was recreated, so do not throw away an already
+            // verified inter-device SE(3) lock here. Explicit session/camera
+            // changes still reset alignment through MainActivity/coordinator.
             when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
                 true -> status("AR tracking")
                 false -> status("AR PAUSED / ${camera.trackingFailureReason}")
@@ -120,7 +124,7 @@ class ArRenderer(
     private fun handleTap(frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
-            status("SYNCING — keep both cameras on overlapping detail until FUSED/LOCKED")
+            status("SYNCING — keep both cameras on overlapping detail until READY")
             return
         }
 
