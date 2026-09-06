@@ -16,12 +16,16 @@ import kotlin.math.min
 
 object FrameCapture {
     /**
-     * Captures the CPU Y plane as a compact grayscale JPEG. Copying is row based
-     * for the normal pixelStride=1 path and resize/JPEG are native OpenCV calls;
-     * this avoids the old AR render-thread loop that created one ARGB Int per
-     * source pixel every ~650 ms.
+     * Captures the CPU Y plane as a compact grayscale JPEG plus the AR camera
+     * geometry, metric supports and a sensor snapshot taken at almost the same
+     * instant. The latter is used only as a registration prior/fallback.
      */
-    fun capture(frame: Frame, camera: Camera, maxWidth: Int = 1280): CapturedFrame? {
+    fun capture(
+        frame: Frame,
+        camera: Camera,
+        maxWidth: Int = 1280,
+        sensors: SensorSnapshot = SensorSnapshot(),
+    ): CapturedFrame? {
         val image = try {
             frame.acquireCameraImage()
         } catch (_: NotYetAvailableException) {
@@ -100,6 +104,7 @@ object FrameCapture {
                     ),
                     jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
                     metricPoints = metric,
+                    sensors = sensors,
                 )
             } finally {
                 src.release()
