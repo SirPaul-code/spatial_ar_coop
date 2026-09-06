@@ -5,9 +5,9 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// DEV-ONLY signing material. The encoded PKCS12 key is intentionally committed
-// so every GitHub Actions runner and local clone signs Spatial Sync with the same
-// certificate. Never reuse this key for a production/Play Store application.
+// Stable sideload/update signing for this POC branch. The encoded PKCS12 key is
+// intentionally committed so CI and local builds use the same certificate.
+// Never reuse this key for a Play Store / production signing identity.
 val stableDevStoreSource = rootProject.file("keystore/spatial-sync-dev.p12.b64")
 val stableDevStore = layout.buildDirectory.file("generated/signing/spatial-sync-dev.p12").get().asFile
 if (!stableDevStore.exists()) {
@@ -53,6 +53,11 @@ android {
     buildTypes {
         getByName("debug") {
             signingConfig = signingConfigs.getByName("stableDev")
+        }
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("stableDev")
+            isDebuggable = false
+            isMinifyEnabled = false
         }
     }
 
