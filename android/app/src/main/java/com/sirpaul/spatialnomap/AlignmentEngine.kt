@@ -44,6 +44,11 @@ object AlignmentEngine {
         val keyLocal: Array<KeyPoint>,
     )
 
+    private data class RatioMatch(
+        val match: DMatch,
+        val ratio: Float,
+    )
+
     fun solve(remote: CapturedFrame, local: CapturedFrame): Result? {
         if (remote.metricPoints.size < 18) return null
         val matchSet = siftMatches(remote, local) ?: return null
@@ -234,6 +239,13 @@ object AlignmentEngine {
         )
     }
 
+    /**
+     * Mutual SIFT matches remain the trusted core, but we also keep a bounded set
+     * of very strong one-way ratio matches. Previously, once eight mutual matches
+     * existed, all other high-quality matches were discarded; with sparse depth
+     * that could leave only 6-7 metric correspondences forever. RANSAC is exactly
+     * the layer which should reject the remaining outliers.
+     */
     private fun siftMatches(remote: CapturedFrame, local: CapturedFrame): MatchSet? {
         val a = decodeGray(remote) ?: return null
         val b = decodeGray(local) ?: run {
@@ -266,51 +278,62 @@ object AlignmentEngine {
         val reverseBest = IntArray(db.rows()) { -1 }
         for (pair in reverse) {
             val arr = pair.toArray()
-            if (arr.size >= 2 && arr[0].distance < SIFT_RATIO * arr[1].distance) {
-                val localIdx = arr[0].queryIdx
-                if (localIdx in reverseBest.indices) reverseBest[localIdx] = arr[0].trainIdx
-            }
-            pair.release()
-        }
-
-        val mutual = ArrayList<DMatch>()
-        val ratioOnly = ArrayList<DMatch>()
-        for (pair in forward) {
-            val arr = pair.toArray()
-            if (arr.size >= 2 && arr[0].distance < SIFT_RATIO * arr[1].distance) {
-                val m = arr[0]
-                ratioOnly += m
-                if (m.trainIdx in reverseBest.indices && reverseBest[m.trainIdx] == m.queryIdx) {
-                    mutual += m
+            if (arr.size >= 2 && arr[1].distance > 1e-6f) {
+                val ratio = arr[0].distance / arr[1].distance
+                if (ratio < SIFT_RATIO) {
+                    val localIdx = arr[0].queryIdx
+                    if (localIdx in reverseBest.indices) reverseBest[localIdx] = arr[0].trainIdx
                 }
             }
             pair.release()
         }
 
-        val good = if (mutual.size >= 8) mutual else ratioOnly.filter { match ->
-            val q = forwardRatioMargin(match, da, db)
-            q <= STRICT_FALLBACK_RATIO
+        val mutual = ArrayList<DMatch>()
+        val ratioAccepted = ArrayList<RatioMatch>()
+        for (pair in forward) {
+            val arr = pair.toArray()
+            if (arr.size >= 2 && arr[1].distance > 1e-6f) {
+                val ratio = arr[0].distance / arr[1].distance
+                if (ratio < SIFT_RATIO) {
+                    val m = arr[0]
+                    ratioAccepted += RatioMatch(m, ratio)
+                    if (m.trainIdx in reverseBest.indices && reverseBest[m.trainIdx] == m.queryIdx) {
+                        mutual += m
+                    }
+                }
+            }
+            pair.release()
         }
+
+        val good = ArrayList<DMatch>(mutual.size + MAX_STRICT_AUGMENT)
+        val usedQuery = HashSet<Int>()
+        val usedTrain = HashSet<Int>()
+        for (m in mutual.sortedBy { it.distance }) {
+            if (usedQuery.add(m.queryIdx) && usedTrain.add(m.trainIdx)) good += m
+        }
+
+        for (candidate in ratioAccepted.sortedWith(compareBy<RatioMatch> { it.ratio }.thenBy { it.match.distance })) {
+            if (good.size >= mutual.size + MAX_STRICT_AUGMENT) break
+            if (candidate.ratio > STRICT_FALLBACK_RATIO) break
+            val m = candidate.match
+            if (usedQuery.add(m.queryIdx) && usedTrain.add(m.trainIdx)) good += m
+        }
+
+        // Recovery path only when the strict set is still too small to run PnP.
+        if (good.size < MIN_MATCHES_FOR_PNP) {
+            for (candidate in ratioAccepted.sortedWith(compareBy<RatioMatch> { it.ratio }.thenBy { it.match.distance })) {
+                if (good.size >= RECOVERY_MATCH_TARGET) break
+                if (candidate.ratio > RECOVERY_FALLBACK_RATIO) break
+                val m = candidate.match
+                if (usedQuery.add(m.queryIdx) && usedTrain.add(m.trainIdx)) good += m
+            }
+        }
+
         val result = MatchSet(good, kpa.toArray(), kpb.toArray())
         releaseAll(a, b, kpa, kpb, da, db)
         matcher.clear()
         sift.clear()
         return result
-    }
-
-    private fun forwardRatioMargin(match: DMatch, da: Mat, db: Mat): Float {
-        val query = da.row(match.queryIdx)
-        val matcher = BFMatcher.create(Core.NORM_L2, false)
-        val pairs = ArrayList<MatOfDMatch>()
-        return try {
-            matcher.knnMatch(query, db, pairs, 2)
-            val arr = pairs.firstOrNull()?.toArray() ?: return 1f
-            if (arr.size < 2 || arr[1].distance <= 1e-6f) 1f else arr[0].distance / arr[1].distance
-        } finally {
-            pairs.forEach { it.release() }
-            matcher.clear()
-            query.release()
-        }
     }
 
     private fun spatialDiameterM(points: List<Point3>): Double {
@@ -438,7 +461,11 @@ object AlignmentEngine {
 
     private const val SIFT_RATIO = 0.80f
     private const val STRICT_FALLBACK_RATIO = 0.72f
-    private const val METRIC_ASSOCIATION_RADIUS_PX = 16.0
+    private const val RECOVERY_FALLBACK_RATIO = 0.77f
+    private const val MIN_MATCHES_FOR_PNP = 8
+    private const val RECOVERY_MATCH_TARGET = 12
+    private const val MAX_STRICT_AUGMENT = 24
+    private const val METRIC_ASSOCIATION_RADIUS_PX = 20.0
     private const val MIN_WORLD_SUPPORT_DIAMETER_M = 0.08
     private const val MIN_CHEIRALITY_RATIO = 0.90
 }
