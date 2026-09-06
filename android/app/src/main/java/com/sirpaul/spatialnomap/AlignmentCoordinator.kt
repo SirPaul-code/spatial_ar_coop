@@ -7,6 +7,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 class AlignmentCoordinator(
     private val transport: WifiAwarePeerTransport,
@@ -23,7 +24,9 @@ class AlignmentCoordinator(
         val peerReady: Boolean = false,
         val rangeM: Float? = null,
         val rangeDeltaM: Float? = null,
+        val rangeSource: String = "NONE",
         val headingResidualDeg: Double = Double.NaN,
+        val gravityTiltDeg: Double = Double.NaN,
         val sensorPriorConfidence: Float = 0f,
         val fusionSource: String = "VISION",
         val fusionSeedConfidence: Float = 0f,
@@ -68,6 +71,8 @@ class AlignmentCoordinator(
     @Volatile private var peerReady = false
     @Volatile private var latestRangeM: Float? = null
     @Volatile private var latestRangeStdM: Float? = null
+    @Volatile private var latestRangeSource = "NONE"
+    @Volatile private var lastRttAtMs = 0L
     @Volatile private var latestQuality = Quality()
     @Volatile private var pendingPoi: WireMessage.Poi? = null
     @Volatile private var trackingLostAtMs = 0L
@@ -109,13 +114,31 @@ class AlignmentCoordinator(
         maybeSolve()
     }
 
+    /** Precise Wi-Fi Aware RTT range. Always wins over BLE while fresh. */
     fun onRange(distanceM: Float, stdDevM: Float, samples: Int) {
         if (distanceM.isFinite() && distanceM in 0.05f..250f) {
             latestRangeM = distanceM
             latestRangeStdM = if (stdDevM.isFinite()) stdDevM else null
+            latestRangeSource = "RTT"
+            lastRttAtMs = System.currentTimeMillis()
             updateFusionSeed()
             emitQuality()
         }
+    }
+
+    /**
+     * Optional BLE RSSI fallback. It never replaces recent RTT and its large
+     * uncertainty prevents it from masquerading as a precise position sensor.
+     */
+    fun onBleRange(distanceM: Float, stdDevM: Float, rssiDbm: Int) {
+        if (!distanceM.isFinite() || distanceM !in 0.05f..30f) return
+        val now = System.currentTimeMillis()
+        if (now - lastRttAtMs <= RTT_FRESH_MS) return
+        latestRangeM = distanceM
+        latestRangeStdM = max(if (stdDevM.isFinite()) stdDevM else 1.0f, 0.75f)
+        latestRangeSource = "BLE"
+        updateFusionSeed()
+        emitQuality()
     }
 
     fun onPeerQuality(message: WireMessage.Quality) {
@@ -188,7 +211,7 @@ class AlignmentCoordinator(
                     }
                     if (isSingleFrameLockQuality(result)) break
                 }
-                if (serial == solveSerial.get()) acceptResult(best, bestPair)
+                if (serial == solveSerial.get()) acceptResult(best)
             } finally {
                 solving.set(false)
                 if (serial == solveSerial.get()) {
@@ -203,6 +226,11 @@ class AlignmentCoordinator(
         }
     }
 
+    /**
+     * Search a short history rather than matching only latest/latest. Two people
+     * are never perfectly synchronized in how they move their phones; keeping
+     * six keyframes per side means overlap found a few seconds ago remains useful.
+     */
     private fun buildFramePairs(): List<FramePair> {
         val locals: List<CapturedFrame>
         val remotes: List<CapturedFrame>
@@ -217,29 +245,43 @@ class AlignmentCoordinator(
             for ((ri, remote) in remotes.withIndex()) {
                 val recency = (li + 1).toDouble() / locals.size + (ri + 1).toDouble() / remotes.size
                 val support = min(local.metricPoints.size, remote.metricPoints.size).coerceAtMost(1800) / 1800.0
+
                 val headingScore = if (local.sensors.hasHeading && remote.sensors.hasHeading) {
                     val d = abs(FusionMath.angleDeltaDeg(
                         local.sensors.headingDeg.toDouble(),
                         remote.sensors.headingDeg.toDouble(),
                     ))
-                    // Same feature can be viewed from different angles, so heading
-                    // is only a ranking hint, never a hard exclusion.
                     (1.0 - d / 180.0).coerceIn(0.0, 1.0)
                 } else 0.35
-                val score = recency * 0.55 + support * 0.75 + headingScore * 0.35
+
+                val pitchScore = if (local.sensors.pitchDeg.isFinite() && remote.sensors.pitchDeg.isFinite()) {
+                    val d = abs(local.sensors.pitchDeg - remote.sensors.pitchDeg).toDouble()
+                    (1.0 - d / 90.0).coerceIn(0.0, 1.0)
+                } else 0.5
+
+                val motionScore = min(frameMotionQuality(local), frameMotionQuality(remote))
+                val score = recency * 0.45 + support * 0.80 + headingScore * 0.28 +
+                    pitchScore * 0.18 + motionScore * 0.34
                 out += FramePair(remote, local, score)
             }
         }
         return out.sortedByDescending { it.score }
     }
 
-    @Synchronized private fun acceptResult(
-        result: AlignmentEngine.Result?,
-        pair: FramePair?,
-    ) {
+    private fun frameMotionQuality(frame: CapturedFrame): Double {
+        val g = frame.sensors.gyroRadS
+        if (g.size < 3 || !g[0].isFinite() || !g[1].isFinite() || !g[2].isFinite()) return 0.55
+        val magnitude = sqrt(
+            g[0].toDouble() * g[0] +
+                g[1].toDouble() * g[1] +
+                g[2].toDouble() * g[2],
+        )
+        return (1.0 / (1.0 + magnitude * 0.45)).coerceIn(0.12, 1.0)
+    }
+
+    @Synchronized private fun acceptResult(result: AlignmentEngine.Result?) {
         if (result == null) {
-            // A failed pair no longer destroys previous good evidence. With two
-            // moving phones, latest/latest is often simply the wrong temporal pair.
+            // A failed current pair must not erase previously accumulated evidence.
             emitQuality()
             return
         }
@@ -249,18 +291,20 @@ class AlignmentCoordinator(
         latestRangeM?.let { range ->
             val delta = abs(result.predictedDeviceDistanceM.toFloat() - range)
             rangeDelta = delta
-            val allowed = max(2.25f, range * 0.55f + (latestRangeStdM ?: 0.25f) * 3f)
-            if (delta > allowed) confidence *= 0.62f
+            val baseAllowance = if (latestRangeSource == "BLE") 3.5f else 2.25f
+            val allowed = max(baseAllowance, range * 0.55f + (latestRangeStdM ?: 0.25f) * 3f)
+            if (delta > allowed) confidence *= if (latestRangeSource == "BLE") 0.82f else 0.62f
         }
 
         val headingOk = result.sensorPriorConfidence < 0.45f ||
             !result.headingResidualDeg.isFinite() || result.headingResidualDeg <= 42.0
+        val gravityOk = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 20.0
         val passes = result.inliers >= 7 &&
             result.correspondences >= 7 &&
             result.medianReprojectionPx <= 4.8 &&
             result.imageCoverage >= 0.055 &&
             confidence >= 0.11f &&
-            headingOk
+            headingOk && gravityOk
 
         localConfidence = confidence
         if (passes) {
@@ -276,7 +320,8 @@ class AlignmentCoordinator(
             val cluster = strongestCluster(candidateHistory)
             stableCount = cluster.size
             val sensorBacked = result.sensorPriorConfidence >= 0.42f &&
-                result.headingResidualDeg.isFinite() && result.headingResidualDeg <= 24.0
+                result.headingResidualDeg.isFinite() && result.headingResidualDeg <= 24.0 &&
+                (!result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 8.0)
             val singleStrong = isSingleFrameLockQuality(result) && confidence >= 0.24f
             val sensorSingle = sensorBacked && result.inliers >= 10 &&
                 result.medianReprojectionPx <= 3.9 && result.imageCoverage >= 0.065 && confidence >= 0.17f
@@ -285,7 +330,6 @@ class AlignmentCoordinator(
             if (lockedTransform == null && (singleStrong || sensorSingle || enoughCluster)) {
                 lockedTransform = consensusMedoid(if (cluster.isNotEmpty()) cluster else candidateHistory.toList())
             } else if (lockedTransform != null && cluster.size >= 2) {
-                // Slow refinement after lock without making the UI flap.
                 lockedTransform = consensusMedoid(cluster)
             }
         }
@@ -303,9 +347,11 @@ class AlignmentCoordinator(
             peerReady = peerReady,
             rangeM = latestRangeM,
             rangeDeltaM = rangeDelta,
+            rangeSource = latestRangeSource,
             headingResidualDeg = result.headingResidualDeg,
+            gravityTiltDeg = result.gravityTiltDeg,
             sensorPriorConfidence = result.sensorPriorConfidence,
-            fusionSource = if (ready) "VISION+SENSORS" else coarseSource,
+            fusionSource = if (ready) "VISION+IMU+RADIO" else coarseSource,
             fusionSeedConfidence = coarseConfidence,
             keyframesLocal = synchronized(frameLock) { localFrames.size },
             keyframesRemote = synchronized(frameLock) { remoteFrames.size },
@@ -329,14 +375,15 @@ class AlignmentCoordinator(
             local = local,
             rangeM = latestRangeM,
             rangeStdM = latestRangeStdM,
+            rangeSource = latestRangeSource,
         )
         val best = listOfNotNull(gnss, colocated).maxByOrNull { it.confidence } ?: return
         coarseTransform = best.transformLocalFromRemote
         coarseConfidence = best.confidence
         coarseSource = best.source
 
-        // Only exceptionally strong GNSS is allowed to become an actual lock.
-        // Normal indoor GNSS and scalar RTT remain priors, never fake precision.
+        // Only truly informative outdoor GNSS is allowed to become an actual
+        // transform by itself. Indoor GNSS/RTT/BLE remain priors for vision.
         if (best.source == "GNSS+COMPASS" && best.confidence >= 0.64f) {
             lockedTransform = best.transformLocalFromRemote.copyOf()
             localConfidence = best.confidence
@@ -367,22 +414,26 @@ class AlignmentCoordinator(
     private fun isSingleFrameLockQuality(result: AlignmentEngine.Result): Boolean {
         val headingAcceptable = result.sensorPriorConfidence < 0.45f ||
             (result.headingResidualDeg.isFinite() && result.headingResidualDeg <= 28.0)
+        val gravityAcceptable = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 8.0
         return result.inliers >= 16 &&
             result.correspondences >= 16 &&
             result.medianReprojectionPx <= 3.3 &&
             result.imageCoverage >= 0.095 &&
             result.confidence >= 0.24f &&
-            headingAcceptable
+            headingAcceptable && gravityAcceptable
     }
 
     private fun resultScore(result: AlignmentEngine.Result): Double {
         val headingBonus = if (result.headingResidualDeg.isFinite()) {
             (1.0 - result.headingResidualDeg / 90.0).coerceIn(0.0, 1.0) * result.sensorPriorConfidence
         } else 0.0
+        val gravityBonus = if (result.gravityTiltDeg.isFinite()) {
+            (1.0 - result.gravityTiltDeg / 25.0).coerceIn(0.0, 1.0) * 0.65
+        } else 0.0
         return result.confidence * 4.0 +
             min(result.inliers, 40) / 20.0 +
             min(result.imageCoverage, 0.30) * 3.0 +
-            headingBonus
+            headingBonus + gravityBonus
     }
 
     private fun consensusMedoid(history: Collection<Candidate>): DoubleArray {
@@ -438,7 +489,10 @@ class AlignmentCoordinator(
         peerReady = false
         trackingLostAtMs = 0L
         lastSolveStartedMs = 0L
-        latestQuality = Quality(rangeM = latestRangeM)
+        latestQuality = Quality(
+            rangeM = latestRangeM,
+            rangeSource = latestRangeSource,
+        )
         if (clearPoi) {
             pendingPoi = null
             listener.onPoiCleared()
@@ -454,7 +508,8 @@ class AlignmentCoordinator(
             localReady = lockedTransform != null,
             peerReady = peerReady,
             rangeM = latestRangeM,
-            fusionSource = if (lockedTransform != null) "VISION+SENSORS" else coarseSource,
+            rangeSource = latestRangeSource,
+            fusionSource = if (lockedTransform != null) "VISION+IMU+RADIO" else coarseSource,
             fusionSeedConfidence = coarseConfidence,
             keyframesLocal = synchronized(frameLock) { localFrames.size },
             keyframesRemote = synchronized(frameLock) { remoteFrames.size },
@@ -470,5 +525,6 @@ class AlignmentCoordinator(
         private const val CLUSTER_TRANSLATION_M = 0.70
         private const val CLUSTER_ROTATION_DEG = 12.0
         private const val ROTATION_TO_METERS_WEIGHT = 0.015
+        private const val RTT_FRESH_MS = 5000L
     }
 }
