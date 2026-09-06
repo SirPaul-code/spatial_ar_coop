@@ -79,6 +79,7 @@ class MainActivity : Activity(),
     private var activeCameraIndex = -1
     private var activeRoomCode: String? = null
     private var bannerSerial = 0L
+    private var lastRemotePoiBannerId = Long.MIN_VALUE
     private var lastTransportError = ""
     private var lastArError = ""
     private var lastBleStatus = ""
@@ -387,7 +388,8 @@ class MainActivity : Activity(),
         setOnClickListener {
             haptic()
             coordinator.clearPoi(true)
-            renderer.setRemoteTarget(null)
+            renderer.clearTargets()
+            lastRemotePoiBannerId = Long.MIN_VALUE
             showBanner("POI cleared", "Removed from both devices")
         }
     }
@@ -622,8 +624,6 @@ class MainActivity : Activity(),
     private fun buildArConfig(s: Session, enableDepth: Boolean) = Config(s).apply {
         planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-        // ARCore recommends its default/fixed-focus behavior for tracking. Do not
-        // continuously hunt focus while extracting cross-device correspondences.
         focusMode = Config.FocusMode.FIXED
         depthMode = if (enableDepth) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
     }
@@ -972,7 +972,8 @@ class MainActivity : Activity(),
             if (!peerConnectedOnce) return@runOnUiThread
             peerConnectedOnce = false
             coordinator.onDisconnected()
-            renderer.setRemoteTarget(null)
+            renderer.clearTargets()
+            lastRemotePoiBannerId = Long.MIN_VALUE
             clearButton.visibility = View.GONE
             transportPill.text = activeRoomCode?.let { "OFFLINE • $it" } ?: "OFFLINE"
             transportPill.background = rounded(0xc91b2025.toInt(), 18f)
@@ -1046,10 +1047,11 @@ class MainActivity : Activity(),
         }
     }
 
-    override fun onRemotePoi(pointLocal: FloatArray?, owner: String, confidence: Float) {
+    override fun onRemotePoi(id: Long, pointLocal: FloatArray?, owner: String, confidence: Float) {
         runOnUiThread {
-            renderer.setRemoteTarget(pointLocal, owner, confidence)
-            if (pointLocal != null) {
+            renderer.setRemoteTarget(id, pointLocal, owner, confidence)
+            if (pointLocal != null && id != lastRemotePoiBannerId) {
+                lastRemotePoiBannerId = id
                 haptic()
                 showBanner("POI added from $owner", "Follow the edge arrow until the marker enters view")
             }
@@ -1057,7 +1059,10 @@ class MainActivity : Activity(),
     }
 
     override fun onPoiCleared() {
-        runOnUiThread { renderer.setRemoteTarget(null) }
+        runOnUiThread {
+            lastRemotePoiBannerId = Long.MIN_VALUE
+            renderer.clearTargets()
+        }
     }
 
     private fun refreshCapabilities() {
