@@ -21,7 +21,7 @@ sealed class WireMessage {
 
 object PeerProtocol {
     private const val MAGIC = 0x53505632
-    private const val VERSION = 3
+    private const val VERSION = 4
     private const val MAX_PAYLOAD = 8 * 1024 * 1024
     private const val T_HELLO = 1
     private const val T_FRAME = 2
@@ -137,6 +137,8 @@ object PeerProtocol {
         val points = frame.metricPoints.take(2500)
         out.writeInt(points.size)
         for (p in points) repeat(5) { out.writeFloat(p.getOrElse(it) { 0f }) }
+
+        writeSensors(out, frame.sensors)
     }
 
     private fun readFrame(input: DataInputStream): CapturedFrame {
@@ -168,6 +170,37 @@ object PeerProtocol {
             intrinsics = intrinsics,
             jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
             metricPoints = points,
+            sensors = readSensors(input),
         )
     }
+
+    private fun writeSensors(out: DataOutputStream, s: SensorSnapshot) {
+        out.writeLong(s.elapsedRealtimeNs)
+        out.writeFloat(s.headingDeg)
+        out.writeFloat(s.pitchDeg)
+        out.writeFloat(s.rollDeg)
+        out.writeFloat(s.orientationQuality)
+        out.writeDouble(s.latitudeDeg)
+        out.writeDouble(s.longitudeDeg)
+        out.writeDouble(s.altitudeM)
+        out.writeFloat(s.horizontalAccuracyM)
+        out.writeFloat(s.verticalAccuracyM)
+        out.writeFloat(s.pressureHpa)
+        repeat(3) { out.writeFloat(s.gyroRadS.getOrElse(it) { Float.NaN }) }
+    }
+
+    private fun readSensors(input: DataInputStream) = SensorSnapshot(
+        elapsedRealtimeNs = input.readLong(),
+        headingDeg = input.readFloat(),
+        pitchDeg = input.readFloat(),
+        rollDeg = input.readFloat(),
+        orientationQuality = input.readFloat(),
+        latitudeDeg = input.readDouble(),
+        longitudeDeg = input.readDouble(),
+        altitudeM = input.readDouble(),
+        horizontalAccuracyM = input.readFloat(),
+        verticalAccuracyM = input.readFloat(),
+        pressureHpa = input.readFloat(),
+        gyroRadS = FloatArray(3) { input.readFloat() },
+    )
 }
