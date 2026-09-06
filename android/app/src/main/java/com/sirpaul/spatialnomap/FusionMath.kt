@@ -101,8 +101,12 @@ object FusionMath {
         val orientationConfidence = prior.confidence.toDouble()
         val locationConfidence = (1.0 - combinedAccuracy / 12.0).coerceIn(0.0, 1.0)
         val baselineConfidence = (horizontalSeparation / (combinedAccuracy * 2.0)).coerceIn(0.0, 1.0)
+
+        // Consumer GNSS is an excellent global prior but is not allowed to claim
+        // a precision AR lock by itself. Keep its maximum below the coordinator's
+        // standalone-lock threshold; vision/metric geometry must verify 6DoF.
         val confidence = (orientationConfidence * locationConfidence * baselineConfidence)
-            .coerceIn(0.0, 0.72)
+            .coerceIn(0.0, 0.60)
             .toFloat()
 
         return Bootstrap(r, confidence, "GNSS+COMPASS", horizontalSeparation)
