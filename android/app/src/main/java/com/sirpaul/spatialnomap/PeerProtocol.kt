@@ -1,6 +1,5 @@
 package com.sirpaul.spatialnomap
 
-import android.util.Base64
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -8,6 +7,7 @@ import java.io.DataOutputStream
 import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Base64
 
 sealed class WireMessage {
     data class Hello(val username: String, val deviceModel: String) : WireMessage()
@@ -60,6 +60,7 @@ object PeerProtocol {
                 is WireMessage.ResetAlignment -> out.writeUTF(message.reason.take(128))
             }
         }
+
         val bytes = payload.toByteArray()
         require(bytes.size <= MAX_PAYLOAD) { "wire payload too large: ${bytes.size}" }
         val type = when (message) {
@@ -71,6 +72,7 @@ object PeerProtocol {
             is WireMessage.Quality -> T_QUALITY
             is WireMessage.ResetAlignment -> T_RESET_ALIGNMENT
         }
+
         val out = DataOutputStream(output)
         out.writeInt(MAGIC)
         out.writeByte(VERSION)
@@ -82,7 +84,11 @@ object PeerProtocol {
 
     fun read(input: InputStream): WireMessage? {
         val source = DataInputStream(input)
-        val magic = try { source.readInt() } catch (_: EOFException) { return null }
+        val magic = try {
+            source.readInt()
+        } catch (_: EOFException) {
+            return null
+        }
         require(magic == MAGIC) { "bad wire magic" }
         val version = source.readUnsignedByte()
         require(version == VERSION) { "unsupported wire version $version" }
@@ -91,6 +97,7 @@ object PeerProtocol {
         require(size in 0..MAX_PAYLOAD) { "invalid payload size $size" }
         val payload = ByteArray(size)
         source.readFully(payload)
+
         DataInputStream(ByteArrayInputStream(payload)).use { data ->
             return when (type) {
                 T_HELLO -> WireMessage.Hello(data.readUTF(), data.readUTF())
@@ -114,6 +121,7 @@ object PeerProtocol {
         out.writeLong(frame.timestampNs)
         repeat(3) { out.writeFloat(frame.pose.t.getOrElse(it) { 0f }) }
         repeat(4) { out.writeFloat(frame.pose.q.getOrElse(it) { if (it == 3) 1f else 0f }) }
+
         val k = frame.intrinsics
         out.writeFloat(k.fx)
         out.writeFloat(k.fy)
@@ -121,9 +129,11 @@ object PeerProtocol {
         out.writeFloat(k.cy)
         out.writeInt(k.width)
         out.writeInt(k.height)
-        val jpeg = Base64.decode(frame.jpegBase64, Base64.NO_WRAP)
+
+        val jpeg = Base64.getDecoder().decode(frame.jpegBase64)
         out.writeInt(jpeg.size)
         out.write(jpeg)
+
         val points = frame.metricPoints.take(2500)
         out.writeInt(points.size)
         for (p in points) repeat(5) { out.writeFloat(p.getOrElse(it) { 0f }) }
@@ -141,20 +151,23 @@ object PeerProtocol {
             input.readInt(),
             input.readInt(),
         )
+
         val jpegSize = input.readInt()
         require(jpegSize in 1..MAX_PAYLOAD) { "invalid jpeg size $jpegSize" }
         val jpeg = ByteArray(jpegSize)
         input.readFully(jpeg)
+
         val count = input.readInt()
         require(count in 0..2500) { "invalid point count $count" }
         val points = ArrayList<FloatArray>(count)
         repeat(count) { points += FloatArray(5) { input.readFloat() } }
+
         return CapturedFrame(
-            timestampNs,
-            PosePacket(t, q),
-            intrinsics,
-            Base64.encodeToString(jpeg, Base64.NO_WRAP),
-            points,
+            timestampNs = timestampNs,
+            pose = PosePacket(t, q),
+            intrinsics = intrinsics,
+            jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
+            metricPoints = points,
         )
     }
 }
