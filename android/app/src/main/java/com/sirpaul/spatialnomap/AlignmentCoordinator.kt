@@ -52,7 +52,7 @@ class AlignmentCoordinator(
 
     interface Listener {
         fun onAlignmentQuality(quality: Quality)
-        fun onRemotePoi(pointLocal: FloatArray?, owner: String, confidence: Float)
+        fun onRemotePoi(id: Long, pointLocal: FloatArray?, owner: String, confidence: Float)
         fun onPoiCleared()
     }
 
@@ -120,8 +120,6 @@ class AlignmentCoordinator(
 
     fun onLocalFrame(frame: CapturedFrame) {
         synchronized(frameLock) { addDiverseKeyframe(localFrames, frame) }
-        // Send the freshest captured frame even if it was too similar to retain as
-        // a keyframe. The peer independently decides whether it improves its map.
         transport.sendFrame(frame)
         updateFusionSeed()
         tryAdoptOrVerifyPeerTransform()
@@ -184,11 +182,15 @@ class AlignmentCoordinator(
         listener.onPoiCleared()
     }
 
-    fun sendPoi(pointLocalWorld: FloatArray, owner: String): Boolean {
+    fun sendPoi(id: Long, pointLocalWorld: FloatArray, owner: String): Boolean {
         if (!canPlacePoi()) return false
-        transport.sendPoi(System.nanoTime(), owner, pointLocalWorld)
+        transport.sendPoi(id, owner, pointLocalWorld)
         return true
     }
+
+    /** Backward-compatible convenience for callers that do not own a stable POI id. */
+    fun sendPoi(pointLocalWorld: FloatArray, owner: String): Boolean =
+        sendPoi(System.nanoTime(), pointLocalWorld, owner)
 
     fun canPlacePoi(): Boolean = transport.connected && latestQuality.bothReady
     fun quality(): Quality = latestQuality
@@ -219,8 +221,6 @@ class AlignmentCoordinator(
         if (spatiallyNew || temporallyNew) {
             window.addLast(frame)
         } else if (materiallyBetterDepth || calmer) {
-            // Same viewpoint, better observation: replace instead of polluting the
-            // micro-map with another near-duplicate frame.
             window.removeLast()
             window.addLast(frame)
         }
@@ -295,11 +295,6 @@ class AlignmentCoordinator(
         }
     }
 
-    /**
-     * Magnetometers beside speakers, PCs and steel furniture are not trustworthy
-     * enough to veto metric visual geometry. Solve without heading, then expose
-     * compass residual only as diagnostics/prior telemetry.
-     */
     private fun solveVisionAuthoritative(pair: FramePair): AlignmentEngine.Result? {
         val remoteVision = pair.remote.copy(
             sensors = pair.remote.sensors.copy(
@@ -654,6 +649,7 @@ class AlignmentCoordinator(
         val transform = lockedTransform ?: return
         val p = AlignmentEngine.transformPoint(transform, poi.pointWorld)
         listener.onRemotePoi(
+            poi.id,
             floatArrayOf(p[0].toFloat(), p[1].toFloat(), p[2].toFloat()),
             poi.owner,
             localConfidence,
