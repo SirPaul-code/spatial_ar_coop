@@ -32,8 +32,13 @@ import com.google.ar.core.Config
 import com.google.ar.core.Session
 import org.opencv.android.OpenCVLoader
 import java.security.SecureRandom
+import kotlin.math.min
 
-class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoordinator.Listener {
+class MainActivity : Activity(),
+    WifiAwarePeerTransport.Callbacks,
+    AlignmentCoordinator.Listener,
+    BlePeerRanger.Callback {
+
     private enum class PeerAction { CREATE, SCAN, JOIN }
 
     private lateinit var root: FrameLayout
@@ -42,6 +47,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     private lateinit var renderer: ArRenderer
     private lateinit var transport: WifiAwarePeerTransport
     private lateinit var coordinator: AlignmentCoordinator
+    private lateinit var bleRanger: BlePeerRanger
 
     private lateinit var hudView: LinearLayout
     private lateinit var setupShell: ScrollView
@@ -76,6 +82,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     private var bannerSerial = 0L
     private var lastTransportError = ""
     private var lastArError = ""
+    private var lastBleStatus = ""
     private var permissionRequestInFlight = false
     private var initialPermissionPromptAttempted = false
     private var pendingPeerAction: PeerAction? = null
@@ -94,6 +101,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         openCvReady = OpenCVLoader.initLocal()
         transport = WifiAwarePeerTransport(this, this)
         coordinator = AlignmentCoordinator(transport, this)
+        bleRanger = BlePeerRanger(this, this)
         overlay = TargetOverlayView(this)
         renderer = ArRenderer(coordinator, overlay, ::username, ::setTechnicalStatus, ::displayRotation)
 
@@ -166,7 +174,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
                 leftMargin = dp(18)
                 rightMargin = dp(18)
-                topMargin = dp(94)
+                topMargin = dp(108)
             },
         )
 
@@ -210,13 +218,13 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             (banner.layoutParams as? FrameLayout.LayoutParams)?.let {
                 it.leftMargin = safe.left + dp(18)
                 it.rightMargin = safe.right + dp(18)
-                it.topMargin = safe.top + dp(88)
+                it.topMargin = safe.top + dp(103)
                 banner.layoutParams = it
             }
 
             root.post {
                 if (!isFinishing && root.height > 0) {
-                    val maxHeight = (root.height - safe.top - safe.bottom - dp(190)).coerceAtLeast(dp(220))
+                    val maxHeight = (root.height - safe.top - safe.bottom - dp(205)).coerceAtLeast(dp(220))
                     val lp = setupShell.layoutParams as FrameLayout.LayoutParams
                     lp.height = maxHeight.coerceAtMost(dp(340))
                     setupShell.layoutParams = lp
@@ -247,15 +255,15 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             setTextColor(0xffd8e0e5.toInt())
             textSize = 11.5f
             gravity = Gravity.CENTER
-            maxLines = 1
+            maxLines = 2
             text = "Starting local AR…"
-            background = rounded(0x8f101418.toInt(), 16f)
+            background = rounded(0x9f101418.toInt(), 16f)
             setPadding(dp(11), dp(4), dp(11), dp(4))
         }
         out.addView(row)
         out.addView(
             detailPill,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(29)).apply { topMargin = dp(6) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)).apply { topMargin = dp(6) },
         )
         return out
     }
@@ -314,7 +322,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             setTextColor(0xffaebbc4.toInt())
             textSize = 12f
             text = "Create on one phone, Join Nearby on the other."
-            maxLines = 5
+            maxLines = 6
             setPadding(dp(2), dp(8), dp(2), dp(5))
             setOnClickListener {
                 val missing = peerPermissionConstants()
@@ -322,6 +330,9 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                     requestRuntimePermissions(missing)
                 } else if (!transport.capabilities().locationEnabled) {
                     openLocationSettings()
+                } else {
+                    val optional = optionalFusionPermissionConstants()
+                    if (optional.isNotEmpty() && !permissionRequestInFlight) requestRuntimePermissions(optional)
                 }
             }
         }
@@ -355,7 +366,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         bannerSubtitle = TextView(this).apply {
             setTextColor(0xffb6c1c8.toInt())
             textSize = 12.5f
-            maxLines = 6
+            maxLines = 7
             setTextIsSelectable(true)
         }
         view.addView(bannerTitle)
@@ -453,7 +464,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             haptic()
             showBanner(
                 "Camera ${choice.label}",
-                "${choice.detail} • depth ${configured.depthMode} • geometry reset; re-aligning both phones",
+                "${choice.detail} • depth ${configured.depthMode} • intrinsics/world transform reset; re-fusing both phones",
             )
         } catch (t: Throwable) {
             renderer.detachSession()
@@ -534,6 +545,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
 
         refreshCapabilities()
         resumePendingPeerActionIfReady()
+        activeRoomCode?.takeIf { peerConnectedOnce }?.let { bleRanger.start(it) }
     }
 
     @Synchronized private fun startArIfPossible() {
@@ -660,11 +672,13 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         arTrackingStable = false
         pauseSurfaceOnly()
         runCatching { session?.pause() }
+        bleRanger.stop()
         super.onPause()
     }
 
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
+        bleRanger.stop()
         coordinator.close()
         transport.close()
         renderer.detachSession()
@@ -694,11 +708,12 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     }
 
     private fun allRuntimePermissionConstants(): List<String> {
-        val needed = ArrayList<String>(4)
+        val needed = ArrayList<String>(8)
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             needed += Manifest.permission.CAMERA
         }
         appendPeerPermissions(needed)
+        appendOptionalFusionPermissions(needed)
         return needed.distinct()
     }
 
@@ -708,6 +723,12 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             needed += Manifest.permission.CAMERA
         }
         appendPeerPermissions(needed)
+        return needed.distinct()
+    }
+
+    private fun optionalFusionPermissionConstants(): List<String> {
+        val needed = ArrayList<String>(3)
+        appendOptionalFusionPermissions(needed)
         return needed.distinct()
     }
 
@@ -729,6 +750,19 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         }
     }
 
+    private fun appendOptionalFusionPermissions(out: MutableList<String>) {
+        if (Build.VERSION.SDK_INT < 31) return
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            out += Manifest.permission.BLUETOOTH_SCAN
+        }
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+            out += Manifest.permission.BLUETOOTH_ADVERTISE
+        }
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            out += Manifest.permission.BLUETOOTH_CONNECT
+        }
+    }
+
     private fun requestRuntimePermissions(permissions: List<String>) {
         if (permissions.isEmpty() || permissionRequestInFlight) return
         permissionRequestInFlight = true
@@ -747,6 +781,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startArIfPossible()
         }
+        activeRoomCode?.takeIf { peerConnectedOnce }?.let { bleRanger.start(it) }
         refreshCapabilities()
 
         val missing = peerPermissionLabels()
@@ -758,7 +793,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             } else {
                 ""
             }
-            val text = "Still missing: ${missing.joinToString()}.${suffix} Tap this setup status to retry."
+            val text = "Still missing: ${missing.joinToString()}.$suffix Tap this setup status to retry."
             setupStatus.text = text
             showBanner("Permission required", text, 8500L)
             return
@@ -772,13 +807,22 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) missing += "Camera"
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED
-        ) missing += "Nearby devices"
+        ) missing += "Nearby Wi-Fi"
         if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             missing += "Location"
         }
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             missing += "Precise location"
         }
+        return missing
+    }
+
+    private fun optionalFusionPermissionLabels(): List<String> {
+        if (Build.VERSION.SDK_INT < 31) return emptyList()
+        val missing = ArrayList<String>(3)
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) missing += "BLE scan"
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) missing += "BLE advertise"
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) missing += "Bluetooth"
         return missing
     }
 
@@ -823,12 +867,14 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                 runCatching { transport.createRoom(username(), code) }
                     .onSuccess {
                         transportPill.text = "HOST • $code"
+                        bleRanger.start(code)
                         hideSetup()
                         haptic()
-                        showBanner("Space $code starting", "Waiting for Wi-Fi Aware publish confirmation…")
+                        showBanner("Space $code starting", "Wi-Fi Aware + RTT + camera/IMU fusion starting…")
                     }
                     .onFailure {
                         activeRoomCode = null
+                        bleRanger.stop()
                         setupStatus.text = errorText(it)
                         showErrorBanner("Create space failed", it)
                     }
@@ -847,11 +893,13 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                 runCatching { transport.joinRoom(code) }
                     .onSuccess {
                         activeRoomCode = code
+                        bleRanger.start(code)
                         transportPill.text = "LINKING • $code"
                         hideSetup()
                         haptic()
                     }
                     .onFailure {
+                        bleRanger.stop()
                         setupStatus.text = errorText(it)
                         showErrorBanner("Join failed", it)
                     }
@@ -902,18 +950,24 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             transportPill.text = "DIRECT • $peerUsername"
             transportPill.background = rounded(0xd11a4b3c.toInt(), 18f, 0x6655f0bd, 1)
             clearButton.visibility = View.VISIBLE
+            activeRoomCode?.let { bleRanger.start(it) }
             if (!peerConnectedOnce) {
                 peerConnectedOnce = true
                 coordinator.onConnected()
                 hideSetup()
                 haptic()
-                showBanner("Connected to $peerUsername", "Direct Wi-Fi Aware link • no router • no server")
+                showBanner(
+                    "Connected to $peerUsername",
+                    "Direct Wi-Fi Aware • RTT/BLE ranging • compass/IMU/GPS priors • visual 3D refinement",
+                    5200L,
+                )
             }
         }
     }
 
     override fun onDisconnected(reason: String) {
         runOnUiThread {
+            bleRanger.stop()
             if (!peerConnectedOnce) return@runOnUiThread
             peerConnectedOnce = false
             coordinator.onDisconnected()
@@ -935,7 +989,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             is WireMessage.Range -> coordinator.onRange(message.distanceM, message.stdDevM, message.samples)
             is WireMessage.ResetAlignment -> {
                 coordinator.onPeerAlignmentReset(message.reason)
-                runOnUiThread { showBanner("Peer AR changed", "Re-aligning geometry: ${message.reason}") }
+                runOnUiThread { showBanner("Peer AR changed", "Re-fusing geometry: ${message.reason}") }
             }
             is WireMessage.Hello -> Unit
         }
@@ -945,28 +999,75 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         coordinator.onRange(distanceM, stdDevM, samples)
     }
 
+    override fun onBleRange(distanceM: Float, stdDevM: Float, rssiDbm: Int) {
+        coordinator.onBleRange(distanceM, stdDevM, rssiDbm)
+    }
+
+    override fun onBleStatus(text: String) {
+        if (text == lastBleStatus) return
+        lastBleStatus = text
+        runOnUiThread {
+            val lower = text.lowercase()
+            if (("failed" in lower || "rejected" in lower) && setupShell.visibility == View.VISIBLE) {
+                setupStatus.text = text
+            }
+        }
+    }
+
     override fun onAlignmentQuality(quality: AlignmentCoordinator.Quality) {
         runOnUiThread {
-            val range = quality.rangeM?.let { " • RTT %.2f m".format(it) } ?: ""
+            val range = quality.rangeM?.let {
+                "${quality.rangeSource} %.2fm".format(it)
+            } ?: "radio —"
+            val heading = if (quality.headingResidualDeg.isFinite()) {
+                "HΔ %.0f°".format(quality.headingResidualDeg)
+            } else if (quality.sensorPriorConfidence > 0f) {
+                "compass ✓"
+            } else {
+                "compass —"
+            }
+            val gravity = if (quality.gravityTiltDeg.isFinite()) {
+                "GΔ %.0f°".format(quality.gravityTiltDeg)
+            } else {
+                "gravity ✓"
+            }
+            val keyframes = "KF ${quality.keyframesLocal}/${quality.keyframesRemote}"
+
             when {
                 quality.bothReady -> {
-                    syncPill.text = "LOCKED • ${(quality.confidence * 100).toInt()}%"
+                    syncPill.text = "READY • ${(quality.confidence * 100).toInt()}%"
                     syncPill.background = rounded(0xd11a4b3c.toInt(), 18f, 0x7755f0bd, 1)
-                    detailPill.text = "READY — tap a physical point to sync POI$range"
+                    detailPill.text = "Tap a physical point • $range • $heading • $gravity"
                 }
                 quality.localReady -> {
-                    syncPill.text = "LOCAL LOCK"
+                    syncPill.text = "VERIFYING PEER"
                     syncPill.background = rounded(0xcf584719.toInt(), 18f)
-                    detailPill.text = "Hold the same textured area for the peer lock$range"
+                    detailPill.text = "Local transform locked • waiting for peer confirmation • $range"
                 }
                 peerConnectedOnce -> {
-                    syncPill.text = if (quality.inliers > 0) "ALIGN • ${quality.inliers}" else "ALIGNING"
+                    val progress = fusionProgress(quality)
+                    syncPill.text = "FUSING • $progress%"
                     syncPill.background = rounded(0xcf493b18.toInt(), 18f)
-                    detailPill.text = "Point both phones at overlapping static detail and move slightly$range"
+                    detailPill.text = if (quality.inliers > 0) {
+                        "Vision ${quality.inliers}/${quality.correspondences} • $heading • $gravity • $range • $keyframes"
+                    } else if (quality.fusionSource != "NONE" && quality.fusionSource != "VISION") {
+                        "${quality.fusionSource} seed ${(quality.fusionSeedConfidence * 100).toInt()}% • point both cameras at one shared detailed area"
+                    } else {
+                        "Point both cameras at the same detailed area for 1–2 s • $range • $keyframes"
+                    }
                 }
                 else -> renderArReadiness()
             }
         }
+    }
+
+    private fun fusionProgress(quality: AlignmentCoordinator.Quality): Int {
+        val visual = (min(quality.inliers, 16) / 16f) * 46f
+        val consensus = (min(quality.stableCount, 3) / 3f) * 26f
+        val sensors = quality.sensorPriorConfidence.coerceIn(0f, 1f) * 14f
+        val coarse = quality.fusionSeedConfidence.coerceIn(0f, 1f) * 12f
+        val history = (min(quality.keyframesLocal, quality.keyframesRemote).coerceAtMost(6) / 6f) * 6f
+        return (visual + consensus + sensors + coarse + history).toInt().coerceIn(1, 96)
     }
 
     override fun onRemotePoi(pointLocal: FloatArray?, owner: String, confidence: Float) {
@@ -986,6 +1087,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     private fun refreshCapabilities() {
         val caps = transport.capabilities()
         val missing = peerPermissionLabels()
+        val optionalMissing = optionalFusionPermissionLabels()
         val awareText = when {
             !caps.awareSupported -> "Aware ✕"
             caps.awareAvailable -> "Aware ✓"
@@ -996,9 +1098,10 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             caps.rttAvailable -> "RTT ✓"
             else -> "RTT idle"
         }
-        val permText = if (missing.isEmpty()) "Perm ✓" else "Perm ! ${missing.joinToString()}"
+        val permText = if (missing.isEmpty()) "core perms ✓" else "missing ${missing.joinToString()}"
+        val bleText = if (optionalMissing.isEmpty()) "BLE ✓" else "BLE optional"
         val locationText = if (caps.locationEnabled) "Location ✓" else "Location OFF"
-        setupStatus.text = "$awareText • $rttText • $permText • $locationText • OpenCV ${if (openCvReady) "✓" else "✕"}"
+        setupStatus.text = "$awareText • $rttText • $bleText • $permText • $locationText\n${SpatialSyncApplication.sensorSummary()} • OpenCV ${if (openCvReady) "✓" else "✕"}"
         if (!openCvReady) showBanner("Alignment unavailable", "OpenCV failed to initialize on this build", 8000L)
     }
 
@@ -1022,6 +1125,17 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                     lastArError = text
                     showBanner("AR frame error", text.removePrefix("AR frame error: "), 8500L)
                 }
+                text.startsWith("SYNCING") -> {
+                    showBanner(
+                        "Spatial lock not ready yet",
+                        "Keep both cameras on one overlapping detailed area. The app is fusing vision, ARCore/IMU gravity, compass and radio ranging.",
+                        4200L,
+                    )
+                }
+                text.startsWith("No reliable metric depth") -> {
+                    showBanner("No surface depth at tap", "Move the phone slightly so ARCore can build depth, then tap the surface again.", 4200L)
+                }
+                text == "POI sent" -> showBanner("POI sent", "Shared metric point transmitted to the peer", 2300L)
             }
         }
     }
