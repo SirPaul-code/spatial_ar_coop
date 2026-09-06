@@ -7,21 +7,22 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
 
-    <!--
-      Wi-Fi Aware / RTT normally use NEARBY_WIFI_DEVICES on Android 13+.
-      Spatial Sync also uses peer ranging as a metric sanity constraint and some
-      Samsung Wi-Fi Aware implementations enforce precise foreground location for
-      ranging/discovery. Keep both location permissions declared and request
-      COARSE + FINE together at runtime (required by Android 12+ permission UX).
-    -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- BLE is an optional low-confidence fallback when Wi-Fi RTT is unavailable. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
     <uses-feature android:name="android.hardware.wifi.aware" android:required="true" />
     <uses-feature android:name="android.hardware.wifi.rtt" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <application
         android:name=".SpatialSyncApplication"
