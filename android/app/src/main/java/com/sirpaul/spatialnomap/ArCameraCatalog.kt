@@ -10,8 +10,10 @@ import java.util.Locale
 
 /**
  * Enumerates only rear camera configs ARCore says are valid for tracking.
- * The normal Android camera app may expose extra physical lenses that ARCore
- * intentionally does not expose as tracking cameras; those are not forced here.
+ *
+ * Tracking quality has priority over CPU-image resolution. ARCore itself ranks
+ * stereo usage first, then 60 fps, then hardware depth; keep the same ordering
+ * when collapsing duplicate CPU-stream variants for one physical camera ID.
  */
 class ArCameraCatalog(
     context: Context,
@@ -25,9 +27,16 @@ class ArCameraCatalog(
         val imageWidth: Int,
         val imageHeight: Int,
         val maxFps: Int,
+        val stereo: Boolean,
+        val hardwareDepth: Boolean,
     ) {
         val detail: String
-            get() = "${imageWidth}×${imageHeight} • ${maxFps} fps • AR camera $cameraId"
+            get() = buildString {
+                append("${imageWidth}×${imageHeight} • ${maxFps} fps")
+                if (stereo) append(" • stereo VIO")
+                if (hardwareDepth) append(" • HW depth")
+                append(" • AR camera $cameraId")
+            }
     }
 
     val choices: List<Choice>
@@ -38,19 +47,9 @@ class ArCameraCatalog(
             .setFacingDirection(CameraConfig.FacingDirection.BACK)
         val supported = session.getSupportedCameraConfigs(filter)
 
-        // ARCore often exposes several CPU-image/FPS variants for one tracking
-        // camera. Keep one feature-rich config per camera ID. Alignment frames are
-        // downscaled later, so the larger CPU image is useful without increasing
-        // network payload.
         val bestPerCamera = supported
             .groupBy { it.cameraId }
-            .mapNotNull { (_, configs) ->
-                configs.maxWithOrNull(
-                    compareBy<CameraConfig> {
-                        it.imageSize.width.toLong() * it.imageSize.height.toLong()
-                    }.thenBy { it.fpsRange.upper }
-                )
-            }
+            .mapNotNull { (_, configs) -> configs.maxWithOrNull(TRACKING_CONFIG_COMPARATOR) }
 
         val cameraManager = context.getSystemService(CameraManager::class.java)
         val opticalPower = bestPerCamera.associate { config ->
@@ -74,15 +73,23 @@ class ArCameraCatalog(
                 imageWidth = config.imageSize.width,
                 imageHeight = config.imageSize.height,
                 maxFps = config.fpsRange.upper,
+                stereo = config.stereoCameraUsage == CameraConfig.StereoCameraUsage.REQUIRE_AND_USE,
+                hardwareDepth = config.depthSensorUsage == CameraConfig.DepthSensorUsage.REQUIRE_AND_USE,
             )
-        }.sortedWith(compareBy<Choice> { it.approximateZoom ?: Float.MAX_VALUE }.thenBy { it.cameraId })
+        }.sortedWith(
+            compareByDescending<Choice> { it.stereo }
+                .thenByDescending { it.maxFps }
+                .thenByDescending { it.hardwareDepth }
+                .thenBy { it.approximateZoom ?: Float.MAX_VALUE }
+                .thenBy { it.cameraId },
+        )
     }
 
     fun indexForCameraId(cameraId: String?): Int =
         if (cameraId == null) -1 else choices.indexOfFirst { it.cameraId == cameraId }
 
     private fun formatZoom(zoom: Float): String {
-        val rounded = when {
+        return when {
             kotlin.math.abs(zoom - 0.5f) < 0.12f -> "0.5×"
             kotlin.math.abs(zoom - 0.6f) < 0.12f -> "0.6×"
             kotlin.math.abs(zoom - 1f) < 0.15f -> "1×"
@@ -92,7 +99,6 @@ class ArCameraCatalog(
             kotlin.math.abs(zoom - 10f) < 0.8f -> "10×"
             else -> String.format(Locale.US, "%.1f×", zoom)
         }
-        return rounded
     }
 
     private fun effectiveOpticalPower(cameraManager: CameraManager?, cameraId: String): Float? {
@@ -106,5 +112,18 @@ class ArCameraCatalog(
         } catch (_: Throwable) {
             null
         }
+    }
+
+    companion object {
+        private val TRACKING_CONFIG_COMPARATOR =
+            compareBy<CameraConfig> {
+                if (it.stereoCameraUsage == CameraConfig.StereoCameraUsage.REQUIRE_AND_USE) 1 else 0
+            }.thenBy {
+                if (it.fpsRange.upper >= 60) 1 else 0
+            }.thenBy {
+                if (it.depthSensorUsage == CameraConfig.DepthSensorUsage.REQUIRE_AND_USE) 1 else 0
+            }.thenBy {
+                it.imageSize.width.toLong() * it.imageSize.height.toLong()
+            }
     }
 }
