@@ -32,24 +32,27 @@ jobs:
 
       - run: chmod +x android/gradlew
 
-      - name: Unit tests + lint + signed Android APK
+      - name: Unit tests + lint + debug + release APK
         working-directory: android
         shell: bash
         run: |
           set -o pipefail
-          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug 2>&1 | tee ../android-build.log
+          ./gradlew --no-daemon testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease 2>&1 | tee ../android-build.log
 
-      - name: Verify stable APK signature
+      - name: Verify stable APK signatures
         shell: bash
         run: |
           set -euo pipefail
-          APK="android/app/build/outputs/apk/debug/app-debug.apk"
           APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
           EXPECTED="9e752e4f1ae0d9f1dd72b17a3d72d88e82e54075651dc268657877a0e73eaf3a"
-          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee apk-signature.txt
-          ACTUAL=$(grep -i "Signer #1 certificate SHA-256 digest:" apk-signature.txt | head -1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
-          test "$ACTUAL" = "$EXPECTED"
-          echo "Stable signing certificate verified: $ACTUAL"
+          : > apk-signature.txt
+          for APK in android/app/build/outputs/apk/debug/app-debug.apk android/app/build/outputs/apk/release/app-release.apk; do
+            echo "=== $APK ===" | tee -a apk-signature.txt
+            "$APKSIGNER" verify --verbose --print-certs "$APK" | tee -a apk-signature.txt
+            ACTUAL=$("$APKSIGNER" verify --print-certs "$APK" | grep -i "Signer #1 certificate SHA-256 digest:" | head -1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
+            test "$ACTUAL" = "$EXPECTED"
+            echo "Stable signing certificate verified: $ACTUAL" | tee -a apk-signature.txt
+          done
 
       - name: Upload compiler and test log
         if: always()
@@ -67,7 +70,9 @@ jobs:
           name: android-lint-report
           path: |
             android/app/build/reports/lint-results-debug.*
+            android/app/build/reports/lint-results-release.*
             android/app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/lint-results-debug.txt
+            android/app/build/intermediates/lint_intermediate_text_report/release/lintReportRelease/lint-results-release.txt
           if-no-files-found: warn
           retention-days: 30
 
@@ -83,12 +88,20 @@ jobs:
       - name: Upload signed debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: spatial-sync-v3-signed-apk
+          name: spatial-sync-v3-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish latest signed APK
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: spatial-sync-v3-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish latest signed APKs
         if: github.event_name == 'push' && github.ref == 'refs/heads/fresh/no-map-runtime-poc'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,21 +109,23 @@ jobs:
         run: |
           set -euo pipefail
           cp android/app/build/outputs/apk/debug/app-debug.apk SpatialSync-latest-dev.apk
-          sha256sum SpatialSync-latest-dev.apk > SHA256SUMS.txt
+          cp android/app/build/outputs/apk/release/app-release.apk SpatialSync-latest-release.apk
+          sha256sum SpatialSync-latest-dev.apk SpatialSync-latest-release.apk > SHA256SUMS.txt
           cat > RELEASE_NOTES.md <<EOF
-          Automated signed development build from \`fresh/no-map-runtime-poc\` at \`$GITHUB_SHA\`.
+          Automated signed builds from \`fresh/no-map-runtime-poc\` at \`$GITHUB_SHA\`.
 
           - Unit tests: passed
-          - Android lint: passed
-          - APK signature verification: passed
-          - Stable development certificate SHA-256: \`9E:75:2E:4F:1A:E0:D9:F1:DD:72:B1:7A:3D:72:D8:8E:82:E5:40:75:65:1D:C2:68:65:78:77:A0:E7:3E:AF:3A\`
-          - Version code is generated monotonically from the GitHub Actions run number, so browser-installed updates work normally.
+          - Android debug/release lint: passed
+          - Debug APK: signed and verified
+          - Release APK: signed, non-debuggable, verified
+          - Stable sideload certificate SHA-256: \`9E:75:2E:4F:1A:E0:D9:F1:DD:72:B1:7A:3D:72:D8:8E:82:E5:40:75:65:1D:C2:68:65:78:77:A0:E7:3E:AF:3A\`
+          - Both variants share the same application ID/signing identity so installs can update in place when Android version-code rules permit it.
 
-          Migration note: builds published before stable signing was introduced used an ephemeral CI debug key. If Android says the app cannot be installed while updating one of those older builds, uninstall Spatial Sync once and install this build. Future latest-dev builds will update in place.
+          Use \`SpatialSync-latest-release.apk\` for normal device testing. Use the dev APK only when a debuggable build is specifically needed.
           EOF
           gh release delete latest-dev --cleanup-tag -y || true
-          gh release create latest-dev SpatialSync-latest-dev.apk SHA256SUMS.txt apk-signature.txt \
+          gh release create latest-dev SpatialSync-latest-release.apk SpatialSync-latest-dev.apk SHA256SUMS.txt apk-signature.txt \
             --target "$GITHUB_SHA" \
             --latest \
-            --title "Spatial Sync — latest signed dev" \
+            --title "Spatial Sync — latest signed build" \
             --notes-file RELEASE_NOTES.md
