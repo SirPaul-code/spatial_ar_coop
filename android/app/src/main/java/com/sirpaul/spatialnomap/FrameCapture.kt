@@ -1,6 +1,5 @@
 package com.sirpaul.spatialnomap
 
-import android.util.Base64
 import com.google.ar.core.Camera
 import com.google.ar.core.Frame
 import com.google.ar.core.exceptions.NotYetAvailableException
@@ -11,6 +10,7 @@ import org.opencv.core.MatOfInt
 import org.opencv.core.Size
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
+import java.util.Base64
 import kotlin.math.max
 import kotlin.math.min
 
@@ -64,7 +64,14 @@ object FrameCapture {
             try {
                 src.put(0, 0, grayBytes)
                 val output = if (dstW != srcW || dstH != srcH) {
-                    Imgproc.resize(src, resized, Size(dstW.toDouble(), dstH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+                    Imgproc.resize(
+                        src,
+                        resized,
+                        Size(dstW.toDouble(), dstH.toDouble()),
+                        0.0,
+                        0.0,
+                        Imgproc.INTER_AREA,
+                    )
                     resized
                 } else {
                     src
@@ -91,7 +98,7 @@ object FrameCapture {
                         width = dstW,
                         height = dstH,
                     ),
-                    jpegBase64 = Base64.encodeToString(jpeg, Base64.NO_WRAP),
+                    jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
                     metricPoints = metric,
                 )
             } finally {
