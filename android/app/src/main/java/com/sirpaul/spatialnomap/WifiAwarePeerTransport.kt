@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -26,6 +27,7 @@ import android.net.wifi.rtt.WifiRttManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
@@ -36,10 +38,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * All public entry points are reached after MainActivity's permission flow, but
- * the transport also checks the permission itself. The SuppressLint annotation
- * only tells static analysis about that cross-method invariant; it is not the
- * runtime safety mechanism.
+ * Direct Wi-Fi Aware/NDP transport. Runtime permission checks live here as well
+ * as in MainActivity so a vendor-specific SecurityException can never be hidden
+ * behind a UI assumption.
  */
 @SuppressLint("MissingPermission")
 class WifiAwarePeerTransport(
@@ -52,7 +53,14 @@ class WifiAwarePeerTransport(
         val awareAvailable: Boolean,
         val rttSupported: Boolean,
         val rttAvailable: Boolean,
-    )
+        val nearbyPermissionGranted: Boolean,
+        val fineLocationGranted: Boolean,
+        val coarseLocationGranted: Boolean,
+        val locationEnabled: Boolean,
+    ) {
+        val permissionsReady: Boolean
+            get() = nearbyPermissionGranted && fineLocationGranted && coarseLocationGranted
+    }
 
     interface Callbacks {
         fun onTransportStatus(text: String)
@@ -69,6 +77,7 @@ class WifiAwarePeerTransport(
     private val aware = context.getSystemService(WifiAwareManager::class.java)
     private val rtt = context.getSystemService(WifiRttManager::class.java)
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
+    private val location = context.getSystemService(LocationManager::class.java)
 
     private var awareSession: WifiAwareSession? = null
     private var publishSession: PublishDiscoverySession? = null
@@ -91,6 +100,7 @@ class WifiAwarePeerTransport(
     private val latestFrame = AtomicReference<CapturedFrame?>(null)
     private val framePumpRunning = AtomicBoolean(false)
     private val writeLock = Any()
+    private var lastRangingError = ""
 
     @Volatile var connected = false
         private set
@@ -99,11 +109,22 @@ class WifiAwarePeerTransport(
         val pm = context.packageManager
         val hasAware = pm.hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE)
         val hasRtt = pm.hasSystemFeature(PackageManager.FEATURE_WIFI_RTT)
+        val nearbyGranted = Build.VERSION.SDK_INT < 33 ||
+            context.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+        val fineGranted =
+            context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted =
+            context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val locationEnabled = runCatching { location?.isLocationEnabled != false }.getOrDefault(true)
         return Capabilities(
             awareSupported = hasAware,
             awareAvailable = hasAware && aware?.isAvailable == true,
             rttSupported = hasRtt,
             rttAvailable = hasRtt && rtt?.isAvailable == true,
+            nearbyPermissionGranted = nearbyGranted,
+            fineLocationGranted = fineGranted,
+            coarseLocationGranted = coarseGranted,
+            locationEnabled = locationEnabled,
         )
     }
 
@@ -119,8 +140,9 @@ class WifiAwarePeerTransport(
     }
 
     fun joinRoom(code: String) {
-        if (!hasPeerPermission()) {
-            status("Nearby devices permission was revoked. Re-open connection setup.")
+        val missing = missingPeerPermissions()
+        if (missing.isNotEmpty()) {
+            status("Permission missing: ${missing.joinToString()}. Re-open connection setup.")
             return
         }
         val normalized = normalizeRoom(code)
@@ -142,7 +164,7 @@ class WifiAwarePeerTransport(
             )
             scheduleRanging()
         } catch (t: Throwable) {
-            status("Join message failed: ${errorText(t)}")
+            reportError("Join message failed", t)
         }
     }
 
@@ -189,6 +211,7 @@ class WifiAwarePeerTransport(
         clientConnectStarted.set(false)
         rangingBusy.set(false)
         latestFrame.set(null)
+        lastRangingError = ""
 
         try { socket?.close() } catch (_: Throwable) {}
         try { serverSocket?.close() } catch (_: Throwable) {}
@@ -222,15 +245,21 @@ class WifiAwarePeerTransport(
     private fun startCommon(name: String) {
         stop("restart")
         username = name.trim().ifBlank { Build.MODEL }.take(32)
-        if (!hasPeerPermission()) {
-            throw SecurityException("Nearby devices permission is required for direct peer discovery")
+
+        val missing = missingPeerPermissions()
+        if (missing.isNotEmpty()) {
+            throw SecurityException("Missing runtime permission(s): ${missing.joinToString()}")
         }
+
         val caps = capabilities()
+        if (!caps.locationEnabled) {
+            throw IllegalStateException("Location services are OFF. Samsung Wi-Fi Aware/RTT requires Location to be enabled while pairing.")
+        }
         if (!caps.awareSupported || aware == null) {
             throw IllegalStateException("Wi-Fi Aware is not supported on this device")
         }
         if (!caps.awareAvailable) {
-            throw IllegalStateException("Wi-Fi Aware unavailable. Enable Wi-Fi/Location and disable hotspot/tethering")
+            throw IllegalStateException("Wi-Fi Aware unavailable. Enable Wi-Fi + Location and disable hotspot/tethering/Wi-Fi Direct conflicts")
         }
         running.set(true)
     }
@@ -247,7 +276,7 @@ class WifiAwarePeerTransport(
                     try {
                         action(session)
                     } catch (t: Throwable) {
-                        status("Wi-Fi Aware setup failed: ${errorText(t)}")
+                        reportError("Wi-Fi Aware setup failed", t)
                         running.set(false)
                         try { session.close() } catch (_: Throwable) {}
                         awareSession = null
@@ -256,11 +285,12 @@ class WifiAwarePeerTransport(
 
                 override fun onAttachFailed() {
                     running.set(false)
-                    status("Wi-Fi Aware attach failed")
+                    status("Wi-Fi Aware attach failed (framework rejected the session)")
                 }
             }, main)
         } catch (t: Throwable) {
             running.set(false)
+            Log.e(TAG, "Wi-Fi Aware attach threw", t)
             throw IllegalStateException("Wi-Fi Aware start failed: ${errorText(t)}", t)
         }
     }
@@ -291,23 +321,30 @@ class WifiAwarePeerTransport(
                         requestHostNetwork(peerHandle)
                         scheduleRanging()
                     } catch (t: Throwable) {
-                        status("Peer join handling failed: ${errorText(t)}")
+                        reportError("Peer join handling failed", t)
                     }
                 }
 
                 override fun onSessionConfigFailed() {
                     if (allowRanging && running.get()) {
                         status("Retrying room without RTT discovery filter…")
-                        try { publish(session = awareSession ?: return, allowRanging = false) }
-                        catch (t: Throwable) { status("Wi-Fi Aware publish failed: ${errorText(t)}") }
+                        try {
+                            publish(session = awareSession ?: return, allowRanging = false)
+                        } catch (t: Throwable) {
+                            reportError("Wi-Fi Aware publish failed", t)
+                        }
                     } else {
                         status("Wi-Fi Aware publish configuration failed")
                     }
                 }
             }, main)
         } catch (t: Throwable) {
-            if (allowRanging) publish(session, allowRanging = false)
-            else throw t
+            if (allowRanging) {
+                status("RTT-enabled publish rejected; retrying plain Wi-Fi Aware…")
+                publish(session, allowRanging = false)
+            } else {
+                throw t
+            }
         }
     }
 
@@ -353,23 +390,30 @@ class WifiAwarePeerTransport(
                             requestClientNetwork(peerHandle)
                         }
                     } catch (t: Throwable) {
-                        status("Peer data-path message failed: ${errorText(t)}")
+                        reportError("Peer data-path message failed", t)
                     }
                 }
 
                 override fun onSessionConfigFailed() {
                     if (allowRanging && running.get()) {
                         status("Retrying scan without RTT distance filter…")
-                        try { subscribe(session = awareSession ?: return, allowRanging = false) }
-                        catch (t: Throwable) { status("Wi-Fi Aware scan failed: ${errorText(t)}") }
+                        try {
+                            subscribe(session = awareSession ?: return, allowRanging = false)
+                        } catch (t: Throwable) {
+                            reportError("Wi-Fi Aware scan failed", t)
+                        }
                     } else {
                         status("Wi-Fi Aware scan configuration failed")
                     }
                 }
             }, main)
         } catch (t: Throwable) {
-            if (allowRanging) subscribe(session, allowRanging = false)
-            else throw t
+            if (allowRanging) {
+                status("RTT-enabled scan rejected; retrying plain Wi-Fi Aware…")
+                subscribe(session, allowRanging = false)
+            } else {
+                throw t
+            }
         }
     }
 
@@ -387,7 +431,7 @@ class WifiAwarePeerTransport(
             roomPeers[code] = peer
             safeCallback { callbacks.onRoomFound(room) }
         } catch (t: Throwable) {
-            status("Nearby room decode failed: ${errorText(t)}")
+            reportError("Nearby room decode failed", t)
         }
     }
 
@@ -430,6 +474,7 @@ class WifiAwarePeerTransport(
                 "NDP|$roomCode".toByteArray(StandardCharsets.UTF_8),
             )
         } catch (t: Throwable) {
+            Log.e(TAG, "Host data path failed", t)
             failLink("Host data path failed: ${errorText(t)}")
         }
     }
@@ -465,11 +510,13 @@ class WifiAwarePeerTransport(
                                 attachSocket(network.socketFactory.createSocket(address, port).apply { tcpNoDelay = true })
                             } catch (t: Throwable) {
                                 socketConnected.set(false)
+                                Log.e(TAG, "Client socket failed", t)
                                 failLink("Client socket failed: ${errorText(t)}")
                             }
                         }
                     } catch (t: Throwable) {
                         socketConnected.set(false)
+                        Log.e(TAG, "Peer endpoint resolution failed", t)
                         failLink("Peer endpoint resolution failed: ${errorText(t)}")
                     }
                 }
@@ -482,6 +529,7 @@ class WifiAwarePeerTransport(
             connectivity.requestNetwork(request, callback)
         } catch (t: Throwable) {
             clientConnectStarted.set(false)
+            Log.e(TAG, "Client data path failed", t)
             failLink("Client data path failed: ${errorText(t)}")
         }
     }
@@ -516,7 +564,10 @@ class WifiAwarePeerTransport(
             }
             if (running.get()) failLink("Peer disconnected")
         } catch (t: Throwable) {
-            if (running.get()) failLink("Peer link error: ${errorText(t)}")
+            if (running.get()) {
+                Log.e(TAG, "Peer read loop failed", t)
+                failLink("Peer link error: ${errorText(t)}")
+            }
         }
     }
 
@@ -526,7 +577,10 @@ class WifiAwarePeerTransport(
         try {
             synchronized(writeLock) { PeerProtocol.write(s.getOutputStream(), message) }
         } catch (t: Throwable) {
-            if (running.get()) failLink("Send failed: ${errorText(t)}")
+            if (running.get()) {
+                Log.e(TAG, "Peer send failed", t)
+                failLink("Send failed: ${errorText(t)}")
+            }
         }
     }
 
@@ -547,7 +601,7 @@ class WifiAwarePeerTransport(
     private fun rangeOnce() {
         val peer = currentPeer ?: return
         val manager = rtt ?: return
-        if (!hasPeerPermission()) return
+        if (missingPeerPermissions().isNotEmpty()) return
         if (!capabilities().rttAvailable || !rangingBusy.compareAndSet(false, true)) return
         try {
             val request = RangingRequest.Builder()
@@ -557,10 +611,16 @@ class WifiAwarePeerTransport(
             manager.startRanging(request, context.mainExecutor, object : RangingResultCallback() {
                 override fun onRangingFailure(code: Int) {
                     rangingBusy.set(false)
+                    val error = "framework failure code $code"
+                    if (error != lastRangingError) {
+                        lastRangingError = error
+                        status("Wi-Fi RTT unavailable: $error — continuing with visual alignment")
+                    }
                 }
 
                 override fun onRangingResults(results: MutableList<RangingResult>) {
                     rangingBusy.set(false)
+                    lastRangingError = ""
                     val result = results.firstOrNull { it.status == RangingResult.STATUS_SUCCESS } ?: return
                     val samples = result.numSuccessfulMeasurements
                     val std = if (samples >= 2) result.distanceStdDevMm / 1000f else Float.NaN
@@ -569,8 +629,14 @@ class WifiAwarePeerTransport(
                     sendRange(distance, std, samples)
                 }
             })
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             rangingBusy.set(false)
+            val error = errorText(t)
+            Log.e(TAG, "Wi-Fi RTT start failed", t)
+            if (error != lastRangingError) {
+                lastRangingError = error
+                status("Wi-Fi RTT failed: $error — continuing with visual alignment")
+            }
         }
     }
 
@@ -584,20 +650,47 @@ class WifiAwarePeerTransport(
         status(reason)
     }
 
-    private fun hasPeerPermission(): Boolean = if (Build.VERSION.SDK_INT >= 33) {
-        context.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
-    } else {
-        context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    private fun missingPeerPermissions(): List<String> {
+        val missing = ArrayList<String>(3)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            context.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED
+        ) {
+            missing += "Nearby Wi-Fi devices"
+        }
+        if (context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            missing += "Location"
+        }
+        if (context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            missing += "Precise location"
+        }
+        return missing
     }
 
     private fun status(text: String) = safeCallback { callbacks.onTransportStatus(text) }
+
+    private fun reportError(prefix: String, t: Throwable) {
+        Log.e(TAG, prefix, t)
+        status("$prefix: ${errorText(t)}")
+    }
 
     private inline fun safeCallback(block: () -> Unit) {
         try { block() } catch (_: Throwable) {}
     }
 
-    private fun errorText(t: Throwable): String =
-        "${t.javaClass.simpleName}${t.message?.let { ": $it" } ?: ""}"
+    private fun errorText(t: Throwable): String {
+        val parts = ArrayList<String>(3)
+        var current: Throwable? = t
+        repeat(3) {
+            val c = current ?: return@repeat
+            val item = buildString {
+                append(c.javaClass.simpleName)
+                c.message?.takeIf { it.isNotBlank() }?.let { append(": ").append(it) }
+            }
+            if (item !in parts) parts += item
+            current = c.cause
+        }
+        return parts.joinToString(" <- ").ifBlank { t.javaClass.name }
+    }
 
     private fun normalizeRoom(code: String) =
         code.uppercase(Locale.US).filter { it.isLetterOrDigit() }.take(8).ifBlank { "ROOM01" }
@@ -609,5 +702,6 @@ class WifiAwarePeerTransport(
 
     companion object {
         private const val SERVICE = "spatialnomap.v3"
+        private const val TAG = "SpatialAware"
     }
 }
