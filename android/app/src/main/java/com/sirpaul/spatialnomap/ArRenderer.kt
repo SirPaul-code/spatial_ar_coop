@@ -37,8 +37,12 @@ class ArRenderer(
     private var textureBoundSession: Session? = null
     private var lastCaptureNs = 0L
     private var lastTrackingText = ""
+    private var lastFrameError = ""
+    private var lastFrameErrorAtMs = 0L
 
-    fun queueTap(x: Float, y: Float) { pendingTap.set(floatArrayOf(x, y)) }
+    fun queueTap(x: Float, y: Float) {
+        pendingTap.set(floatArrayOf(x, y))
+    }
 
     fun setRemoteTarget(pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
         remoteTarget.set(pointLocalWorld?.let { RemoteTarget(it.copyOf(3), owner, confidence) })
@@ -46,10 +50,15 @@ class ArRenderer(
     }
 
     fun detachSession() {
+        // Set the gate first. A late GL callback can still happen while the UI
+        // thread is pausing GLSurfaceView, but it will not touch ARCore.
         sessionResumed = false
         session = null
         textureBoundSession = null
+        pendingTap.set(null)
+        lastCaptureNs = 0L
         lastTrackingText = ""
+        lastFrameError = ""
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -62,7 +71,9 @@ class ArRenderer(
         this.width = width
         this.height = height
         GLES20.glViewport(0, 0, width, height)
-        if (sessionResumed) session?.setDisplayGeometry(rotationProvider(), width, height)
+        if (sessionResumed) {
+            runCatching { session?.setDisplayGeometry(rotationProvider(), width, height) }
+        }
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -77,12 +88,20 @@ class ArRenderer(
                 s.setDisplayGeometry(rotationProvider(), width, height)
             }
 
+            // Re-check after camera/texture setup because the UI thread may have
+            // started a pause or lens switch in the meantime.
+            if (!sessionResumed || session !== s) return
+
             val frame = s.update()
             background.draw(frame)
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
             coordinator.onTrackingState(tracking)
-            val text = if (tracking) "AR tracking" else "AR ${camera.trackingState} / ${camera.trackingFailureReason}"
+            val text = if (tracking) {
+                "AR tracking"
+            } else {
+                "AR ${camera.trackingState} / ${camera.trackingFailureReason}"
+            }
             if (text != lastTrackingText) {
                 lastTrackingText = text
                 status(text)
@@ -93,10 +112,14 @@ class ArRenderer(
             captureIfDue(frame, camera)
             projectRemoteTarget(camera)
         } catch (t: Throwable) {
-            // SessionPausedException must never become a frame-error storm. Lifecycle
-            // owns sessionResumed, so a late GL callback after pause is simply ignored.
             if (t.javaClass.simpleName == "SessionPausedException") return
-            status("AR frame error: ${t.javaClass.simpleName}: ${t.message}")
+            val error = "${t.javaClass.simpleName}: ${t.message}"
+            val now = System.currentTimeMillis()
+            if (error != lastFrameError || now - lastFrameErrorAtMs > 2000L) {
+                lastFrameError = error
+                lastFrameErrorAtMs = now
+                status("AR frame error: $error")
+            }
         }
     }
 
@@ -173,6 +196,16 @@ class ArRenderer(
         val dy = p[1] - camera.pose.ty()
         val dz = p[2] - camera.pose.tz()
         val distance = sqrt(dx * dx + dy * dy + dz * dz)
-        overlay.setTarget(TargetOverlayView.Target(x, y, inFront, bearing, distance, target.owner, target.confidence))
+        overlay.setTarget(
+            TargetOverlayView.Target(
+                x,
+                y,
+                inFront,
+                bearing,
+                distance,
+                target.owner,
+                target.confidence,
+            ),
+        )
     }
 }
