@@ -1,6 +1,7 @@
 package com.sirpaul.spatialnomap
 
 import kotlin.math.abs
+import kotlin.math.acos
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.min
@@ -39,7 +40,6 @@ object FusionMath {
     /** Heading change induced by the rotation in a remote->local transform. */
     fun yawFromTransformDeg(transform: DoubleArray): Double {
         if (transform.size < 16) return Double.NaN
-        // Remote world forward is (0,0,-1). Transform it as a direction.
         val x = -transform[2]
         val z = -transform[10]
         return normalizeDeg(Math.toDegrees(atan2(x, -z)))
@@ -48,6 +48,23 @@ object FusionMath {
     fun yawResidualDeg(transform: DoubleArray, prior: YawPrior?): Double {
         if (prior == null) return Double.NaN
         return abs(angleDeltaDeg(yawFromTransformDeg(transform), prior.yawRemoteToLocalDeg))
+    }
+
+    /**
+     * ARCore worlds are gravity aligned. A valid world-to-world registration can
+     * differ strongly in yaw, but should not tip gravity sideways. This is a very
+     * useful IMU-derived rejection signal for PnP false positives.
+     */
+    fun gravityTiltDeg(transform: DoubleArray): Double {
+        if (transform.size < 16) return Double.NaN
+        // Rotation of remote +Y into local world is matrix column 1.
+        val ux = transform[1]
+        val uy = transform[5]
+        val uz = transform[9]
+        val n = sqrt(ux * ux + uy * uy + uz * uz)
+        if (n < 1e-9) return Double.NaN
+        val cosine = (uy / n).coerceIn(-1.0, 1.0)
+        return Math.toDegrees(acos(cosine))
     }
 
     /**
@@ -77,8 +94,6 @@ object FusionMath {
         )
         val horizontalSeparation = sqrt(enu[0] * enu[0] + enu[1] * enu[1])
 
-        // If both phones are in the same room and GNSS says they are only a few
-        // meters apart with several meters of uncertainty, its bearing is noise.
         if (horizontalSeparation < combinedAccuracy * 0.85) return null
 
         val localWorldHeading = cameraHeadingInArWorldDeg(local.pose)
@@ -124,8 +139,6 @@ object FusionMath {
         val r = headingYawMatrix(prior.yawRemoteToLocalDeg)
         val mappedRemote = transformDirectionPoint(r, remote.pose.t)
 
-        // Co-location prior: align the current camera centers. Vision/RTT history
-        // then refines the remaining <=range translation ambiguity.
         r[3] = local.pose.t.getOrElse(0) { 0f } - mappedRemote[0]
         r[7] = local.pose.t.getOrElse(1) { 0f } - mappedRemote[1]
         r[11] = local.pose.t.getOrElse(2) { 0f } - mappedRemote[2]
@@ -147,7 +160,6 @@ object FusionMath {
         if (n < 1e-9) return Double.NaN
         x /= n; y /= n; z /= n; w /= n
 
-        // Rotate camera forward (0,0,-1) into the AR world.
         val fx = -2.0 * (x * z + y * w)
         val fz = -(1.0 - 2.0 * (x * x + y * y))
         if (abs(fx) + abs(fz) < 1e-8) return Double.NaN
