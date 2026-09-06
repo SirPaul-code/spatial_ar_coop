@@ -36,6 +36,7 @@ class SpatialSensorFusion(private val context: Context) : SensorEventListener, L
     private val gyroSensor: Sensor? = sensors?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
     @Volatile private var started = false
+    @Volatile private var locationStarted = false
     @Volatile private var headingDeg = Float.NaN
     @Volatile private var pitchDeg = Float.NaN
     @Volatile private var rollDeg = Float.NaN
@@ -46,17 +47,19 @@ class SpatialSensorFusion(private val context: Context) : SensorEventListener, L
     @Volatile private var rotationAccuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
 
     fun start() {
-        if (started) return
-        started = true
-        rotationSensor?.let { sensors?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        pressureSensor?.let { sensors?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
-        gyroSensor?.let { sensors?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        startLocationIfPermitted()
+        if (!started) {
+            started = true
+            rotationSensor?.let { sensors?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+            pressureSensor?.let { sensors?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
+            gyroSensor?.let { sensors?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        }
+        if (!locationStarted) startLocationIfPermitted()
     }
 
     fun stop() {
         if (!started) return
         started = false
+        locationStarted = false
         runCatching { sensors?.unregisterListener(this) }
         runCatching { location?.removeUpdates(this) }
     }
@@ -64,10 +67,14 @@ class SpatialSensorFusion(private val context: Context) : SensorEventListener, L
     fun restartLocation() {
         if (!started) return
         runCatching { location?.removeUpdates(this) }
+        locationStarted = false
         startLocationIfPermitted()
     }
 
     fun snapshot(): SensorSnapshot {
+        // Permissions may have been granted after Application.onCreate(). Calling
+        // start() here is cheap and activates Location as soon as that happens.
+        start()
         val loc = latestLocation
         return SensorSnapshot(
             elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos(),
@@ -130,8 +137,6 @@ class SpatialSensorFusion(private val context: Context) : SensorEventListener, L
         headingDeg = heading
         pitchDeg = Math.toDegrees(asin(fz.coerceIn(-1f, 1f).toDouble())).toFloat()
 
-        // Device +Y projected around the camera-forward axis gives a stable
-        // advisory roll value; exact roll is not used to force registration.
         val ux = r[1]
         val uy = r[4]
         rollDeg = Math.toDegrees(atan2(ux.toDouble(), max(1e-6f, uy).toDouble())).toFloat()
@@ -150,6 +155,7 @@ class SpatialSensorFusion(private val context: Context) : SensorEventListener, L
         val coarse = context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!fine && !coarse) return
 
+        var registeredAny = false
         val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
         for (provider in providers) {
             val enabled = runCatching { location?.isProviderEnabled(provider) == true }.getOrDefault(false)
@@ -157,8 +163,10 @@ class SpatialSensorFusion(private val context: Context) : SensorEventListener, L
             runCatching {
                 location?.getLastKnownLocation(provider)?.let { considerLocation(it) }
                 location?.requestLocationUpdates(provider, 500L, 0.25f, this, Looper.getMainLooper())
+                registeredAny = true
             }
         }
+        locationStarted = registeredAny
     }
 
     override fun onLocationChanged(location: Location) = considerLocation(location)
