@@ -5,7 +5,9 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -56,9 +58,65 @@ class TargetOverlayView(context: Context) : View(context) {
 
     @Volatile private var target: Target? = null
 
+    /**
+     * Scene tap callback. The overlay intentionally owns camera-surface gestures:
+     * it sits above GLSurfaceView and therefore receives a complete DOWN/UP stream.
+     * The previous GLSurfaceView listener returned false on ACTION_DOWN, so Android
+     * was free to drop the rest of the gesture and ACTION_UP never reached POI code.
+     */
+    var onSceneTap: ((Float, Float) -> Unit)? = null
+
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private var tapCandidate = false
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+    private var touchDownAtMs = 0L
+
     init {
-        isClickable = false
+        isClickable = true
         isFocusable = false
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                tapCandidate = true
+                touchDownX = event.x
+                touchDownY = event.y
+                touchDownAtMs = event.eventTime
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (event.pointerCount > 1) tapCandidate = false
+                val dx = event.x - touchDownX
+                val dy = event.y - touchDownY
+                if (dx * dx + dy * dy > touchSlop * touchSlop) tapCandidate = false
+                return true
+            }
+
+            MotionEvent.ACTION_UP -> {
+                val shortEnough = event.eventTime - touchDownAtMs <= MAX_TAP_DURATION_MS
+                val shouldTap = tapCandidate && shortEnough
+                tapCandidate = false
+                if (shouldTap) {
+                    onSceneTap?.invoke(event.x, event.y)
+                    performClick()
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                tapCandidate = false
+                return true
+            }
+        }
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
     }
 
     fun setTarget(target: Target?) {
@@ -168,5 +226,9 @@ class TargetOverlayView(context: Context) : View(context) {
             panel,
         )
         canvas.drawText(label, labelLeft + d(10f), labelTop + d(21f), meta)
+    }
+
+    companion object {
+        private const val MAX_TAP_DURATION_MS = 650L
     }
 }
