@@ -36,6 +36,7 @@ object AlignmentEngine {
         val confidence: Float,
         val headingResidualDeg: Double = Double.NaN,
         val sensorPriorConfidence: Float = 0f,
+        val gravityTiltDeg: Double = Double.NaN,
     )
 
     private data class MatchSet(
@@ -173,6 +174,19 @@ object AlignmentEngine {
             .coerceIn(0.0, 1.0)
             .toFloat()
 
+        // ARCore fuses accelerometer/gyro to keep each local world gravity aligned.
+        // A remote->local transform that tilts gravity substantially is therefore
+        // physically implausible even when PnP found a tempting visual solution.
+        val gravityTilt = FusionMath.gravityTiltDeg(localFromRemote)
+        if (gravityTilt.isFinite()) {
+            if (gravityTilt > 32.0) {
+                releaseAll(obj, img, k, dist, rvec, tvec, inlierMat, objIn, imgIn, rotation)
+                return null
+            }
+            confidence *= exp(-gravityTilt / 22.0).toFloat()
+            if (gravityTilt < 5.0) confidence = (confidence * 1.08f).coerceAtMost(1f)
+        }
+
         val yawPrior = FusionMath.yawPrior(remote, local)
         val headingResidual = FusionMath.yawResidualDeg(localFromRemote, yawPrior)
         if (yawPrior != null && headingResidual.isFinite()) {
@@ -209,6 +223,7 @@ object AlignmentEngine {
             confidence = confidence,
             headingResidualDeg = headingResidual,
             sensorPriorConfidence = yawPrior?.confidence ?: 0f,
+            gravityTiltDeg = gravityTilt,
         )
     }
 
