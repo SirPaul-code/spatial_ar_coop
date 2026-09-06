@@ -196,6 +196,22 @@ class WifiAwarePeerTransport(
     fun sendAlignmentReset(reason: String) =
         sendControl(WireMessage.ResetAlignment(reason.take(128)))
 
+    fun sendAlignmentTransform(
+        senderFromPeer: DoubleArray,
+        confidence: Float,
+        inliers: Int,
+        medianReprojectionPx: Float,
+        source: String,
+    ) = sendControl(
+        WireMessage.AlignmentTransform(
+            senderFromPeer = senderFromPeer.copyOf(16),
+            confidence = confidence,
+            inliers = inliers,
+            medianReprojectionPx = medianReprojectionPx,
+            source = source.take(48),
+        ),
+    )
+
     private fun sendRange(distanceM: Float, stdDevM: Float, samples: Int) =
         sendControl(WireMessage.Range(distanceM, stdDevM, samples))
 
@@ -296,7 +312,7 @@ class WifiAwarePeerTransport(
     }
 
     private fun publish(session: WifiAwareSession, allowRanging: Boolean) {
-        val info = "V3|$roomCode|${safeToken(username)}".toByteArray(StandardCharsets.UTF_8)
+        val info = "V4|$roomCode|${safeToken(username)}".toByteArray(StandardCharsets.UTF_8)
         val config = PublishConfig.Builder()
             .setServiceName(SERVICE)
             .setServiceSpecificInfo(info)
@@ -420,7 +436,7 @@ class WifiAwarePeerTransport(
     private fun registerRoom(peer: PeerHandle, info: ByteArray?, distanceM: Float?) {
         try {
             val parts = info?.toString(StandardCharsets.UTF_8)?.split('|', limit = 3) ?: return
-            if (parts.size < 3 || parts[0] != "V3") return
+            if (parts.size < 3 || parts[0] != "V4") return
             val code = normalizeRoom(parts[1])
             val room = NearbyRoom(
                 code,
@@ -614,7 +630,7 @@ class WifiAwarePeerTransport(
                     val error = "framework failure code $code"
                     if (error != lastRangingError) {
                         lastRangingError = error
-                        status("Wi-Fi RTT unavailable: $error — continuing with visual alignment")
+                        status("Wi-Fi RTT unavailable: $error — continuing with fused alignment")
                     }
                 }
 
@@ -635,7 +651,7 @@ class WifiAwarePeerTransport(
             Log.e(TAG, "Wi-Fi RTT start failed", t)
             if (error != lastRangingError) {
                 lastRangingError = error
-                status("Wi-Fi RTT failed: $error — continuing with visual alignment")
+                status("Wi-Fi RTT failed: $error — continuing with fused alignment")
             }
         }
     }
@@ -698,10 +714,10 @@ class WifiAwarePeerTransport(
     private fun safeToken(value: String) =
         value.replace('|', '_').replace('\n', ' ').replace('\r', ' ').trim().take(32)
 
-    private fun psk(code: String) = "Spatial-${normalizeRoom(code)}-V3"
+    private fun psk(code: String) = "Spatial-${normalizeRoom(code)}-V4"
 
     companion object {
-        private const val SERVICE = "spatialnomap.v3"
+        private const val SERVICE = "spatialnomap.v4"
         private const val TAG = "SpatialAware"
     }
 }
