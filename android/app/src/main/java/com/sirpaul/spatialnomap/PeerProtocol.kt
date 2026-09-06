@@ -17,11 +17,6 @@ sealed class WireMessage {
     data class Range(val distanceM: Float, val stdDevM: Float, val samples: Int) : WireMessage()
     data class Quality(val confidence: Float, val stableCount: Int, val ready: Boolean) : WireMessage()
     data class ResetAlignment(val reason: String) : WireMessage()
-    data class AlignmentTransform(
-        val transformSenderFromPeer: DoubleArray,
-        val confidence: Float,
-        val source: String,
-    ) : WireMessage()
 }
 
 object PeerProtocol {
@@ -35,7 +30,6 @@ object PeerProtocol {
     private const val T_RANGE = 5
     private const val T_QUALITY = 6
     private const val T_RESET_ALIGNMENT = 7
-    private const val T_ALIGNMENT_TRANSFORM = 8
 
     fun write(output: OutputStream, message: WireMessage) {
         val payload = ByteArrayOutputStream()
@@ -64,12 +58,6 @@ object PeerProtocol {
                     out.writeBoolean(message.ready)
                 }
                 is WireMessage.ResetAlignment -> out.writeUTF(message.reason.take(128))
-                is WireMessage.AlignmentTransform -> {
-                    require(message.transformSenderFromPeer.size >= 16) { "alignment transform must be 4x4" }
-                    repeat(16) { out.writeDouble(message.transformSenderFromPeer[it]) }
-                    out.writeFloat(message.confidence)
-                    out.writeUTF(message.source.take(48))
-                }
             }
         }
 
@@ -83,7 +71,6 @@ object PeerProtocol {
             is WireMessage.Range -> T_RANGE
             is WireMessage.Quality -> T_QUALITY
             is WireMessage.ResetAlignment -> T_RESET_ALIGNMENT
-            is WireMessage.AlignmentTransform -> T_ALIGNMENT_TRANSFORM
         }
 
         val out = DataOutputStream(output)
@@ -125,11 +112,6 @@ object PeerProtocol {
                 T_RANGE -> WireMessage.Range(data.readFloat(), data.readFloat(), data.readInt())
                 T_QUALITY -> WireMessage.Quality(data.readFloat(), data.readInt(), data.readBoolean())
                 T_RESET_ALIGNMENT -> WireMessage.ResetAlignment(data.readUTF())
-                T_ALIGNMENT_TRANSFORM -> WireMessage.AlignmentTransform(
-                    transformSenderFromPeer = DoubleArray(16) { data.readDouble() },
-                    confidence = data.readFloat(),
-                    source = data.readUTF(),
-                )
                 else -> throw IllegalArgumentException("unknown wire type $type")
             }
         }
