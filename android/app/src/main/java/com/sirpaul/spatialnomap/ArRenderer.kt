@@ -45,9 +45,6 @@ class ArRenderer(
     private val clearTargetsRequested = AtomicBoolean(false)
     private val trackingGate = TrackingStabilityGate(acquireMs = 300L, lossMs = 1000L)
 
-    // ARCore Anchor objects are owned and touched on the GL/session thread. Their
-    // numerical world-space poses can change as ARCore refines its map, which is
-    // exactly why POIs are rendered from anchors rather than frozen XYZ vectors.
     private var remoteAnchor: Anchor? = null
     private var remoteAnchorId = Long.MIN_VALUE
     private var remoteAnchorInputPoint: FloatArray? = null
@@ -171,9 +168,6 @@ class ArRenderer(
         }
 
         var newAnchor: Anchor? = null
-
-        // Prefer a real ARCore HitResult anchor. DepthPoint/Plane/feature-point
-        // anchors receive ARCore's ongoing map corrections automatically.
         for (hit in frame.hitTest(tap[0], tap[1])) {
             val trackable = hit.trackable
             val usable = when (trackable) {
@@ -274,13 +268,14 @@ class ArRenderer(
     }
 
     private fun captureIfDue(frame: Frame, camera: Camera) {
+        val locked = coordinator.quality().bothReady
+        val budget = SpatialSyncApplication.captureBudget(locked)
         val now = System.nanoTime()
-        val interval = if (coordinator.quality().bothReady) LOCKED_CAPTURE_INTERVAL_NS else ALIGN_CAPTURE_INTERVAL_NS
-        if (now - lastCaptureNs < interval) return
+        if (now - lastCaptureNs < budget.intervalNs) return
         val packet = FrameCapture.capture(
             frame = frame,
             camera = camera,
-            maxWidth = 960,
+            maxWidth = budget.maxWidth,
             sensors = sensorSnapshotProvider(),
         ) ?: return
         coordinator.onLocalFrame(packet)
@@ -371,8 +366,6 @@ class ArRenderer(
     }
 
     companion object {
-        private const val ALIGN_CAPTURE_INTERVAL_NS = 520_000_000L
-        private const val LOCKED_CAPTURE_INTERVAL_NS = 2_000_000_000L
         private const val LOCAL_ANCHOR_UPDATE_M = 0.015f
         private const val LOCAL_ANCHOR_HEARTBEAT_NS = 2_000_000_000L
         private const val REMOTE_REANCHOR_THRESHOLD_M = 0.04f
