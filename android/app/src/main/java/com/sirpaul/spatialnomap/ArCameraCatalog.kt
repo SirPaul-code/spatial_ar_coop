@@ -17,7 +17,7 @@ import java.util.Locale
  *
  * A fresh Session may expose a conservative default CameraConfig. After ranking,
  * explicitly apply the best tracking config for that same physical default camera
- * so the quality policy is active even before a user ever opens the camera menu.
+ * so the quality policy is active before the user ever opens the camera menu.
  */
 class ArCameraCatalog(
     context: Context,
@@ -44,7 +44,7 @@ class ArCameraCatalog(
     }
 
     val choices: List<Choice>
-    val defaultCameraId: String = session.cameraConfig.cameraId
+    val defaultCameraId: String = session.getCameraConfig().getCameraId()
 
     init {
         val filter = CameraConfigFilter(session)
@@ -52,12 +52,13 @@ class ArCameraCatalog(
         val supported = session.getSupportedCameraConfigs(filter)
 
         val bestPerCamera = supported
-            .groupBy { it.cameraId }
+            .groupBy { it.getCameraId() }
             .mapNotNull { (_, configs) -> configs.maxWithOrNull(TRACKING_CONFIG_COMPARATOR) }
 
         val cameraManager = context.getSystemService(CameraManager::class.java)
         val opticalPower = bestPerCamera.associate { config ->
-            config.cameraId to effectiveOpticalPower(cameraManager, config.cameraId)
+            val id = config.getCameraId()
+            id to effectiveOpticalPower(cameraManager, id)
         }
         val defaultPower = effectiveOpticalPower(cameraManager, defaultCameraId)
             ?: opticalPower.values.filterNotNull().sorted().let { list ->
@@ -65,20 +66,22 @@ class ArCameraCatalog(
             }
 
         choices = bestPerCamera.mapIndexed { index, config ->
-            val power = opticalPower[config.cameraId]
+            val cameraId = config.getCameraId()
+            val imageSize = config.getImageSize()
+            val power = opticalPower[cameraId]
             val zoom = if (power != null && defaultPower != null && defaultPower > 0f) {
                 (power / defaultPower).coerceIn(0.1f, 20f)
             } else null
             Choice(
                 config = config,
-                cameraId = config.cameraId,
+                cameraId = cameraId,
                 label = zoom?.let { formatZoom(it) } ?: "CAM ${index + 1}",
                 approximateZoom = zoom,
-                imageWidth = config.imageSize.width,
-                imageHeight = config.imageSize.height,
-                maxFps = config.fpsRange.upper,
-                stereo = config.stereoCameraUsage == CameraConfig.StereoCameraUsage.REQUIRE_AND_USE,
-                hardwareDepth = config.depthSensorUsage == CameraConfig.DepthSensorUsage.REQUIRE_AND_USE,
+                imageWidth = imageSize.width,
+                imageHeight = imageSize.height,
+                maxFps = config.getFpsRange().upper,
+                stereo = config.getStereoCameraUsage() == CameraConfig.StereoCameraUsage.REQUIRE_AND_USE,
+                hardwareDepth = config.getDepthSensorUsage() == CameraConfig.DepthSensorUsage.REQUIRE_AND_USE,
             )
         }.sortedWith(
             compareByDescending<Choice> { it.stereo }
@@ -88,11 +91,8 @@ class ArCameraCatalog(
                 .thenBy { it.cameraId },
         )
 
-        // Session is still paused while this catalog is constructed, which is the
-        // valid point to replace its CameraConfig. Preserve the physical camera ID
-        // but activate the highest-ranked tracking stream combination for it.
         choices.firstOrNull { it.cameraId == defaultCameraId }?.let { bestDefault ->
-            runCatching { session.cameraConfig = bestDefault.config }
+            runCatching { session.setCameraConfig(bestDefault.config) }
         }
     }
 
@@ -128,13 +128,14 @@ class ArCameraCatalog(
     companion object {
         private val TRACKING_CONFIG_COMPARATOR =
             compareBy<CameraConfig> {
-                if (it.stereoCameraUsage == CameraConfig.StereoCameraUsage.REQUIRE_AND_USE) 1 else 0
+                if (it.getStereoCameraUsage() == CameraConfig.StereoCameraUsage.REQUIRE_AND_USE) 1 else 0
             }.thenBy {
-                if (it.fpsRange.upper >= 60) 1 else 0
+                if (it.getFpsRange().upper >= 60) 1 else 0
             }.thenBy {
-                if (it.depthSensorUsage == CameraConfig.DepthSensorUsage.REQUIRE_AND_USE) 1 else 0
+                if (it.getDepthSensorUsage() == CameraConfig.DepthSensorUsage.REQUIRE_AND_USE) 1 else 0
             }.thenBy {
-                it.imageSize.width.toLong() * it.imageSize.height.toLong()
+                val size = it.getImageSize()
+                size.width.toLong() * size.height.toLong()
             }
     }
 }
