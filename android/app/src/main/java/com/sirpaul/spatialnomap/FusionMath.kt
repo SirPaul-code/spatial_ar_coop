@@ -37,7 +37,6 @@ object FusionMath {
         return YawPrior(yaw, q)
     }
 
-    /** Heading change induced by the rotation in a remote->local transform. */
     fun yawFromTransformDeg(transform: DoubleArray): Double {
         if (transform.size < 16) return Double.NaN
         val x = -transform[2]
@@ -50,28 +49,16 @@ object FusionMath {
         return abs(angleDeltaDeg(yawFromTransformDeg(transform), prior.yawRemoteToLocalDeg))
     }
 
-    /**
-     * ARCore worlds are gravity aligned. A valid world-to-world registration can
-     * differ strongly in yaw, but should not tip gravity sideways. This is a very
-     * useful IMU-derived rejection signal for PnP false positives.
-     */
     fun gravityTiltDeg(transform: DoubleArray): Double {
         if (transform.size < 16) return Double.NaN
-        // Rotation of remote +Y into local world is matrix column 1.
         val ux = transform[1]
         val uy = transform[5]
         val uz = transform[9]
         val n = sqrt(ux * ux + uy * uy + uz * uz)
         if (n < 1e-9) return Double.NaN
-        val cosine = (uy / n).coerceIn(-1.0, 1.0)
-        return Math.toDegrees(acos(cosine))
+        return Math.toDegrees(acos((uy / n).coerceIn(-1.0, 1.0)))
     }
 
-    /**
-     * Creates an absolute coarse transform when GNSS is genuinely informative.
-     * It is never treated as centimeter precision; it exists to seed and score
-     * visual/ranging alignment and can become a fallback only at high confidence.
-     */
     fun bootstrapFromGnss(remote: CapturedFrame, local: CapturedFrame): Bootstrap? {
         val prior = yawPrior(remote, local) ?: return null
         val rs = remote.sensors
@@ -93,18 +80,16 @@ object FusionMath {
             altM = rs.altitudeM,
         )
         val horizontalSeparation = sqrt(enu[0] * enu[0] + enu[1] * enu[1])
-
         if (horizontalSeparation < combinedAccuracy * 0.85) return null
 
         val localWorldHeading = cameraHeadingInArWorldDeg(local.pose)
         val localEarthOffset = normalizeDeg(ls.headingDeg.toDouble() - localWorldHeading)
         val earthHeading = Math.toDegrees(atan2(enu[0], enu[1]))
         val localHeading = Math.toRadians(normalizeDeg(earthHeading - localEarthOffset))
-        val horizontal = horizontalSeparation
         val targetRemoteCameraInLocal = doubleArrayOf(
-            local.pose.t.getOrElse(0) { 0f } + horizontal * sin(localHeading),
+            local.pose.t.getOrElse(0) { 0f } + horizontalSeparation * sin(localHeading),
             local.pose.t.getOrElse(1) { 0f }.toDouble() + enu[2],
-            local.pose.t.getOrElse(2) { 0f } - horizontal * cos(localHeading),
+            local.pose.t.getOrElse(2) { 0f } - horizontalSeparation * cos(localHeading),
         )
 
         val r = headingYawMatrix(prior.yawRemoteToLocalDeg)
@@ -123,16 +108,12 @@ object FusionMath {
         return Bootstrap(r, confidence, "GNSS+COMPASS", horizontalSeparation)
     }
 
-    /**
-     * When the radios prove the phones are physically very close, absolute yaw
-     * plus ARCore's metric camera positions gives a useful immediate coarse seed.
-     * Translation error is bounded by the measured phone separation.
-     */
     fun bootstrapFromCoLocation(
         remote: CapturedFrame,
         local: CapturedFrame,
         rangeM: Float?,
         rangeStdM: Float?,
+        rangeSource: String = "RTT",
     ): Bootstrap? {
         val prior = yawPrior(remote, local) ?: return null
         val range = rangeM?.takeIf { it.isFinite() && it in 0.05f..1.25f } ?: return null
@@ -147,7 +128,8 @@ object FusionMath {
         val rangeQuality = (1f - (range / 1.25f)).coerceIn(0f, 1f) *
             (1f - (std / 0.8f)).coerceIn(0.25f, 1f)
         val confidence = (0.18f + 0.34f * min(prior.confidence, rangeQuality)).coerceAtMost(0.52f)
-        return Bootstrap(r, confidence, "RTT+COMPASS", range.toDouble())
+        val source = rangeSource.uppercase().filter { it.isLetterOrDigit() }.take(8).ifBlank { "RADIO" }
+        return Bootstrap(r, confidence, "$source+COMPASS", range.toDouble())
     }
 
     fun cameraHeadingInArWorldDeg(pose: PosePacket): Double {
@@ -166,7 +148,6 @@ object FusionMath {
         return normalizeDeg(Math.toDegrees(atan2(fx, -fz)))
     }
 
-    /** Matrix that increases our heading convention by yawDeg. */
     fun headingYawMatrix(yawDeg: Double): DoubleArray {
         val a = Math.toRadians(yawDeg)
         val c = cos(a)
@@ -199,7 +180,6 @@ object FusionMath {
         )
     }
 
-    /** ENU displacement from (lat0,lon0,alt0) to (lat,lon,alt), meters. */
     fun enuMeters(
         lat0Deg: Double,
         lon0Deg: Double,
