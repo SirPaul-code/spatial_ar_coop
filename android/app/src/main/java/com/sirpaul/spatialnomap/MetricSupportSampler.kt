@@ -11,28 +11,72 @@ import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.sqrt
 
+/**
+ * Metric geometry sampler for cross-device registration and POI placement.
+ *
+ * Production policy:
+ *  1. Prefer ARCore Raw Depth because it is the least-smoothed metric signal.
+ *  2. Reject raw pixels below the ARCore confidence midpoint (128/255).
+ *  3. Fall back to full/smoothed depth when raw depth is too sparse.
+ *  4. Fall back to ARCore's tracked point cloud when depth is unavailable.
+ *
+ * A single depth pixel is never trusted. All paths use a local robust median
+ * with an edge/noise gate before converting the measurement to ARCore world.
+ */
 object MetricSupportSampler {
+    private const val RAW_CONFIDENCE_MIN = 128
+    private const val MIN_DEPTH_MM = 150
+    private const val MAX_DEPTH_MM = 65_000
+
     fun sample(frame: Frame, camera: Camera, maxPoints: Int = 2200): List<FloatArray> {
-        val depth = tryDepth(frame, camera, maxPoints)
-        if (depth.size >= 24) return depth
+        val raw = tryRawDepth(frame, camera, maxPoints)
+        if (raw.size >= 24) return raw
+
+        val full = tryFullDepth(frame, camera, maxPoints)
+        if (full.size >= 24) return full
+
         return samplePointCloud(frame, camera, maxPoints)
     }
 
     fun pointAtCpuPixel(frame: Frame, camera: Camera, u: Float, v: Float): FloatArray? {
+        pointAtCpuPixelRaw(frame, camera, u, v)?.let { return it }
+        return pointAtCpuPixelFull(frame, camera, u, v)
+    }
+
+    private fun pointAtCpuPixelRaw(frame: Frame, camera: Camera, u: Float, v: Float): FloatArray? {
+        return try {
+            frame.acquireRawDepthImage16Bits().use { depthImage ->
+                frame.acquireRawDepthConfidenceImage().use { confidenceImage ->
+                    if (depthImage.width != confidenceImage.width || depthImage.height != confidenceImage.height) {
+                        return null
+                    }
+                    val xy = cpuPixelToDepth(frame, u, v, depthImage.width, depthImage.height) ?: return null
+                    val depth = DepthAccessor(depthImage)
+                    val confidence = ConfidenceAccessor(confidenceImage)
+                    val medianMm = robustRawDepthMm(
+                        depth = depth,
+                        confidence = confidence,
+                        cx = xy.first,
+                        cy = xy.second,
+                        radius = 3,
+                        minSamples = 3,
+                    ) ?: return null
+                    unprojectToWorld(camera, u, v, medianMm / 1000f)
+                }
+            }
+        } catch (_: NotYetAvailableException) {
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun pointAtCpuPixelFull(frame: Frame, camera: Camera, u: Float, v: Float): FloatArray? {
         return try {
             frame.acquireDepthImage16Bits().use { image ->
-                val tex = FloatArray(2)
-                frame.transformCoordinates2d(
-                    Coordinates2d.IMAGE_PIXELS,
-                    floatArrayOf(u, v),
-                    Coordinates2d.TEXTURE_NORMALIZED,
-                    tex,
-                )
-                if (tex[0] !in 0f..1f || tex[1] !in 0f..1f) return null
-                val cx = (tex[0] * image.width).toInt().coerceIn(0, image.width - 1)
-                val cy = (tex[1] * image.height).toInt().coerceIn(0, image.height - 1)
+                val xy = cpuPixelToDepth(frame, u, v, image.width, image.height) ?: return null
                 val depth = DepthAccessor(image)
-                val medianMm = robustDepthMm(depth, cx, cy, radius = 2, minSamples = 4) ?: return null
+                val medianMm = robustDepthMm(depth, xy.first, xy.second, radius = 2, minSamples = 4) ?: return null
                 unprojectToWorld(camera, u, v, medianMm / 1000f)
             }
         } catch (_: NotYetAvailableException) {
@@ -43,12 +87,56 @@ object MetricSupportSampler {
     }
 
     /**
-     * Build a dense metric support map, but never trust a single noisy depth
-     * sample. Each grid support is a local 3x3 median with a MAD gate. This costs
-     * very little compared with SIFT/PnP and makes the world points substantially
-     * more stable on texture edges and Samsung depth discontinuities.
+     * Raw depth is sparse but higher-fidelity. We keep only confident samples
+     * and use a confidence-weighted local robust median at every support cell.
      */
-    private fun tryDepth(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
+    private fun tryRawDepth(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
+        return try {
+            frame.acquireRawDepthImage16Bits().use { depthImage ->
+                frame.acquireRawDepthConfidenceImage().use { confidenceImage ->
+                    if (depthImage.width != confidenceImage.width || depthImage.height != confidenceImage.height) {
+                        return emptyList()
+                    }
+                    val depth = DepthAccessor(depthImage)
+                    val confidence = ConfidenceAccessor(confidenceImage)
+                    val total = depthImage.width * depthImage.height
+                    val step = max(1, ceil(sqrt(total.toDouble() / maxPoints.toDouble())).toInt())
+                    val texList = ArrayList<Float>(maxPoints * 2)
+                    val depths = ArrayList<Int>(maxPoints)
+
+                    var y = step / 2
+                    while (y < depthImage.height) {
+                        var x = step / 2
+                        while (x < depthImage.width) {
+                            val mm = robustRawDepthMm(
+                                depth = depth,
+                                confidence = confidence,
+                                cx = x,
+                                cy = y,
+                                radius = 1,
+                                minSamples = 2,
+                            )
+                            if (mm != null) {
+                                texList.add((x + 0.5f) / depthImage.width)
+                                texList.add((y + 0.5f) / depthImage.height)
+                                depths.add(mm)
+                            }
+                            x += step
+                        }
+                        y += step
+                    }
+                    supportsFromDepth(frame, camera, texList, depths, maxPoints)
+                }
+            }
+        } catch (_: NotYetAvailableException) {
+            emptyList()
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    /** Full ARCore depth is denser and temporally smoothed; use it as fallback. */
+    private fun tryFullDepth(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
         return try {
             frame.acquireDepthImage16Bits().use { image ->
                 val accessor = DepthAccessor(image)
@@ -70,32 +158,62 @@ object MetricSupportSampler {
                     }
                     y += step
                 }
-                if (depths.isEmpty()) return emptyList()
-
-                val tex = FloatArray(texList.size) { texList[it] }
-                val cpu = FloatArray(tex.size)
-                frame.transformCoordinates2d(
-                    Coordinates2d.TEXTURE_NORMALIZED,
-                    tex,
-                    Coordinates2d.IMAGE_PIXELS,
-                    cpu,
-                )
-                val out = ArrayList<FloatArray>(depths.size)
-                for (i in depths.indices) {
-                    val pu = cpu[i * 2]
-                    val pv = cpu[i * 2 + 1]
-                    if (!pu.isFinite() || !pv.isFinite() || pu < 0 || pv < 0) continue
-                    val world = unprojectToWorld(camera, pu, pv, depths[i] / 1000f)
-                    out.add(floatArrayOf(pu, pv, world[0], world[1], world[2]))
-                    if (out.size >= maxPoints) break
-                }
-                out
+                supportsFromDepth(frame, camera, texList, depths, maxPoints)
             }
         } catch (_: NotYetAvailableException) {
             emptyList()
         } catch (_: Throwable) {
             emptyList()
         }
+    }
+
+    private fun supportsFromDepth(
+        frame: Frame,
+        camera: Camera,
+        texList: List<Float>,
+        depths: List<Int>,
+        maxPoints: Int,
+    ): List<FloatArray> {
+        if (depths.isEmpty()) return emptyList()
+        val tex = FloatArray(texList.size) { texList[it] }
+        val cpu = FloatArray(tex.size)
+        frame.transformCoordinates2d(
+            Coordinates2d.TEXTURE_NORMALIZED,
+            tex,
+            Coordinates2d.IMAGE_PIXELS,
+            cpu,
+        )
+        val out = ArrayList<FloatArray>(depths.size)
+        for (i in depths.indices) {
+            val pu = cpu[i * 2]
+            val pv = cpu[i * 2 + 1]
+            if (!pu.isFinite() || !pv.isFinite() || pu < 0 || pv < 0) continue
+            val world = unprojectToWorld(camera, pu, pv, depths[i] / 1000f)
+            out.add(floatArrayOf(pu, pv, world[0], world[1], world[2]))
+            if (out.size >= maxPoints) break
+        }
+        return out
+    }
+
+    private fun cpuPixelToDepth(
+        frame: Frame,
+        u: Float,
+        v: Float,
+        depthWidth: Int,
+        depthHeight: Int,
+    ): Pair<Int, Int>? {
+        val tex = FloatArray(2)
+        frame.transformCoordinates2d(
+            Coordinates2d.IMAGE_PIXELS,
+            floatArrayOf(u, v),
+            Coordinates2d.TEXTURE_NORMALIZED,
+            tex,
+        )
+        if (tex[0] !in 0f..1f || tex[1] !in 0f..1f) return null
+        return Pair(
+            (tex[0] * depthWidth).toInt().coerceIn(0, depthWidth - 1),
+            (tex[1] * depthHeight).toInt().coerceIn(0, depthHeight - 1),
+        )
     }
 
     private fun samplePointCloud(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
@@ -146,6 +264,56 @@ object MetricSupportSampler {
         }
     }
 
+    private class ConfidenceAccessor(image: Image) {
+        private val plane = image.planes[0]
+        private val buffer: ByteBuffer = plane.buffer.duplicate()
+        private val rowStride = plane.rowStride
+        private val pixelStride = plane.pixelStride
+        val width: Int = image.width
+        val height: Int = image.height
+
+        fun value(x: Int, y: Int): Int {
+            val index = x * pixelStride + y * rowStride
+            return java.lang.Byte.toUnsignedInt(buffer.get(index))
+        }
+    }
+
+    private fun robustRawDepthMm(
+        depth: DepthAccessor,
+        confidence: ConfidenceAccessor,
+        cx: Int,
+        cy: Int,
+        radius: Int,
+        minSamples: Int,
+    ): Int? {
+        val samples = ArrayList<Pair<Int, Int>>((radius * 2 + 1) * (radius * 2 + 1))
+        for (dy in -radius..radius) {
+            for (dx in -radius..radius) {
+                val x = (cx + dx).coerceIn(0, depth.width - 1)
+                val y = (cy + dy).coerceIn(0, depth.height - 1)
+                val conf = confidence.value(x, y)
+                if (conf < RAW_CONFIDENCE_MIN) continue
+                val mm = depth.mm(x, y)
+                if (mm in MIN_DEPTH_MM..MAX_DEPTH_MM) samples += mm to conf
+            }
+        }
+        if (samples.size < minSamples) return null
+
+        // Expand higher-confidence observations so the median naturally favors
+        // pixels ARCore considers reliable without trusting one maximum pixel.
+        val weighted = ArrayList<Int>(samples.size * 3)
+        for ((mm, conf) in samples) {
+            val weight = 1 + ((conf - RAW_CONFIDENCE_MIN) * 2 / (255 - RAW_CONFIDENCE_MIN)).coerceIn(0, 2)
+            repeat(weight) { weighted += mm }
+        }
+        weighted.sort()
+        val median = weighted[weighted.size / 2]
+        val deviations = weighted.map { kotlin.math.abs(it - median) }.sorted()
+        val mad = deviations[deviations.size / 2]
+        val allowedMad = max(65, (median * 0.065f).toInt())
+        return median.takeIf { mad <= allowedMad }
+    }
+
     private fun robustDepthMm(
         depth: DepthAccessor,
         cx: Int,
@@ -159,7 +327,7 @@ object MetricSupportSampler {
                 val x = (cx + dx).coerceIn(0, depth.width - 1)
                 val y = (cy + dy).coerceIn(0, depth.height - 1)
                 val mm = depth.mm(x, y)
-                if (mm in 150..65000) samples += mm
+                if (mm in MIN_DEPTH_MM..MAX_DEPTH_MM) samples += mm
             }
         }
         if (samples.size < minSamples) return null
