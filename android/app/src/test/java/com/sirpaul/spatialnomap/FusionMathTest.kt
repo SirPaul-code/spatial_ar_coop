@@ -5,6 +5,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
 
 class FusionMathTest {
     private val identityPose = PosePacket(
@@ -50,6 +52,21 @@ class FusionMathTest {
         val transform = FusionMath.headingYawMatrix(prior.yawRemoteToLocalDeg)
         assertEquals(30.0, FusionMath.yawFromTransformDeg(transform), 1e-5)
         assertEquals(0.0, FusionMath.yawResidualDeg(transform, prior), 1e-5)
+        assertEquals(0.0, FusionMath.gravityTiltDeg(transform), 1e-7)
+    }
+
+    @Test
+    fun gravityTiltDetectsImpossibleWorldRoll() {
+        val a = Math.toRadians(20.0)
+        val c = cos(a)
+        val s = sin(a)
+        val roll = doubleArrayOf(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, c, -s, 0.0,
+            0.0, s, c, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        assertEquals(20.0, FusionMath.gravityTiltDeg(roll), 1e-6)
     }
 
     @Test
@@ -84,6 +101,23 @@ class FusionMathTest {
         assertEquals(40.0, FusionMath.yawFromTransformDeg(seed.transformLocalFromRemote), 1e-4)
         assertTrue(seed.confidence in 0.18f..0.52f)
         assertEquals(0.65, seed.expectedDeviceDistanceM, 1e-5)
+    }
+
+    @Test
+    fun bleFallbackIsExplicitlyLabeledAndUncertaintyKeepsItWeak() {
+        val remote = frame(heading = 55f, x = 0.2f)
+        val local = frame(heading = 15f, x = 1.1f)
+        val seed = FusionMath.bootstrapFromCoLocation(
+            remote,
+            local,
+            rangeM = 0.70f,
+            rangeStdM = 1.1f,
+            rangeSource = "BLE",
+        )
+        assertNotNull(seed)
+        seed!!
+        assertEquals("BLE+COMPASS", seed.source)
+        assertTrue(seed.confidence < 0.30f)
     }
 
     @Test
