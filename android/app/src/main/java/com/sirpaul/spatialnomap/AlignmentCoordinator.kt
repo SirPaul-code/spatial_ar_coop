@@ -49,8 +49,28 @@ class AlignmentCoordinator(
     @Volatile private var trackingLostAtMs = 0L
     @Volatile private var lastSolveStartedMs = 0L
 
-    fun onConnected() = resetAlignment()
-    fun onDisconnected() { resetAlignment(); peerReady = false; emitQuality() }
+    fun onConnected() = resetAlignment(clearFrames = true, clearPoi = false)
+
+    fun onDisconnected() {
+        resetAlignment(clearFrames = true, clearPoi = true)
+        peerReady = false
+        emitQuality()
+    }
+
+    /**
+     * ARCore may reset its internal world state when a different tracking camera
+     * is selected. All frame pairs and transforms from the previous camera are
+     * therefore invalid. Tell the peer to discard its transform as well.
+     */
+    fun onCameraChanged(reason: String = "camera changed") {
+        resetAlignment(clearFrames = true, clearPoi = true)
+        transport.sendAlignmentReset(reason)
+    }
+
+    /** Same reset requested by the peer. Does not echo another reset back. */
+    fun onPeerAlignmentReset(reason: String = "peer AR state changed") {
+        resetAlignment(clearFrames = true, clearPoi = true)
+    }
 
     fun onLocalFrame(frame: CapturedFrame) {
         localFrame.set(frame)
@@ -58,7 +78,10 @@ class AlignmentCoordinator(
         maybeSolve()
     }
 
-    fun onRemoteFrame(frame: CapturedFrame) { remoteFrame.set(frame); maybeSolve() }
+    fun onRemoteFrame(frame: CapturedFrame) {
+        remoteFrame.set(frame)
+        maybeSolve()
+    }
 
     fun onRange(distanceM: Float, stdDevM: Float, samples: Int) {
         if (distanceM.isFinite() && distanceM in 0.05f..250f) {
@@ -68,8 +91,15 @@ class AlignmentCoordinator(
         }
     }
 
-    fun onPeerQuality(message: WireMessage.Quality) { peerReady = message.ready; emitQuality() }
-    fun onRemotePoi(message: WireMessage.Poi) { pendingPoi = message; publishPendingPoiIfPossible() }
+    fun onPeerQuality(message: WireMessage.Quality) {
+        peerReady = message.ready
+        emitQuality()
+    }
+
+    fun onRemotePoi(message: WireMessage.Poi) {
+        pendingPoi = message
+        publishPendingPoiIfPossible()
+    }
 
     fun clearPoi(sendToPeer: Boolean = true) {
         pendingPoi = null
@@ -94,7 +124,9 @@ class AlignmentCoordinator(
         }
         val lostAt = trackingLostAtMs
         trackingLostAtMs = 0L
-        if (lostAt != 0L && now - lostAt > 3000L) resetAlignment()
+        if (lostAt != 0L && now - lostAt > 3000L) {
+            resetAlignment(clearFrames = true, clearPoi = false)
+        }
     }
 
     fun close() { solveExecutor.shutdownNow() }
@@ -151,8 +183,18 @@ class AlignmentCoordinator(
                 localConfidence = confidence
                 transport.sendQuality(confidence, 0, false)
             }
-            latestQuality = Quality(confidence, result.inliers, result.correspondences, result.medianReprojectionPx,
-                result.imageCoverage, stableCount, lockedTransform != null, peerReady, latestRangeM, rangeDelta)
+            latestQuality = Quality(
+                confidence,
+                result.inliers,
+                result.correspondences,
+                result.medianReprojectionPx,
+                result.imageCoverage,
+                stableCount,
+                lockedTransform != null,
+                peerReady,
+                latestRangeM,
+                rangeDelta,
+            )
             listener.onAlignmentQuality(latestQuality)
             return
         }
@@ -185,8 +227,18 @@ class AlignmentCoordinator(
         localConfidence = confidence
         val ready = lockedTransform != null
         transport.sendQuality(confidence, stableCount, ready)
-        latestQuality = Quality(confidence, result.inliers, result.correspondences, result.medianReprojectionPx,
-            result.imageCoverage, stableCount, ready, peerReady, latestRangeM, rangeDelta)
+        latestQuality = Quality(
+            confidence,
+            result.inliers,
+            result.correspondences,
+            result.medianReprojectionPx,
+            result.imageCoverage,
+            stableCount,
+            ready,
+            peerReady,
+            latestRangeM,
+            rangeDelta,
+        )
         listener.onAlignmentQuality(latestQuality)
         publishPendingPoiIfPossible()
     }
@@ -215,25 +267,44 @@ class AlignmentCoordinator(
         val poi = pendingPoi ?: return
         val transform = lockedTransform ?: return
         val p = AlignmentEngine.transformPoint(transform, poi.pointWorld)
-        listener.onRemotePoi(floatArrayOf(p[0].toFloat(), p[1].toFloat(), p[2].toFloat()), poi.owner, localConfidence)
+        listener.onRemotePoi(
+            floatArrayOf(p[0].toFloat(), p[1].toFloat(), p[2].toFloat()),
+            poi.owner,
+            localConfidence,
+        )
     }
 
-    @Synchronized private fun resetAlignment() {
+    @Synchronized private fun resetAlignment(clearFrames: Boolean, clearPoi: Boolean) {
         solveSerial.incrementAndGet()
+        if (clearFrames) {
+            localFrame.set(null)
+            remoteFrame.set(null)
+        }
         lockedTransform = null
         candidateTransform = null
         stableHistory.clear()
         stableCount = 0
         localConfidence = 0f
         peerReady = false
+        trackingLostAtMs = 0L
+        lastSolveStartedMs = 0L
         latestQuality = Quality(rangeM = latestRangeM)
+        if (clearPoi) {
+            pendingPoi = null
+            listener.onPoiCleared()
+        }
         if (transport.connected) transport.sendQuality(0f, 0, false)
         listener.onAlignmentQuality(latestQuality)
     }
 
     private fun emitQuality() {
-        latestQuality = latestQuality.copy(confidence = localConfidence, stableCount = stableCount,
-            localReady = lockedTransform != null, peerReady = peerReady, rangeM = latestRangeM)
+        latestQuality = latestQuality.copy(
+            confidence = localConfidence,
+            stableCount = stableCount,
+            localReady = lockedTransform != null,
+            peerReady = peerReady,
+            rangeM = latestRangeM,
+        )
         listener.onAlignmentQuality(latestQuality)
     }
 
