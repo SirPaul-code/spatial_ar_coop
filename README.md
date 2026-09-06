@@ -2,6 +2,8 @@
 
 Fresh Android proof of concept for sharing a physical 3D point between two phones **without an access point, router, external server, Cloud Anchors, pre-scanned map, or stored common origin**.
 
+> Current production tracking architecture and hardening details: [`docs/PRODUCTION_TRACKING.md`](docs/PRODUCTION_TRACKING.md)
+
 The runtime is fully peer-to-peer:
 
 ```text
@@ -55,7 +57,7 @@ Primary solve is metric 3D-to-2D PnP:
 2. Both phones exchange grayscale camera frames, intrinsics, camera poses, and selected metric samples.
 3. OpenCV SIFT finds cross-view correspondences locally on each phone.
 4. Remote matched pixels are associated with metric remote-world support points.
-5. `solvePnPRansac` + LM refinement estimates the remote world in the local camera.
+5. `solvePnPRansac` + refinement estimates the remote world in the local camera.
 6. OpenCV camera axes are converted to ARCore axes.
 7. The result is composed with the local ARCore camera pose to produce `T_localWorld_remoteWorld`.
 8. A remote POI is transformed into the receiver's local world and reprojected every AR frame.
@@ -80,11 +82,13 @@ These gates intentionally prefer refusing a weak placement over displaying a con
 
 ### POI placement
 
-Tap depth uses a local 5×5 ARCore depth neighborhood instead of trusting one pixel:
+Tap depth uses robust ARCore metric geometry instead of trusting one pixel:
 
-- median valid depth,
+- Raw Depth + confidence when available,
+- local median depth,
 - median absolute deviation rejection,
-- ARCore hit-test fallback when dense depth is unavailable.
+- full depth / ARCore hit-test fallback when needed,
+- POIs are retained as local ARCore Anchors and updated as ARCore refines its map.
 
 ### AR UI
 
@@ -163,12 +167,13 @@ Real-world accuracy still has to be measured on physical devices; CI verifies th
 ## Repository layout
 
 ```text
-android/                    Native Kotlin + ARCore + OpenCV V2 runtime
-scripts/                    Build and ADB sideload helpers
-.github/workflows/ci.yml    Android build verification + APK artifact
-docs/RESEARCH.md            Research, observability limits, error budgets
-docs/PROTOCOL.md            Direct SPV2 peer protocol
-docs/V2_IMPLEMENTATION.md   V2 implementation details and field checks
+android/                         Native Kotlin + ARCore + OpenCV runtime
+scripts/                         Build and ADB sideload helpers
+.github/workflows/ci.yml         Android build verification + APK artifact
+docs/RESEARCH.md                 Research, observability limits, error budgets
+docs/PROTOCOL.md                 Direct SPV2 peer protocol
+docs/V2_IMPLEMENTATION.md        Original V2 implementation details
+docs/PRODUCTION_TRACKING.md      Current production tracking architecture/hardening
 ```
 
-The fresh V2 branch intentionally contains no FastAPI/Docker runtime. The alignment engine now lives on-device in the Android app.
+The fresh V2 branch intentionally contains no FastAPI/Docker runtime. The alignment engine lives on-device in the Android app.
