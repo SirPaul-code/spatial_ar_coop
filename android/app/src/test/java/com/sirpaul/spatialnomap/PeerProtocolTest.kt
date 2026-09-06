@@ -2,6 +2,8 @@ package com.sirpaul.spatialnomap
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -117,11 +119,41 @@ class PeerProtocolTest {
         assertEquals(0.73f, q.confidence, 1e-6f)
         assertEquals(4, q.stableCount)
         assertTrue(q.ready)
+        assertNull(q.senderFromPeer)
 
         val r = roundTrip(WireMessage.Range(3.42f, 0.18f, 7)) as WireMessage.Range
         assertEquals(3.42f, r.distanceM, 1e-6f)
         assertEquals(0.18f, r.stdDevM, 1e-6f)
         assertEquals(7, r.samples)
+    }
+
+    @Test
+    fun solvedTransformRoundTripPreservesFullSe3() {
+        val transform = doubleArrayOf(
+            0.8660254, 0.0, -0.5, 1.25,
+            0.0, 1.0, 0.0, -0.2,
+            0.5, 0.0, 0.8660254, 3.4,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        val q = roundTrip(
+            WireMessage.AlignmentTransform(
+                senderFromPeer = transform,
+                confidence = 0.81f,
+                inliers = 23,
+                medianReprojectionPx = 1.7f,
+                source = "VISION+IMU+RADIO",
+            ),
+        ) as WireMessage.Quality
+
+        val restored = q.senderFromPeer
+        assertNotNull(restored)
+        restored!!
+        repeat(16) { assertEquals(transform[it], restored[it], 1e-10) }
+        assertEquals(0.81f, q.confidence, 1e-6f)
+        assertEquals(23, q.transformInliers)
+        assertEquals(1.7f, q.transformMedianReprojectionPx, 1e-6f)
+        assertEquals("VISION+IMU+RADIO", q.transformSource)
+        assertTrue(q.ready)
     }
 
     @Test
