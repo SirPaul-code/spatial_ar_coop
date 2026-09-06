@@ -17,6 +17,20 @@ sealed class WireMessage {
     data class Range(val distanceM: Float, val stdDevM: Float, val samples: Int) : WireMessage()
     data class Quality(val confidence: Float, val stableCount: Int, val ready: Boolean) : WireMessage()
     data class ResetAlignment(val reason: String) : WireMessage()
+
+    /**
+     * A sender that solved T_senderWorld_from_peerWorld shares the actual SE(3)
+     * transform, not just a boolean "ready" flag. The receiver can invert it to
+     * obtain T_receiverWorld_from_senderWorld. This means one strong solve is
+     * enough to bootstrap both phones and the second solve becomes verification.
+     */
+    data class AlignmentTransform(
+        val senderFromPeer: DoubleArray,
+        val confidence: Float,
+        val inliers: Int,
+        val medianReprojectionPx: Float,
+        val source: String,
+    ) : WireMessage()
 }
 
 object PeerProtocol {
@@ -30,6 +44,7 @@ object PeerProtocol {
     private const val T_RANGE = 5
     private const val T_QUALITY = 6
     private const val T_RESET_ALIGNMENT = 7
+    private const val T_ALIGNMENT_TRANSFORM = 8
 
     fun write(output: OutputStream, message: WireMessage) {
         val payload = ByteArrayOutputStream()
@@ -58,6 +73,14 @@ object PeerProtocol {
                     out.writeBoolean(message.ready)
                 }
                 is WireMessage.ResetAlignment -> out.writeUTF(message.reason.take(128))
+                is WireMessage.AlignmentTransform -> {
+                    require(message.senderFromPeer.size >= 16) { "alignment transform must contain 16 values" }
+                    repeat(16) { out.writeDouble(message.senderFromPeer[it]) }
+                    out.writeFloat(message.confidence)
+                    out.writeInt(message.inliers)
+                    out.writeFloat(message.medianReprojectionPx)
+                    out.writeUTF(message.source.take(48))
+                }
             }
         }
 
@@ -71,6 +94,7 @@ object PeerProtocol {
             is WireMessage.Range -> T_RANGE
             is WireMessage.Quality -> T_QUALITY
             is WireMessage.ResetAlignment -> T_RESET_ALIGNMENT
+            is WireMessage.AlignmentTransform -> T_ALIGNMENT_TRANSFORM
         }
 
         val out = DataOutputStream(output)
@@ -112,6 +136,13 @@ object PeerProtocol {
                 T_RANGE -> WireMessage.Range(data.readFloat(), data.readFloat(), data.readInt())
                 T_QUALITY -> WireMessage.Quality(data.readFloat(), data.readInt(), data.readBoolean())
                 T_RESET_ALIGNMENT -> WireMessage.ResetAlignment(data.readUTF())
+                T_ALIGNMENT_TRANSFORM -> WireMessage.AlignmentTransform(
+                    senderFromPeer = DoubleArray(16) { data.readDouble() },
+                    confidence = data.readFloat(),
+                    inliers = data.readInt(),
+                    medianReprojectionPx = data.readFloat(),
+                    source = data.readUTF(),
+                )
                 else -> throw IllegalArgumentException("unknown wire type $type")
             }
         }
