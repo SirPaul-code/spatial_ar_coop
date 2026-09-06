@@ -64,6 +64,12 @@ class ArRenderer(
     private var lastFrameError = ""
     private var lastFrameErrorAtMs = 0L
 
+    init {
+        // TargetOverlayView sits above GLSurfaceView and owns the complete gesture
+        // stream. Forward accepted short taps into the GL-thread POI queue.
+        overlay.onSceneTap = { x, y -> queueTap(x, y) }
+    }
+
     fun queueTap(x: Float, y: Float) {
         pendingTap.set(floatArrayOf(x, y))
     }
