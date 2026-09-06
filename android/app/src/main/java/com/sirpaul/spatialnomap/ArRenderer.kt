@@ -3,6 +3,7 @@ package com.sirpaul.spatialnomap
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
+import android.os.SystemClock
 import com.google.ar.core.Camera
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.DepthPoint
@@ -32,11 +33,11 @@ class ArRenderer(
     private val background = CameraBackgroundRenderer()
     private val pendingTap = AtomicReference<FloatArray?>(null)
     private val remoteTarget = AtomicReference<RemoteTarget?>(null)
+    private val trackingGate = TrackingStabilityGate(acquireMs = 300L, lossMs = 1000L)
     private var width = 1
     private var height = 1
     private var textureBoundSession: Session? = null
     private var lastCaptureNs = 0L
-    private var lastTrackingText = ""
     private var lastFrameError = ""
     private var lastFrameErrorAtMs = 0L
 
@@ -57,8 +58,8 @@ class ArRenderer(
         textureBoundSession = null
         pendingTap.set(null)
         lastCaptureNs = 0L
-        lastTrackingText = ""
         lastFrameError = ""
+        trackingGate.reset()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -96,15 +97,15 @@ class ArRenderer(
             background.draw(frame)
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
+
+            // Alignment still receives raw frame-by-frame tracking so a sustained
+            // loss can invalidate geometry. The HUD gets hysteresis separately to
+            // avoid READY/ACQUIRING flicker from one or two paused frames.
             coordinator.onTrackingState(tracking)
-            val text = if (tracking) {
-                "AR tracking"
-            } else {
-                "AR ${camera.trackingState} / ${camera.trackingFailureReason}"
-            }
-            if (text != lastTrackingText) {
-                lastTrackingText = text
-                status(text)
+            when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
+                true -> status("AR tracking")
+                false -> status("AR PAUSED / ${camera.trackingFailureReason}")
+                null -> Unit
             }
             if (!tracking) return
 
@@ -112,10 +113,12 @@ class ArRenderer(
             captureIfDue(frame, camera)
             projectRemoteTarget(camera)
         } catch (t: Throwable) {
+            // A late GL callback can race Activity.onPause. This is not a user
+            // facing AR failure; the renderer gate prevents the next frame.
             if (t.javaClass.simpleName == "SessionPausedException") return
-            val error = "${t.javaClass.simpleName}: ${t.message}"
+            val error = errorText(t)
             val now = System.currentTimeMillis()
-            if (error != lastFrameError || now - lastFrameErrorAtMs > 2000L) {
+            if (error != lastFrameError || now - lastFrameErrorAtMs > 2500L) {
                 lastFrameError = error
                 lastFrameErrorAtMs = now
                 status("AR frame error: $error")
@@ -207,5 +210,20 @@ class ArRenderer(
                 target.confidence,
             ),
         )
+    }
+
+    private fun errorText(t: Throwable): String {
+        val parts = ArrayList<String>(3)
+        var current: Throwable? = t
+        repeat(3) {
+            val c = current ?: return@repeat
+            val item = buildString {
+                append(c.javaClass.simpleName)
+                c.message?.takeIf { it.isNotBlank() }?.let { append(": ").append(it) }
+            }
+            if (item !in parts) parts += item
+            current = c.cause
+        }
+        return parts.joinToString(" <- ").ifBlank { t.javaClass.name }
     }
 }
