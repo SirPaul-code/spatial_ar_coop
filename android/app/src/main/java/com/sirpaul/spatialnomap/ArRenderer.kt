@@ -24,7 +24,7 @@ class ArRenderer(
     private val usernameProvider: () -> String,
     private val status: (String) -> Unit,
     private val rotationProvider: () -> Int,
-    private val sensorSnapshotProvider: () -> SensorSnapshot = { SensorSnapshot() },
+    private val sensorSnapshotProvider: () -> SensorSnapshot = { SpatialSyncApplication.sensorSnapshot() },
 ) : GLSurfaceView.Renderer {
     private data class RemoteTarget(val point: FloatArray, val owner: String, val confidence: Float)
 
