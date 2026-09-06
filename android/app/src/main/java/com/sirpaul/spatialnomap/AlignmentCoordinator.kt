@@ -446,6 +446,19 @@ class AlignmentCoordinator(
             coarseSource = "PEER:${message.transformSource.ifBlank { "FUSED" }}"
             peerTransformVerified = true
             transport.sendQuality(localConfidence, stableCount, true)
+
+            // Explicit reciprocal acknowledgement. Without this, the original
+            // solver only receives a scalar READY and cannot prove that the peer
+            // actually accepted the same SE(3). Sending the inverse back lets the
+            // solver compare transforms and mark both phones READY without forcing
+            // the receiver to independently solve the whole scene again.
+            transport.sendAlignmentTransform(
+                senderFromPeer = localFromPeerSender,
+                confidence = localConfidence,
+                inliers = message.transformInliers,
+                medianReprojectionPx = message.transformMedianReprojectionPx,
+                source = "PEER_ACK",
+            )
         } else {
             val (translationDelta, rotationDelta) = AlignmentEngine.transformDelta(existing, localFromPeerSender)
             if (translationDelta <= PEER_VERIFY_TRANSLATION_M && rotationDelta <= PEER_VERIFY_ROTATION_DEG) {
