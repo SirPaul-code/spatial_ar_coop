@@ -19,14 +19,14 @@ if (!stableDevStore.exists()) {
 val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
 val ciRunAttempt = System.getenv("GITHUB_RUN_ATTEMPT")?.toIntOrNull() ?: 0
 val generatedVersionCode = if (ciRunNumber != null) {
-    400_000 + ciRunNumber * 10 + ciRunAttempt
+    500_000 + ciRunNumber * 10 + ciRunAttempt
 } else {
-    400_000
+    500_000
 }
 val generatedVersionName = if (ciRunNumber != null) {
-    "0.4.0-dev.${ciRunNumber}.${ciRunAttempt}"
+    "0.5.0-fusion.${ciRunNumber}.${ciRunAttempt}"
 } else {
-    "0.4.0-dev.local"
+    "0.5.0-fusion.local"
 }
 
 android {
