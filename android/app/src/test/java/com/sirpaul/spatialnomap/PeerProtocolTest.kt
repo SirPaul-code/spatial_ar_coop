@@ -23,7 +23,7 @@ class PeerProtocolTest {
     }
 
     @Test
-    fun frameRoundTripPreservesCameraGeometryAndMetricSupports() {
+    fun frameRoundTripPreservesCameraGeometryMetricSupportsAndSensorFusion() {
         val jpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 1, 2, 3, 4, 0xff.toByte(), 0xd9.toByte())
         val original = CapturedFrame(
             timestampNs = 987654321L,
@@ -43,6 +43,20 @@ class PeerProtocolTest {
             metricPoints = listOf(
                 floatArrayOf(100f, 120f, 1f, 2f, 3f),
                 floatArrayOf(500f, 220f, -4f, 0.5f, 8f),
+            ),
+            sensors = SensorSnapshot(
+                elapsedRealtimeNs = 555_000_111L,
+                headingDeg = 173.25f,
+                pitchDeg = -7.5f,
+                rollDeg = 2.75f,
+                orientationQuality = 0.82f,
+                latitudeDeg = 48.998765,
+                longitudeDeg = 21.239876,
+                altitudeM = 274.6,
+                horizontalAccuracyM = 3.25f,
+                verticalAccuracyM = 4.75f,
+                pressureHpa = 1004.2f,
+                gyroRadS = floatArrayOf(0.11f, -0.22f, 0.33f),
             ),
         )
 
@@ -67,6 +81,21 @@ class PeerProtocolTest {
                 )
             }
         }
+
+        val expected = original.sensors
+        val actual = result.sensors
+        assertEquals(expected.elapsedRealtimeNs, actual.elapsedRealtimeNs)
+        assertEquals(expected.headingDeg, actual.headingDeg, 1e-6f)
+        assertEquals(expected.pitchDeg, actual.pitchDeg, 1e-6f)
+        assertEquals(expected.rollDeg, actual.rollDeg, 1e-6f)
+        assertEquals(expected.orientationQuality, actual.orientationQuality, 1e-6f)
+        assertEquals(expected.latitudeDeg, actual.latitudeDeg, 1e-9)
+        assertEquals(expected.longitudeDeg, actual.longitudeDeg, 1e-9)
+        assertEquals(expected.altitudeM, actual.altitudeM, 1e-9)
+        assertEquals(expected.horizontalAccuracyM, actual.horizontalAccuracyM, 1e-6f)
+        assertEquals(expected.verticalAccuracyM, actual.verticalAccuracyM, 1e-6f)
+        assertEquals(expected.pressureHpa, actual.pressureHpa, 1e-6f)
+        repeat(3) { assertEquals(expected.gyroRadS[it], actual.gyroRadS[it], 1e-6f) }
     }
 
     @Test
@@ -111,7 +140,7 @@ class PeerProtocolTest {
         val out = ByteArrayOutputStream()
         PeerProtocol.write(out, WireMessage.Hello("A", "B"))
         val bytes = out.toByteArray()
-        bytes[4] = 99.toByte() // 4-byte magic is followed by 1-byte protocol version.
+        bytes[4] = 99.toByte()
         var rejected = false
         try {
             PeerProtocol.read(ByteArrayInputStream(bytes))
