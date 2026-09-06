@@ -33,6 +33,26 @@ sealed class WireMessage {
     ) : WireMessage()
 
     data class ResetAlignment(val reason: String) : WireMessage()
+
+    companion object {
+        /** Factory kept named for transport readability without adding a new wire subtype. */
+        @Suppress("FunctionName")
+        fun AlignmentTransform(
+            senderFromPeer: DoubleArray,
+            confidence: Float,
+            inliers: Int,
+            medianReprojectionPx: Float,
+            source: String,
+        ): Quality = Quality(
+            confidence = confidence,
+            stableCount = 0,
+            ready = true,
+            senderFromPeer = senderFromPeer,
+            transformInliers = inliers,
+            transformMedianReprojectionPx = medianReprojectionPx,
+            transformSource = source,
+        )
+    }
 }
 
 object PeerProtocol {
