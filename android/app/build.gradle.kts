@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.sirpaul.spatialnomap"
-        minSdk = 29
+        minSdk = 31
         targetSdk = 36
         versionCode = 3
         versionName = "0.3.0-dev"
