@@ -8,7 +8,10 @@ import android.graphics.drawable.GradientDrawable
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
@@ -33,6 +36,7 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     private lateinit var renderer: ArRenderer
     private lateinit var transport: WifiAwarePeerTransport
     private lateinit var coordinator: AlignmentCoordinator
+
     private lateinit var setupCard: LinearLayout
     private lateinit var usernameEdit: EditText
     private lateinit var roomList: LinearLayout
@@ -46,15 +50,22 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     private lateinit var clearButton: TextView
     private lateinit var cameraButton: TextView
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val random = SecureRandom()
+
     private var session: Session? = null
     private var installRequested = false
     private var surfaceResumed = false
+    private var activityResumed = false
     private var peerConnectedOnce = false
     private var openCvReady = false
     private var arStarting = false
+    private var arRetryCount = 0
     private var cameraChoices: List<ArCameraCatalog.Choice> = emptyList()
-    private var activeCameraIndex = 0
-    private val random = SecureRandom()
+    private var activeCameraIndex = -1
+    private var activeRoomCode: String? = null
+    private var bannerSerial = 0L
+    private var lastTransportError = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,89 +89,129 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                 if (event.action == MotionEvent.ACTION_UP && setupCard.visibility != View.VISIBLE) {
                     renderer.queueTap(event.x, event.y)
                     true
-                } else false
+                } else {
+                    false
+                }
             }
         }
 
         val root = FrameLayout(this)
-        root.addView(surface, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        root.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        root.addView(buildHud(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        root.addView(surface, matchParent())
+        root.addView(overlay, matchParent())
+        root.addView(
+            buildHud(),
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP),
+        )
 
         setupCard = buildSetupCard()
-        root.addView(setupCard, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {
-            leftMargin = dp(22)
-            rightMargin = dp(22)
-        })
+        root.addView(
+            setupCard,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM).apply {
+                leftMargin = dp(14)
+                rightMargin = dp(14)
+                bottomMargin = dp(92)
+            },
+        )
 
         clearButton = buildClearButton()
-        root.addView(clearButton, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = dp(30)
-        })
+        root.addView(
+            clearButton,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48), Gravity.BOTTOM or Gravity.START).apply {
+                leftMargin = dp(18)
+                bottomMargin = dp(26)
+            },
+        )
 
         cameraButton = buildCameraButton()
-        root.addView(cameraButton, FrameLayout.LayoutParams(dp(72), dp(48), Gravity.BOTTOM or Gravity.END).apply {
-            rightMargin = dp(18)
-            bottomMargin = dp(30)
-        })
+        root.addView(
+            cameraButton,
+            FrameLayout.LayoutParams(dp(76), dp(48), Gravity.BOTTOM or Gravity.END).apply {
+                rightMargin = dp(18)
+                bottomMargin = dp(26)
+            },
+        )
 
         banner = buildBanner()
-        root.addView(banner, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
-            leftMargin = dp(18)
-            rightMargin = dp(18)
-            topMargin = dp(88)
-        })
+        root.addView(
+            banner,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
+                leftMargin = dp(18)
+                rightMargin = dp(18)
+                topMargin = dp(94)
+            },
+        )
 
         setContentView(root)
         refreshCapabilities()
     }
 
+    private fun matchParent() = FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.MATCH_PARENT,
+    )
+
     private fun buildHud(): LinearLayout {
         val out = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(8))
+            setPadding(dp(12), dp(12), dp(12), dp(6))
         }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        transportPill = pill("OFFLINE", 0xcc1d2228.toInt()).apply {
-            setOnClickListener { if (setupCard.visibility == View.VISIBLE) hideSetup() else showSetup() }
+        transportPill = pill("OFFLINE", 0xc91b2025.toInt()).apply {
+            contentDescription = "Connection settings"
+            setOnClickListener {
+                haptic()
+                if (setupCard.visibility == View.VISIBLE) hideSetup() else showSetup()
+            }
         }
-        syncPill = pill("NOT SYNCED", 0xcc1d2228.toInt())
-        row.addView(transportPill, LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(8) })
-        row.addView(syncPill, LinearLayout.LayoutParams(0, dp(42), 1f))
+        syncPill = pill("AR STARTING", 0xc91b2025.toInt())
+        row.addView(transportPill, LinearLayout.LayoutParams(0, dp(38), 1f).apply { rightMargin = dp(7) })
+        row.addView(syncPill, LinearLayout.LayoutParams(0, dp(38), 1f))
+
         detailPill = TextView(this).apply {
-            setTextColor(0xffd6dde4.toInt())
-            textSize = 12f
+            setTextColor(0xffd8e0e5.toInt())
+            textSize = 11.5f
             gravity = Gravity.CENTER
-            text = "Direct peer AR • no AP • no cloud"
-            background = rounded(0x99111418.toInt(), 18f)
-            setPadding(dp(12), dp(5), dp(12), dp(5))
+            maxLines = 1
+            text = "Starting local AR…"
+            background = rounded(0x8f101418.toInt(), 16f)
+            setPadding(dp(11), dp(4), dp(11), dp(4))
         }
         out.addView(row)
-        out.addView(detailPill, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(32)).apply { topMargin = dp(7) })
+        out.addView(
+            detailPill,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(29)).apply { topMargin = dp(6) },
+        )
         return out
     }
 
     private fun buildSetupCard(): LinearLayout {
-        val prefs = getSharedPreferences("spatial-v2", MODE_PRIVATE)
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(22), dp(22), dp(20))
-            background = rounded(0xf0161b20.toInt(), 28f, 0x334fffc3, 1)
+            setPadding(dp(18), dp(15), dp(18), dp(15))
+            background = rounded(0xed11171c.toInt(), 24f, 0x554fffc3, 1)
+            elevation = dp(10).toFloat()
         }
-        card.addView(TextView(this).apply {
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(TextView(this).apply {
             text = "SPATIAL SYNC"
             setTextColor(Color.WHITE)
-            textSize = 27f
+            textSize = 20f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
-        })
-        card.addView(TextView(this).apply {
-            text = "Two phones. One shared point. No router."
-            setTextColor(0xff9eabb5.toInt())
-            textSize = 14f
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(3)
-            bottomMargin = dp(18)
-        })
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(TextView(this).apply {
+            text = "×"
+            gravity = Gravity.CENTER
+            textSize = 26f
+            setTextColor(0xffaeb8bf.toInt())
+            contentDescription = "Close setup"
+            setOnClickListener { hideSetup() }
+        }, LinearLayout.LayoutParams(dp(42), dp(42)))
+        card.addView(header)
 
         usernameEdit = EditText(this).apply {
             hint = "Username"
@@ -168,76 +219,99 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             setText(prefs.getString("username", Build.MODEL.replace("SM-", "Galaxy ")))
             setTextColor(Color.WHITE)
             setHintTextColor(0xff6f7b84.toInt())
-            textSize = 16f
-            background = rounded(0xff22292f.toInt(), 18f, 0x334fffc3, 1)
-            setPadding(dp(16), 0, dp(16), 0)
+            textSize = 15f
+            background = rounded(0xff20272d.toInt(), 15f, 0x334fffc3, 1)
+            setPadding(dp(14), 0, dp(14), 0)
         }
-        card.addView(usernameEdit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)))
+        card.addView(usernameEdit, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
 
-        card.addView(primaryButton("CREATE SPACE") {
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        actions.addView(primaryButton("CREATE") {
             if (!ensurePeerPermissions()) return@primaryButton
             saveUsername()
             roomList.removeAllViews()
             val code = generateRoomCode()
-            setupStatus.text = "Creating room $code…"
+            activeRoomCode = code
+            setupStatus.text = "Creating $code…"
             runCatching { transport.createRoom(username(), code) }
-                .onSuccess { hideSetup(); showBanner("Space $code created", "Waiting for a nearby phone") }
-                .onFailure { showBanner("Create space failed", "${it.javaClass.simpleName}: ${it.message}") }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)).apply { topMargin = dp(14) })
-
-        card.addView(secondaryButton("JOIN NEARBY") {
+                .onSuccess {
+                    transportPill.text = "HOST • $code"
+                    hideSetup()
+                    haptic()
+                    showBanner("Space $code created", "Camera stays live while we wait for the second phone")
+                }
+                .onFailure {
+                    activeRoomCode = null
+                    showBanner("Create space failed", errorText(it))
+                }
+        }, LinearLayout.LayoutParams(0, dp(49), 1f).apply { rightMargin = dp(6) })
+        actions.addView(secondaryButton("JOIN NEARBY") {
             if (!ensurePeerPermissions()) return@secondaryButton
             saveUsername()
             roomList.removeAllViews()
             setupStatus.text = "Scanning nearby rooms…"
             runCatching { transport.scanRooms(username()) }
-                .onFailure { showBanner("Nearby scan failed", "${it.javaClass.simpleName}: ${it.message}") }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply { topMargin = dp(10) })
+                .onFailure { showBanner("Nearby scan failed", errorText(it)) }
+        }, LinearLayout.LayoutParams(0, dp(49), 1f).apply { leftMargin = dp(6) })
+        card.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(49)).apply { topMargin = dp(10) })
 
         setupStatus = TextView(this).apply {
-            setTextColor(0xffb9c5cd.toInt())
-            textSize = 13f
-            text = "Choose CREATE on one phone and JOIN NEARBY on the other."
-            setPadding(dp(2), dp(14), dp(2), dp(8))
+            setTextColor(0xffaebbc4.toInt())
+            textSize = 12.5f
+            text = "Create on one phone, Join Nearby on the other."
+            maxLines = 2
+            setPadding(dp(2), dp(10), dp(2), dp(5))
         }
         card.addView(setupStatus)
+
         roomList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        card.addView(ScrollView(this).apply { addView(roomList) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(144)))
+        card.addView(
+            ScrollView(this).apply {
+                isFillViewport = true
+                addView(roomList)
+            },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(92)),
+        )
         return card
     }
 
     private fun buildBanner(): LinearLayout {
         val view = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(14), dp(18), dp(14))
-            background = rounded(0xee1a2126.toInt(), 24f, 0x664fffc3, 1)
+            setPadding(dp(17), dp(12), dp(17), dp(12))
+            background = rounded(0xee171e23.toInt(), 20f, 0x6655f0bd, 1)
             alpha = 0f
             visibility = View.GONE
+            elevation = dp(12).toFloat()
         }
         bannerTitle = TextView(this).apply {
             setTextColor(Color.WHITE)
-            textSize = 16f
+            textSize = 15.5f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
         bannerSubtitle = TextView(this).apply {
-            setTextColor(0xffaebbc4.toInt())
-            textSize = 13f
+            setTextColor(0xffb6c1c8.toInt())
+            textSize = 12.5f
+            maxLines = 3
         }
         view.addView(bannerTitle)
-        view.addView(bannerSubtitle)
+        view.addView(bannerSubtitle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(2)
+        })
         return view
     }
 
     private fun buildClearButton() = TextView(this).apply {
-        text = "CLEAR POI"
+        text = "CLEAR"
         gravity = Gravity.CENTER
         setTextColor(Color.WHITE)
-        textSize = 13f
+        textSize = 12.5f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
-        setPadding(dp(22), 0, dp(22), 0)
-        background = rounded(0xd91b2228.toInt(), 24f, 0x445f6a72, 1)
+        setPadding(dp(18), 0, dp(18), 0)
+        background = rounded(0xd5161c21.toInt(), 24f, 0x445f6a72, 1)
         visibility = View.GONE
         setOnClickListener {
+            haptic()
             coordinator.clearPoi(true)
             renderer.setRemoteTarget(null)
             showBanner("POI cleared", "Removed from both devices")
@@ -250,19 +324,29 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         setTextColor(Color.WHITE)
         textSize = 13f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
-        background = rounded(0xd91b2228.toInt(), 24f, 0x445f6a72, 1)
-        setOnClickListener { showCameraMenu(this) }
+        background = rounded(0xe0161c21.toInt(), 24f, 0x6655f0bd, 1)
+        contentDescription = "Select AR camera"
+        setOnClickListener {
+            haptic()
+            showCameraMenu(this)
+        }
     }
 
     private fun showCameraMenu(anchor: View) {
         if (cameraChoices.isEmpty()) {
-            showBanner("Camera selector", "ARCore exposes only the current compatible camera on this device")
+            showBanner("Camera selector", "ARCore did not expose another compatible tracking camera")
             return
         }
+        if (cameraChoices.size == 1) {
+            val only = cameraChoices.first()
+            showBanner("${only.label} AR camera", "${only.detail}. Samsung may expose more lenses to the Camera app than ARCore exposes for tracking.")
+            return
+        }
+
         val menu = PopupMenu(this, anchor)
         cameraChoices.forEachIndexed { index, choice ->
-            val suffix = if (index == activeCameraIndex) " ✓" else ""
-            menu.menu.add(0, index, index, "${choice.label}  [AR camera ${choice.cameraId}]$suffix")
+            val selected = if (index == activeCameraIndex) "  ✓" else ""
+            menu.menu.add(0, index, index, "${choice.label}   ${choice.imageWidth}×${choice.imageHeight}$selected")
         }
         menu.setOnMenuItemClickListener {
             switchArCamera(it.itemId)
@@ -271,48 +355,83 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         menu.show()
     }
 
-    private fun switchArCamera(index: Int) {
+    @Synchronized private fun switchArCamera(index: Int) {
         val s = session ?: return
         val choice = cameraChoices.getOrNull(index) ?: return
-        if (index == activeCameraIndex) return
+        if (index == activeCameraIndex || !activityResumed) return
+
+        val oldConfig = runCatching { s.cameraConfig }.getOrNull()
+        val oldIndex = activeCameraIndex
+        var cameraConfigTouched = false
+
+        renderer.detachSession()
+        pauseSurfaceOnly()
+        runCatching { s.pause() }
+
         try {
-            renderer.sessionResumed = false
-            s.pause()
             s.cameraConfig = choice.config
-            val config = buildArConfig(s)
-            s.configure(config)
+            cameraConfigTouched = true
+            val configured = configureBestAvailable(s)
             s.resume()
             renderer.session = s
             renderer.sessionResumed = true
+            resumeSurfaceOnly()
+
             activeCameraIndex = index
             cameraButton.text = choice.label
-            coordinator.onCameraChanged()
-            renderer.setRemoteTarget(null)
-            showBanner("Camera ${choice.label}", "AR tracking restarted for this lens")
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("camera_id", choice.cameraId).apply()
+
+            // Camera images, intrinsics, metric depth supports and ARCore world
+            // state all belong to the selected camera. Discard old frame pairs and
+            // force both phones to solve a fresh SE(3) transform.
+            coordinator.onCameraChanged("camera ${choice.cameraId}")
+            haptic()
+            showBanner("Camera ${choice.label}", "${choice.detail} • depth ${configured.depthMode} • re-aligning both phones")
         } catch (t: Throwable) {
-            renderer.sessionResumed = false
-            showBanner("Camera switch failed", "${t.javaClass.simpleName}: ${t.message}")
-            runCatching { s.resume(); renderer.sessionResumed = true }
+            renderer.detachSession()
+            val restored = runCatching {
+                if (cameraConfigTouched && oldConfig != null) s.cameraConfig = oldConfig
+                configureBestAvailable(s)
+                s.resume()
+                renderer.session = s
+                renderer.sessionResumed = true
+                resumeSurfaceOnly()
+                activeCameraIndex = oldIndex
+                cameraChoices.getOrNull(oldIndex)?.let { cameraButton.text = it.label }
+            }.isSuccess
+
+            coordinator.onCameraChanged("camera switch recovery")
+            if (restored) {
+                showBanner("Camera switch failed", "${errorText(t)} • restored previous AR camera")
+            } else {
+                showBanner("AR camera recovery", "${errorText(t)} • recreating AR session")
+                disposeArSession()
+                scheduleArRetry(immediate = true)
+            }
         }
     }
 
     private fun primaryButton(label: String, action: () -> Unit) = Button(this).apply {
         text = label
-        setTextColor(0xff071713.toInt())
-        textSize = 14f
+        setTextColor(0xff061612.toInt())
+        textSize = 13.5f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
         stateListAnimator = null
-        background = rounded(0xff4fffc3.toInt(), 18f)
+        minHeight = 0
+        minimumHeight = 0
+        background = rounded(0xff55f0bd.toInt(), 16f)
         setOnClickListener { action() }
     }
 
     private fun secondaryButton(label: String, action: () -> Unit) = Button(this).apply {
         text = label
         setTextColor(Color.WHITE)
-        textSize = 14f
+        textSize = 13f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
         stateListAnimator = null
-        background = rounded(0xff252d33.toInt(), 18f, 0x445f6a72, 1)
+        minHeight = 0
+        minimumHeight = 0
+        background = rounded(0xff242c32.toInt(), 16f, 0x445f6a72, 1)
         setOnClickListener { action() }
     }
 
@@ -320,27 +439,31 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         text = label
         gravity = Gravity.CENTER
         setTextColor(Color.WHITE)
-        textSize = 12f
+        textSize = 11.5f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
-        background = rounded(color, 20f)
+        maxLines = 1
+        background = rounded(color, 18f)
     }
 
-    private fun rounded(fill: Int, radiusDp: Float, strokeColor: Int? = null, strokeWidth: Int = 0) = GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        setColor(fill)
-        cornerRadius = dp(radiusDp).toFloat()
-        if (strokeColor != null && strokeWidth > 0) setStroke(dp(strokeWidth), strokeColor)
-    }
+    private fun rounded(fill: Int, radiusDp: Float, strokeColor: Int? = null, strokeWidth: Int = 0) =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(fill)
+            cornerRadius = dp(radiusDp).toFloat()
+            if (strokeColor != null && strokeWidth > 0) setStroke(dp(strokeWidth), strokeColor)
+        }
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         startArIfPossible()
     }
 
     @Synchronized private fun startArIfPossible() {
-        if (arStarting || renderer.sessionResumed) return
+        if (!activityResumed || arStarting || renderer.sessionResumed) return
         if (!ensureCameraPermission()) return
         arStarting = true
+
         try {
             if (session == null) {
                 when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
@@ -352,62 +475,125 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
                 }
 
                 val s = Session(this)
-                cameraChoices = runCatching { ArCameraCatalog(this, s).choices }.getOrDefault(emptyList())
-                val preferredId = getSharedPreferences("spatial-v2", MODE_PRIVATE).getString("camera_id", null)
-                val preferredIndex = cameraChoices.indexOfFirst { it.cameraId == preferredId }.takeIf { it >= 0 } ?: 0
-                cameraChoices.getOrNull(preferredIndex)?.let {
-                    runCatching { s.cameraConfig = it.config }
-                    activeCameraIndex = preferredIndex
-                    cameraButton.text = it.label
+                session = s
+                val catalog = ArCameraCatalog(this, s)
+                cameraChoices = catalog.choices
+
+                val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+                val preferredId = prefs.getString("camera_id", null)
+                val preferredIndex = catalog.indexForCameraId(preferredId)
+                if (preferredIndex >= 0 && preferredId != catalog.defaultCameraId) {
+                    runCatching { s.cameraConfig = cameraChoices[preferredIndex].config }
                 }
 
-                val config = buildArConfig(s)
-                s.configure(config)
-                session = s
-                setTechnicalStatus("AR configured • depth=${config.depthMode}")
+                activeCameraIndex = catalog.indexForCameraId(s.cameraConfig.cameraId)
+                if (activeCameraIndex < 0) activeCameraIndex = catalog.indexForCameraId(catalog.defaultCameraId)
+                cameraChoices.getOrNull(activeCameraIndex)?.let { cameraButton.text = it.label }
+
+                val configured = configureBestAvailable(s)
+                setTechnicalStatus("AR configured • ${cameraButton.text} • depth ${configured.depthMode}")
             }
 
             val s = session ?: return
             s.resume()
             renderer.session = s
             renderer.sessionResumed = true
-            if (!surfaceResumed) {
-                surface.onResume()
-                surfaceResumed = true
-            }
-            setTechnicalStatus("AR tracking starting…")
+            resumeSurfaceOnly()
+            arRetryCount = 0
+            syncPill.text = "AR ACQUIRING"
+            syncPill.background = rounded(0xc9443818.toInt(), 18f)
+            setTechnicalStatus("Move the phone slightly to initialize tracking")
         } catch (t: Throwable) {
-            renderer.sessionResumed = false
-            renderer.session = null
-            setTechnicalStatus("AR start failed: ${t.javaClass.simpleName}: ${t.message}")
-            showBanner("ARCore failed", "${t.javaClass.simpleName}: ${t.message}")
+            renderer.detachSession()
+            disposeArSession()
+            syncPill.text = "AR ERROR"
+            syncPill.background = rounded(0xd0581f27.toInt(), 18f)
+            setTechnicalStatus("AR start failed: ${errorText(t)}")
+            showBanner("ARCore failed", errorText(t))
+            scheduleArRetry(immediate = false)
         } finally {
             arStarting = false
         }
     }
 
-    private fun buildArConfig(s: Session) = Config(s).apply {
+    /**
+     * A camera config can change feature support. Always configure after choosing
+     * the camera and gracefully fall back to AR without Depth if that exact camera
+     * does not support automatic depth.
+     */
+    private fun configureBestAvailable(s: Session): Config {
+        val wantsDepth = runCatching { s.isDepthModeSupported(Config.DepthMode.AUTOMATIC) }.getOrDefault(false)
+        val preferred = buildArConfig(s, enableDepth = wantsDepth)
+        return try {
+            s.configure(preferred)
+            preferred
+        } catch (depthFailure: Throwable) {
+            if (!wantsDepth) throw depthFailure
+            val fallback = buildArConfig(s, enableDepth = false)
+            s.configure(fallback)
+            fallback
+        }
+    }
+
+    private fun buildArConfig(s: Session, enableDepth: Boolean) = Config(s).apply {
         planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
         focusMode = Config.FocusMode.AUTO
-        if (s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) depthMode = Config.DepthMode.AUTOMATIC
+        depthMode = if (enableDepth) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
     }
 
-    override fun onPause() {
-        renderer.sessionResumed = false
+    private fun scheduleArRetry(immediate: Boolean) {
+        if (!activityResumed || arRetryCount >= MAX_AR_RETRIES) return
+        arRetryCount += 1
+        mainHandler.removeCallbacks(arRetryRunnable)
+        mainHandler.postDelayed(arRetryRunnable, if (immediate) 250L else 1200L * arRetryCount)
+    }
+
+    private val arRetryRunnable = Runnable {
+        if (activityResumed && session == null) startArIfPossible()
+    }
+
+    private fun disposeArSession() {
+        renderer.detachSession()
+        pauseSurfaceOnly()
+        val old = session
+        session = null
+        runCatching { old?.pause() }
+        runCatching { old?.close() }
+        cameraChoices = emptyList()
+        activeCameraIndex = -1
+        cameraButton.text = "CAM"
+    }
+
+    private fun pauseSurfaceOnly() {
         if (surfaceResumed) {
             surface.onPause()
             surfaceResumed = false
         }
+    }
+
+    private fun resumeSurfaceOnly() {
+        if (!surfaceResumed && activityResumed) {
+            surface.onResume()
+            surfaceResumed = true
+        }
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        mainHandler.removeCallbacks(arRetryRunnable)
+        renderer.sessionResumed = false
+        pauseSurfaceOnly()
         runCatching { session?.pause() }
         super.onPause()
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
         coordinator.close()
         transport.close()
         renderer.detachSession()
-        session?.close()
+        runCatching { session?.close() }
         session = null
         super.onDestroy()
     }
@@ -420,9 +606,13 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
 
     private fun ensurePeerPermissions(): Boolean {
         val needed = ArrayList<String>()
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.CAMERA
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            needed += Manifest.permission.CAMERA
+        }
         if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.NEARBY_WIFI_DEVICES
+            if (checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+                needed += Manifest.permission.NEARBY_WIFI_DEVICES
+            }
         } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             needed += Manifest.permission.ACCESS_FINE_LOCATION
         }
@@ -431,7 +621,11 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         return false
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.any { it != PackageManager.PERMISSION_GRANTED }) {
             showBanner("Permission required", "Camera and Nearby devices are required for direct spatial sync")
@@ -443,7 +637,12 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     override fun onTransportStatus(text: String) {
         runOnUiThread {
             setupStatus.text = text
-            detailPill.text = text
+            if (!coordinator.quality().bothReady) detailPill.text = text
+            val lower = text.lowercase()
+            if (("failed" in lower || "unavailable" in lower || "lost" in lower) && text != lastTransportError) {
+                lastTransportError = text
+                showBanner("Direct link", text)
+            }
         }
     }
 
@@ -454,24 +653,34 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             val distance = room.distanceM?.let { " • %.1f m".format(it) } ?: ""
             val button = secondaryButton("${room.username}   ${room.code}$distance") {
                 runCatching { transport.joinRoom(room.code) }
-                    .onSuccess { hideSetup() }
-                    .onFailure { showBanner("Join failed", "${it.javaClass.simpleName}: ${it.message}") }
+                    .onSuccess {
+                        activeRoomCode = room.code
+                        transportPill.text = "LINKING • ${room.code}"
+                        hideSetup()
+                        haptic()
+                    }
+                    .onFailure { showBanner("Join failed", errorText(it)) }
             }.apply { tag = tagValue }
-            roomList.addView(button, 0, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply { bottomMargin = dp(7) })
-            setupStatus.text = "Nearby room found. Tap to join."
+            roomList.addView(
+                button,
+                0,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(45)).apply { bottomMargin = dp(6) },
+            )
+            setupStatus.text = "Nearby space found — tap it to connect."
         }
     }
 
     override fun onConnected(peerUsername: String) {
         runOnUiThread {
             transportPill.text = "DIRECT • $peerUsername"
-            transportPill.background = rounded(0xdd163b31.toInt(), 20f, 0x664fffc3, 1)
+            transportPill.background = rounded(0xd11a4b3c.toInt(), 18f, 0x6655f0bd, 1)
             clearButton.visibility = View.VISIBLE
             if (!peerConnectedOnce) {
                 peerConnectedOnce = true
                 coordinator.onConnected()
                 hideSetup()
-                showBanner("Connected to $peerUsername", "Direct Wi‑Fi Aware link • no access point")
+                haptic()
+                showBanner("Connected to $peerUsername", "Direct Wi-Fi Aware link • no router • no server")
             }
         }
     }
@@ -483,11 +692,11 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             coordinator.onDisconnected()
             renderer.setRemoteTarget(null)
             clearButton.visibility = View.GONE
-            transportPill.text = "OFFLINE"
-            transportPill.background = rounded(0xcc1d2228.toInt(), 20f)
-            syncPill.text = "NOT SYNCED"
-            syncPill.background = rounded(0xcc1d2228.toInt(), 20f)
-            showBanner("Peer disconnected", reason)
+            transportPill.text = activeRoomCode?.let { "OFFLINE • $it" } ?: "OFFLINE"
+            transportPill.background = rounded(0xc91b2025.toInt(), 18f)
+            syncPill.text = if (renderer.sessionResumed) "AR READY" else "NOT SYNCED"
+            syncPill.background = rounded(0xc91b2025.toInt(), 18f)
+            showBanner("Peer disconnected", "$reason • tap the connection chip to reconnect")
         }
     }
 
@@ -498,6 +707,10 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             WireMessage.ClearPoi -> coordinator.clearPoi(false)
             is WireMessage.Quality -> coordinator.onPeerQuality(message)
             is WireMessage.Range -> coordinator.onRange(message.distanceM, message.stdDevM, message.samples)
+            is WireMessage.ResetAlignment -> {
+                coordinator.onPeerAlignmentReset(message.reason)
+                runOnUiThread { showBanner("Peer AR changed", "Re-aligning geometry: ${message.reason}") }
+            }
             is WireMessage.Hello -> Unit
         }
     }
@@ -512,18 +725,22 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
             when {
                 quality.bothReady -> {
                     syncPill.text = "LOCKED • ${(quality.confidence * 100).toInt()}%"
-                    syncPill.background = rounded(0xdd164739.toInt(), 20f, 0x884fffc3.toInt(), 1)
+                    syncPill.background = rounded(0xd11a4b3c.toInt(), 18f, 0x7755f0bd, 1)
                     detailPill.text = "READY — tap a physical point to sync POI$range"
                 }
                 quality.localReady -> {
-                    syncPill.text = "LOCKED LOCAL • WAIT PEER"
-                    syncPill.background = rounded(0xdd5a4719.toInt(), 20f)
-                    detailPill.text = "Keep both phones on the same textured area for one more moment$range"
+                    syncPill.text = "LOCAL LOCK"
+                    syncPill.background = rounded(0xcf584719.toInt(), 18f)
+                    detailPill.text = "Hold the same textured area for the peer lock$range"
                 }
-                else -> {
-                    syncPill.text = if (quality.inliers > 0) "ALIGNING • ${quality.inliers} INLIERS" else "ALIGNING"
-                    syncPill.background = rounded(0xdd413718.toInt(), 20f)
-                    detailPill.text = "Look at the same static scene and move both phones slightly$range"
+                peerConnectedOnce -> {
+                    syncPill.text = if (quality.inliers > 0) "ALIGN • ${quality.inliers}" else "ALIGNING"
+                    syncPill.background = rounded(0xcf493b18.toInt(), 18f)
+                    detailPill.text = "Point both phones at overlapping static detail and move slightly$range"
+                }
+                renderer.sessionResumed -> {
+                    syncPill.text = "AR READY"
+                    syncPill.background = rounded(0xc928343b.toInt(), 18f)
                 }
             }
         }
@@ -532,7 +749,10 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
     override fun onRemotePoi(pointLocal: FloatArray?, owner: String, confidence: Float) {
         runOnUiThread {
             renderer.setRemoteTarget(pointLocal, owner, confidence)
-            if (pointLocal != null) showBanner("POI added from $owner", "Follow the edge arrow until the marker enters view")
+            if (pointLocal != null) {
+                haptic()
+                showBanner("POI added from $owner", "Follow the edge arrow until the marker enters view")
+            }
         }
     }
 
@@ -542,48 +762,79 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
 
     private fun refreshCapabilities() {
         val caps = transport.capabilities()
-        val awareText = if (caps.awareSupported) "Aware ✓" else "Aware ✕"
-        val rttText = if (caps.rttSupported) "RTT ✓" else "RTT —"
-        setupStatus.text = "$awareText   •   $rttText   •   OpenCV ${if (openCvReady) "✓" else "✕"}"
+        val awareText = when {
+            !caps.awareSupported -> "Aware ✕"
+            caps.awareAvailable -> "Aware ✓"
+            else -> "Aware unavailable"
+        }
+        val rttText = when {
+            !caps.rttSupported -> "RTT —"
+            caps.rttAvailable -> "RTT ✓"
+            else -> "RTT idle"
+        }
+        setupStatus.text = "$awareText  •  $rttText  •  OpenCV ${if (openCvReady) "✓" else "✕"}"
         if (!openCvReady) showBanner("Alignment unavailable", "OpenCV failed to initialize on this build")
     }
 
     private fun setTechnicalStatus(text: String) {
-        runOnUiThread { if (!coordinator.quality().bothReady) detailPill.text = text }
+        runOnUiThread {
+            if (!coordinator.quality().bothReady) detailPill.text = text
+            when {
+                text == "AR tracking" && !peerConnectedOnce -> {
+                    syncPill.text = "AR READY"
+                    syncPill.background = rounded(0xc928343b.toInt(), 18f)
+                }
+                text.startsWith("AR PAUSED") -> {
+                    syncPill.text = "AR ACQUIRING"
+                }
+            }
+        }
     }
 
     private fun hideSetup() {
         if (setupCard.visibility != View.VISIBLE) return
-        setupCard.animate().alpha(0f).scaleX(0.97f).scaleY(0.97f).setDuration(180).withEndAction {
-            setupCard.visibility = View.GONE
-        }.start()
+        setupCard.animate()
+            .alpha(0f)
+            .translationY(dp(18).toFloat())
+            .setDuration(160)
+            .withEndAction { setupCard.visibility = View.GONE }
+            .start()
     }
 
     private fun showSetup() {
         setupCard.visibility = View.VISIBLE
         setupCard.alpha = 0f
-        setupCard.scaleX = 0.97f
-        setupCard.scaleY = 0.97f
-        setupCard.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
+        setupCard.translationY = dp(18).toFloat()
+        setupCard.animate().alpha(1f).translationY(0f).setDuration(160).start()
     }
 
     private fun showBanner(title: String, subtitle: String) {
+        val serial = ++bannerSerial
         banner.animate().cancel()
         bannerTitle.text = title
         bannerSubtitle.text = subtitle
         banner.visibility = View.VISIBLE
         banner.alpha = 0f
-        banner.translationY = -dp(14).toFloat()
-        banner.animate().alpha(1f).translationY(0f).setDuration(180).start()
+        banner.translationY = -dp(12).toFloat()
+        banner.animate().alpha(1f).translationY(0f).setDuration(160).start()
         banner.postDelayed({
-            if (!isFinishing) banner.animate().alpha(0f).translationY(-dp(10).toFloat()).setDuration(220).withEndAction {
-                banner.visibility = View.GONE
-            }.start()
-        }, 3200L)
+            if (!isFinishing && serial == bannerSerial) {
+                banner.animate()
+                    .alpha(0f)
+                    .translationY(-dp(8).toFloat())
+                    .setDuration(180)
+                    .withEndAction { if (serial == bannerSerial) banner.visibility = View.GONE }
+                    .start()
+            }
+        }, 3000L)
+    }
+
+    private fun haptic() {
+        runCatching { surface.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY) }
     }
 
     private fun saveUsername() {
-        getSharedPreferences("spatial-v2", MODE_PRIVATE).edit().putString("username", username()).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("username", username()).apply()
     }
 
     private fun username() = usernameEdit.text?.toString()?.trim().orEmpty().ifBlank { Build.MODEL }.take(32)
@@ -593,13 +844,19 @@ class MainActivity : Activity(), WifiAwarePeerTransport.Callbacks, AlignmentCoor
         return buildString(6) { repeat(6) { append(alphabet[random.nextInt(alphabet.length)]) } }
     }
 
+    private fun errorText(t: Throwable): String =
+        "${t.javaClass.simpleName}${t.message?.let { ": $it" } ?: ""}"
+
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
 
-    @Suppress("DEPRECATION") private fun displayRotation(): Int = windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
+    @Suppress("DEPRECATION")
+    private fun displayRotation(): Int = windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_0
 
     companion object {
+        private const val PREFS = "spatial-v2"
         private const val REQ_CAMERA = 41
         private const val REQ_PEER = 42
+        private const val MAX_AR_RETRIES = 2
     }
 }
