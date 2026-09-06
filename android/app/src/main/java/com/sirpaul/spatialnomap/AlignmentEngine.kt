@@ -121,8 +121,6 @@ object AlignmentEngine {
         val objIn = MatOfPoint3f(*inObj.toTypedArray())
         val imgIn = MatOfPoint2f(*inImg.toTypedArray())
         try {
-            // VVS updates rotation on the SO(3) exponential map. Fall back to LM
-            // on vendor/OpenCV builds where VVS is unavailable for any reason.
             Calib3d.solvePnPRefineVVS(objIn, imgIn, k, dist, rvec, tvec)
         } catch (_: Throwable) {
             try {
@@ -236,12 +234,6 @@ object AlignmentEngine {
         )
     }
 
-    /**
-     * SIFT remains the deterministic classical production path. Matches must pass
-     * Lowe's ratio test in both directions and be mutual nearest neighbors. This
-     * costs a second descriptor search but removes a large class of repeated-
-     * texture false correspondences before RANSAC ever sees them.
-     */
     private fun siftMatches(remote: CapturedFrame, local: CapturedFrame): MatchSet? {
         val a = decodeGray(remote) ?: return null
         val b = decodeGray(local) ?: run {
@@ -295,9 +287,6 @@ object AlignmentEngine {
             pair.release()
         }
 
-        // Prefer mutual ratio matches. In extremely asymmetric viewpoints retain
-        // the stricter forward-ratio set only if mutual matching became too sparse;
-        // downstream metric association + RANSAC still provide robust rejection.
         val good = if (mutual.size >= 8) mutual else ratioOnly.filter { match ->
             val q = forwardRatioMargin(match, da, db)
             q <= STRICT_FALLBACK_RATIO
@@ -309,11 +298,6 @@ object AlignmentEngine {
         return result
     }
 
-    /**
-     * Cheap fallback ratio reconstruction for the rare mutual-starvation branch.
-     * Re-match one descriptor against the local descriptor matrix and require a
-     * stricter ratio than the normal path.
-     */
     private fun forwardRatioMargin(match: DMatch, da: Mat, db: Mat): Float {
         val query = da.row(match.queryIdx)
         val matcher = BFMatcher.create(Core.NORM_L2, false)
@@ -388,7 +372,7 @@ object AlignmentEngine {
         return (area / (width.toDouble() * height.toDouble())).coerceIn(0.0, 1.0)
     }
 
-    private fun poseMatrix(p: PosePacket): DoubleArray {
+    internal fun poseMatrix(p: PosePacket): DoubleArray {
         val q = p.q
         var x = q.getOrElse(0) { 0f }.toDouble()
         var y = q.getOrElse(1) { 0f }.toDouble()
@@ -409,7 +393,7 @@ object AlignmentEngine {
         )
     }
 
-    private fun multiply4(a: DoubleArray, b: DoubleArray): DoubleArray {
+    internal fun multiply4(a: DoubleArray, b: DoubleArray): DoubleArray {
         val out = DoubleArray(16)
         for (r in 0..3) for (c in 0..3) {
             var v = 0.0
