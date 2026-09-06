@@ -24,6 +24,7 @@ class ArRenderer(
     private val usernameProvider: () -> String,
     private val status: (String) -> Unit,
     private val rotationProvider: () -> Int,
+    private val sensorSnapshotProvider: () -> SensorSnapshot = { SensorSnapshot() },
 ) : GLSurfaceView.Renderer {
     private data class RemoteTarget(val point: FloatArray, val owner: String, val confidence: Float)
 
@@ -51,8 +52,6 @@ class ArRenderer(
     }
 
     fun detachSession() {
-        // Set the gate first. A late GL callback can still happen while the UI
-        // thread is pausing GLSurfaceView, but it will not touch ARCore.
         sessionResumed = false
         session = null
         textureBoundSession = null
@@ -88,9 +87,6 @@ class ArRenderer(
                 textureBoundSession = s
                 s.setDisplayGeometry(rotationProvider(), width, height)
             }
-
-            // Re-check after camera/texture setup because the UI thread may have
-            // started a pause or lens switch in the meantime.
             if (!sessionResumed || session !== s) return
 
             val frame = s.update()
@@ -98,9 +94,6 @@ class ArRenderer(
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
-            // Alignment still receives raw frame-by-frame tracking so a sustained
-            // loss can invalidate geometry. The HUD gets hysteresis separately to
-            // avoid READY/ACQUIRING flicker from one or two paused frames.
             coordinator.onTrackingState(tracking)
             when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
                 true -> status("AR tracking")
@@ -113,8 +106,6 @@ class ArRenderer(
             captureIfDue(frame, camera)
             projectRemoteTarget(camera)
         } catch (t: Throwable) {
-            // A late GL callback can race Activity.onPause. This is not a user
-            // facing AR failure; the renderer gate prevents the next frame.
             if (t.javaClass.simpleName == "SessionPausedException") return
             val error = errorText(t)
             val now = System.currentTimeMillis()
@@ -129,7 +120,7 @@ class ArRenderer(
     private fun handleTap(frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
-            status("SYNCING — both phones need a stable visual lock before placing a POI")
+            status("SYNCING — keep both cameras on overlapping detail until FUSED/LOCKED")
             return
         }
 
@@ -159,13 +150,18 @@ class ArRenderer(
         }
 
         if (coordinator.sendPoi(pointWorld, usernameProvider())) status("POI sent")
-        else status("POI blocked: sync confidence is not ready")
+        else status("POI blocked: spatial fusion is not ready")
     }
 
     private fun captureIfDue(frame: Frame, camera: Camera) {
         val now = System.nanoTime()
-        if (now - lastCaptureNs < 650_000_000L) return
-        val packet = FrameCapture.capture(frame, camera, maxWidth = 960) ?: return
+        if (now - lastCaptureNs < 520_000_000L) return
+        val packet = FrameCapture.capture(
+            frame = frame,
+            camera = camera,
+            maxWidth = 960,
+            sensors = sensorSnapshotProvider(),
+        ) ?: return
         coordinator.onLocalFrame(packet)
         lastCaptureNs = now
     }
