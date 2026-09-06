@@ -53,7 +53,11 @@ import java.util.concurrent.atomic.AtomicReference
  * - every data-path generation is tagged so stale callbacks can never tear down
  *   a newer successful connection;
  * - peer-specific responder is an automatic fallback for vendor NAN stacks that
- *   reject or stall the modern any-peer responder path.
+ *   reject or stall the modern any-peer responder path;
+ * - Android/vendor termination of the Wi-Fi Aware attach session is recovered by
+ *   re-attaching and recreating publish/subscribe state without losing the room;
+ * - repeated NDP recovery failures escalate to a fresh Aware attach so stale
+ *   PeerHandles cannot keep a resumed app in a reconnect loop.
  */
 @SuppressLint("MissingPermission")
 class WifiAwarePeerTransport(
@@ -116,6 +120,7 @@ class WifiAwarePeerTransport(
     private val hostAcceptStarted = AtomicBoolean(false)
     private val rangingBusy = AtomicBoolean(false)
     private val recoveryScheduled = AtomicBoolean(false)
+    private val awareRecoveryScheduled = AtomicBoolean(false)
     private val messageId = AtomicInteger(100)
     private val dataPathEpoch = AtomicInteger(0)
     private val latestFrame = AtomicReference<CapturedFrame?>(null)
@@ -128,6 +133,8 @@ class WifiAwarePeerTransport(
     private var joinAttempt = 0
     private var lastRangingError = ""
     private var hostResponderMode = HostResponderMode.NONE
+    private var dataPathRecoveryCount = 0
+    private var rttBackoffUntilMs = 0L
 
     @Volatile var connected = false
         private set
@@ -261,11 +268,15 @@ class WifiAwarePeerTransport(
         val wasConnected = connected
         main.removeCallbacks(rangeRunnable)
         main.removeCallbacks(joinRetryRunnable)
+        main.removeCallbacks(awareRecoveryRunnable)
         recoveryScheduled.set(false)
+        awareRecoveryScheduled.set(false)
         cleanupDataPath()
         rangingBusy.set(false)
         latestFrame.set(null)
         lastRangingError = ""
+        dataPathRecoveryCount = 0
+        rttBackoffUntilMs = 0L
 
         try { publishSession?.close() } catch (_: Throwable) {}
         try { subscribeSession?.close() } catch (_: Throwable) {}
@@ -322,25 +333,32 @@ class WifiAwarePeerTransport(
                         return
                     }
                     awareSession = session
+                    awareRecoveryScheduled.set(false)
                     try {
                         action(session)
                     } catch (t: Throwable) {
-                        reportError("Wi-Fi Aware setup failed", t)
-                        running.set(false)
+                        Log.e(TAG, "Wi-Fi Aware setup interrupted", t)
                         try { session.close() } catch (_: Throwable) {}
                         awareSession = null
+                        recoverAwareSession("Wi-Fi Aware setup interrupted")
                     }
                 }
 
                 override fun onAttachFailed() {
-                    running.set(false)
-                    status("Wi-Fi Aware attach failed (framework rejected the session)")
+                    if (running.get()) recoverAwareSession("Wi-Fi Aware attach was interrupted")
+                }
+
+                override fun onAwareSessionTerminated() {
+                    if (running.get()) recoverAwareSession("Android restarted the Wi-Fi Aware session")
                 }
             }, main)
         } catch (t: Throwable) {
-            running.set(false)
             Log.e(TAG, "Wi-Fi Aware attach threw", t)
-            throw IllegalStateException("Wi-Fi Aware start failed: ${errorText(t)}", t)
+            if (running.get()) {
+                recoverAwareSession("Wi-Fi Aware attach was interrupted: ${errorText(t)}")
+            } else {
+                throw IllegalStateException("Wi-Fi Aware start failed: ${errorText(t)}", t)
+            }
         }
     }
 
@@ -422,7 +440,7 @@ class WifiAwarePeerTransport(
             session.subscribe(builder.build(), object : DiscoverySessionCallback() {
                 override fun onSubscribeStarted(session: SubscribeDiscoverySession) {
                     subscribeSession = session
-                    status("Scanning nearby Spatial rooms…")
+                    status(if (roomCode.isBlank()) "Scanning nearby Spatial rooms…" else "Restoring nearby Spatial peer…")
                 }
 
                 override fun onServiceDiscovered(
@@ -439,8 +457,6 @@ class WifiAwarePeerTransport(
                     matchFilter: MutableList<ByteArray>?,
                     distanceMm: Int,
                 ) {
-                    // Kept for vendor stacks which may still surface this callback,
-                    // but discovery itself is no longer RTT-geofenced.
                     registerRoom(peerHandle, serviceSpecificInfo, distanceMm / 1000f)
                 }
 
@@ -460,8 +476,8 @@ class WifiAwarePeerTransport(
                     if (allowInstant && running.get()) {
                         status("Instant Wi-Fi Aware scan rejected — retrying standard discovery…")
                         subscribe(session = awareSession ?: return, allowInstant = false)
-                    } else {
-                        status("Wi-Fi Aware scan configuration failed")
+                    } else if (running.get()) {
+                        recoverAwareSession("Wi-Fi Aware discovery session was interrupted")
                     }
                 }
             }, main)
@@ -470,7 +486,7 @@ class WifiAwarePeerTransport(
                 status("Instant Wi-Fi Aware scan threw — retrying standard discovery…")
                 subscribe(session, allowInstant = false)
             } else {
-                throw t
+                recoverAwareSession("Wi-Fi Aware discovery was interrupted: ${errorText(t)}")
             }
         }
     }
@@ -488,6 +504,18 @@ class WifiAwarePeerTransport(
             rooms[code] = room
             roomPeers[code] = peer
             safeCallback { callbacks.onRoomFound(room) }
+
+            // After Android/vendor NAN teardown the old PeerHandle is invalid. If
+            // the user had already selected a room, rediscovery of that same room
+            // is authoritative enough to rebuild the direct path automatically.
+            if (!hostRole && roomCode.isNotBlank() && code == roomCode && !connected) {
+                currentPeer = peer
+                peerUsername = room.username
+                joinAttempt = 0
+                status("Nearby peer restored — reconnecting direct link…")
+                requestClientNetwork(peer)
+                scheduleJoinHandshake(0L)
+            }
         } catch (t: Throwable) {
             reportError("Nearby room decode failed", t)
         }
@@ -780,8 +808,11 @@ class WifiAwarePeerTransport(
         socket = s
         socketConnected.set(true)
         connected = true
+        dataPathRecoveryCount = 0
+        rttBackoffUntilMs = 0L
         networkRequestedAtMs = 0L
         recoveryScheduled.set(false)
+        awareRecoveryScheduled.set(false)
         main.removeCallbacks(joinRetryRunnable)
         main.removeCallbacks(rangeRunnable)
         status("Connected directly to $peerUsername — no AP / no server")
@@ -861,8 +892,17 @@ class WifiAwarePeerTransport(
         val wasConnected = connected
         cleanupDataPath()
         if (wasConnected) safeCallback { callbacks.onDisconnected(reason) }
-        status("$reason — retrying automatically…")
+        dataPathRecoveryCount += 1
 
+        // PeerHandles belong to an Aware discovery session. After several failed
+        // NDP rebuilds, stop trusting the old handle and obtain a fresh attach +
+        // discovery session instead of looping forever on vendor framework state.
+        if (dataPathRecoveryCount >= MAX_DATAPATH_RECOVERIES_BEFORE_REATTACH) {
+            recoverAwareSession("$reason — refreshing nearby session")
+            return
+        }
+
+        status("$reason — retrying automatically…")
         if (!recoveryScheduled.compareAndSet(false, true)) return
         main.postDelayed({
             recoveryScheduled.set(false)
@@ -874,8 +914,73 @@ class WifiAwarePeerTransport(
             } else if (peer != null) {
                 requestClientNetwork(peer)
                 scheduleJoinHandshake(0L)
+            } else {
+                recoverAwareSession("Nearby peer handle expired")
             }
         }, RECOVERY_DELAY_MS)
+    }
+
+    /**
+     * Full discovery-layer recovery. Room identity and host/client role survive;
+     * transient PeerHandles and NDP callbacks do not. On the client, rediscovering
+     * the already-selected room auto-joins it again.
+     */
+    @Synchronized private fun recoverAwareSession(reason: String) {
+        if (!running.get()) return
+        val wasConnected = connected
+        cleanupDataPath()
+        main.removeCallbacks(joinRetryRunnable)
+        recoveryScheduled.set(false)
+
+        try { publishSession?.close() } catch (_: Throwable) {}
+        try { subscribeSession?.close() } catch (_: Throwable) {}
+        try { awareSession?.close() } catch (_: Throwable) {}
+        publishSession = null
+        subscribeSession = null
+        awareSession = null
+        currentPeer = null
+        rooms.clear()
+        roomPeers.clear()
+        peerJoinAtMs = 0L
+        hostModeStartedAtMs = 0L
+        hostResponderMode = HostResponderMode.NONE
+        dataPathRecoveryCount = 0
+
+        if (wasConnected) safeCallback { callbacks.onDisconnected(reason) }
+        status("$reason — restoring direct session…")
+
+        if (awareRecoveryScheduled.compareAndSet(false, true)) {
+            main.removeCallbacks(awareRecoveryRunnable)
+            main.postDelayed(awareRecoveryRunnable, AWARE_RECOVERY_DELAY_MS)
+        }
+    }
+
+    private val awareRecoveryRunnable = object : Runnable {
+        override fun run() {
+            if (!running.get() || connected) {
+                awareRecoveryScheduled.set(false)
+                return
+            }
+            val caps = capabilities()
+            if (!caps.awareAvailable) {
+                status("Wi-Fi Aware is temporarily busy — waiting to restore direct link…")
+                main.postDelayed(this, AWARE_RETRY_WHILE_BUSY_MS)
+                return
+            }
+
+            awareRecoveryScheduled.set(false)
+            attachAware { session ->
+                if (hostRole) {
+                    publish(
+                        session = session,
+                        allowRanging = capabilities().rttAvailable,
+                        allowInstant = instantAwareSupported(),
+                    )
+                } else {
+                    subscribe(session, allowInstant = instantAwareSupported())
+                }
+            }
+        }
     }
 
     private fun isCurrentEpoch(epoch: Int): Boolean = epoch == dataPathEpoch.get()
@@ -897,6 +1002,7 @@ class WifiAwarePeerTransport(
 
     private fun rangeOnce() {
         if (!connected || hostRole) return
+        if (SystemClock.elapsedRealtime() < rttBackoffUntilMs) return
         val peer = currentPeer ?: return
         val manager = rtt ?: return
         if (missingPeerPermissions().isNotEmpty()) return
@@ -909,16 +1015,21 @@ class WifiAwarePeerTransport(
             manager.startRanging(request, context.mainExecutor, object : RangingResultCallback() {
                 override fun onRangingFailure(code: Int) {
                     rangingBusy.set(false)
-                    val error = "framework failure code $code"
+                    rttBackoffUntilMs = SystemClock.elapsedRealtime() + RTT_BACKOFF_MS
+                    val error = "framework code $code"
                     if (error != lastRangingError) {
                         lastRangingError = error
-                        status("Wi-Fi RTT unavailable: $error — continuing with fused alignment")
+                        // RTT is optional. Avoid words such as "failed" or
+                        // "unavailable" so the product UI does not present an RF
+                        // ranging limitation as a broken P2P connection.
+                        status("RTT optional • $error • visual alignment continues")
                     }
                 }
 
                 override fun onRangingResults(results: MutableList<RangingResult>) {
                     rangingBusy.set(false)
                     lastRangingError = ""
+                    rttBackoffUntilMs = 0L
                     val result = results.firstOrNull { it.status == RangingResult.STATUS_SUCCESS } ?: return
                     val samples = result.numSuccessfulMeasurements
                     val std = if (samples >= 2) result.distanceStdDevMm / 1000f else Float.NaN
@@ -929,11 +1040,12 @@ class WifiAwarePeerTransport(
             })
         } catch (t: Throwable) {
             rangingBusy.set(false)
+            rttBackoffUntilMs = SystemClock.elapsedRealtime() + RTT_BACKOFF_MS
             val error = errorText(t)
             Log.e(TAG, "Wi-Fi RTT start failed", t)
             if (error != lastRangingError) {
                 lastRangingError = error
-                status("Wi-Fi RTT failed: $error — continuing with fused alignment")
+                status("RTT optional • $error • visual alignment continues")
             }
         }
     }
@@ -1001,8 +1113,12 @@ class WifiAwarePeerTransport(
         private const val NDP_REQUEST_TIMEOUT_MS = 8_000L
         private const val HOST_MODE_FALLBACK_MS = 5_500L
         private const val RECOVERY_DELAY_MS = 500L
+        private const val AWARE_RECOVERY_DELAY_MS = 700L
+        private const val AWARE_RETRY_WHILE_BUSY_MS = 1_500L
+        private const val MAX_DATAPATH_RECOVERIES_BEFORE_REATTACH = 3
         private const val ENDPOINT_RESOLVE_ATTEMPTS = 50
         private const val ENDPOINT_RESOLVE_SLEEP_MS = 100L
         private const val RTT_PERIOD_MS = 1_500L
+        private const val RTT_BACKOFF_MS = 30_000L
     }
 }
