@@ -15,9 +15,10 @@ import kotlin.math.sqrt
  * Metric geometry sampler for cross-device registration and POI placement.
  *
  * Production policy:
- *  1. Prefer ARCore Raw Depth because it is the least-smoothed metric signal.
- *  2. Reject raw pixels below the ARCore confidence midpoint (128/255).
- *  3. Fall back to full/smoothed depth when raw depth is too sparse.
+ *  1. Prefer high-confidence ARCore Raw Depth as the metric backbone.
+ *  2. Never throw away dense full depth just because a small raw set exists:
+ *     raw depth is intentionally sparse, so full depth fills uncovered image cells.
+ *  3. Reject raw pixels below the ARCore confidence midpoint (128/255).
  *  4. Fall back to ARCore's tracked point cloud when depth is unavailable.
  *
  * A single depth pixel is never trusted. All paths use a local robust median
@@ -27,15 +28,20 @@ object MetricSupportSampler {
     private const val RAW_CONFIDENCE_MIN = 128
     private const val MIN_DEPTH_MM = 150
     private const val MAX_DEPTH_MM = 65_000
+    private const val MERGE_CELL_PX = 10f
 
     fun sample(frame: Frame, camera: Camera, maxPoints: Int = 2200): List<FloatArray> {
+        // Raw depth is more accurate but can contain only a few dozen confident
+        // samples. Returning it exclusively was starving SIFT->metric association
+        // on otherwise good frames. Keep raw as the first-class support and fill
+        // the holes with dense ARCore depth from the same frame.
         val raw = tryRawDepth(frame, camera, maxPoints)
-        if (raw.size >= 24) return raw
-
         val full = tryFullDepth(frame, camera, maxPoints)
-        if (full.size >= 24) return full
+        val merged = mergeSupports(raw, full, maxPoints)
+        if (merged.size >= 24) return merged
 
-        return samplePointCloud(frame, camera, maxPoints)
+        val cloud = samplePointCloud(frame, camera, maxPoints)
+        return mergeSupports(merged, cloud, maxPoints)
     }
 
     fun pointAtCpuPixel(frame: Frame, camera: Camera, u: Float, v: Float): FloatArray? {
@@ -135,7 +141,7 @@ object MetricSupportSampler {
         }
     }
 
-    /** Full ARCore depth is denser and temporally smoothed; use it as fallback. */
+    /** Full ARCore depth is denser and temporally smoothed; it fills raw-depth holes. */
     private fun tryFullDepth(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
         return try {
             frame.acquireDepthImage16Bits().use { image ->
@@ -165,6 +171,44 @@ object MetricSupportSampler {
         } catch (_: Throwable) {
             emptyList()
         }
+    }
+
+    /**
+     * Keep primary supports first and fill only image cells which are not already
+     * represented. This avoids thousands of duplicate raw/full samples while
+     * preserving dense metric coverage for visual feature association.
+     */
+    private fun mergeSupports(
+        primary: List<FloatArray>,
+        secondary: List<FloatArray>,
+        maxPoints: Int,
+    ): List<FloatArray> {
+        if (maxPoints <= 0) return emptyList()
+        if (primary.isEmpty()) return secondary.take(maxPoints)
+        if (secondary.isEmpty() || primary.size >= maxPoints) return primary.take(maxPoints)
+
+        val out = ArrayList<FloatArray>(minOf(maxPoints, primary.size + secondary.size))
+        val occupied = HashSet<Long>(maxPoints * 2)
+
+        fun cellKey(point: FloatArray): Long {
+            val x = kotlin.math.floor(point.getOrElse(0) { 0f } / MERGE_CELL_PX).toLong()
+            val y = kotlin.math.floor(point.getOrElse(1) { 0f } / MERGE_CELL_PX).toLong()
+            return (x shl 32) xor (y and 0xffffffffL)
+        }
+
+        for (p in primary) {
+            if (p.size < 5 || !p.take(5).all { it.isFinite() }) continue
+            out += p
+            occupied += cellKey(p)
+            if (out.size >= maxPoints) return out
+        }
+        for (p in secondary) {
+            if (p.size < 5 || !p.take(5).all { it.isFinite() }) continue
+            if (!occupied.add(cellKey(p))) continue
+            out += p
+            if (out.size >= maxPoints) break
+        }
+        return out
     }
 
     private fun supportsFromDepth(
@@ -299,8 +343,6 @@ object MetricSupportSampler {
         }
         if (samples.size < minSamples) return null
 
-        // Expand higher-confidence observations so the median naturally favors
-        // pixels ARCore considers reliable without trusting one maximum pixel.
         val weighted = ArrayList<Int>(samples.size * 3)
         for ((mm, conf) in samples) {
             val weight = 1 + ((conf - RAW_CONFIDENCE_MIN) * 2 / (255 - RAW_CONFIDENCE_MIN)).coerceIn(0, 2)
