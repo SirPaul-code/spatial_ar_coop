@@ -7,7 +7,6 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.RectF
-import android.graphics.YuvImage
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.Image
@@ -17,6 +16,7 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import java.io.ByteArrayOutputStream
+import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
@@ -30,6 +30,10 @@ import kotlin.math.sqrt
  * supplies dense metric support points, so the detector associates the box with a
  * robust 3D point in the phone's current ARCore world before anything is shared.
  * No image, model request, or inference leaves the phone at runtime.
+ *
+ * A constant-velocity filter is applied before the renderer receives observations.
+ * The renderer still owns room track IDs; this layer only removes detector/depth
+ * jitter and predicts through tiny measurement gaps so a car marker looks stable.
  */
 class VehicleDetector(context: Context) {
     data class Vehicle(
@@ -38,10 +42,19 @@ class VehicleDetector(context: Context) {
         val pointWorld: FloatArray,
     )
 
+    private data class MotionTrack(
+        val id: Int,
+        val label: String,
+        val filter: MotionTrackFilter,
+        var lastSeenMs: Long,
+    )
+
     private val appContext = context.applicationContext
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
     private val executor = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
+    private val motionTracks = LinkedHashMap<Int, MotionTrack>()
+    private var nextMotionTrackId = 1
     @Volatile private var detector: ObjectDetector? = null
     @Volatile private var closed = false
 
@@ -99,7 +112,11 @@ class VehicleDetector(context: Context) {
                         pointWorld = point,
                     )
                 }
-                onResult(vehicles.sortedByDescending { it.confidence }.take(MAX_RESULTS))
+                val filtered = filterVehicleMotion(
+                    vehicles.sortedByDescending { it.confidence }.take(MAX_RESULTS),
+                    System.currentTimeMillis(),
+                )
+                onResult(filtered)
             } catch (t: Throwable) {
                 onError(errorText(t))
             } finally {
@@ -117,6 +134,7 @@ class VehicleDetector(context: Context) {
         executor.execute {
             runCatching { detector?.close() }
             detector = null
+            motionTracks.clear()
         }
         executor.shutdown()
     }
@@ -132,6 +150,43 @@ class VehicleDetector(context: Context) {
             .setMaxResults(8)
             .build()
         return ObjectDetector.createFromOptions(appContext, options)
+    }
+
+    private fun filterVehicleMotion(input: List<Vehicle>, nowMs: Long): List<Vehicle> {
+        motionTracks.entries.removeIf { nowMs - it.value.lastSeenMs > FILTER_TRACK_TTL_MS }
+        if (input.isEmpty()) return emptyList()
+        val used = HashSet<Int>()
+        val out = ArrayList<Vehicle>(input.size)
+
+        for (vehicle in input) {
+            var best: MotionTrack? = null
+            var bestDistance = Float.POSITIVE_INFINITY
+            for (track in motionTracks.values) {
+                if (track.id in used || track.label != vehicle.label) continue
+                val predicted = track.filter.predict(nowMs)?.position ?: continue
+                val distance = pointDistance(predicted, vehicle.pointWorld)
+                if (distance < bestDistance && distance <= FILTER_ASSOCIATION_M) {
+                    bestDistance = distance
+                    best = track
+                }
+            }
+
+            val track = best ?: MotionTrack(
+                id = nextMotionTrackId++,
+                label = vehicle.label,
+                filter = MotionTrackFilter(alpha = 0.58f, beta = 0.20f),
+                lastSeenMs = nowMs,
+            ).also { motionTracks[it.id] = it }
+
+            val state = track.filter.update(vehicle.pointWorld, nowMs, vehicle.confidence)
+            track.lastSeenMs = nowMs
+            used += track.id
+            out += vehicle.copy(
+                pointWorld = state.position,
+                confidence = state.confidence,
+            )
+        }
+        return out
     }
 
     private fun cameraRotationDegrees(cameraId: String?, displayRotation: Int): Int {
@@ -295,6 +350,8 @@ class VehicleDetector(context: Context) {
         private const val MIN_METRIC_INLIERS = 3
         private const val MIN_VEHICLE_DISTANCE_M = 0.35f
         private const val MAX_VEHICLE_DISTANCE_M = 45f
+        private const val FILTER_ASSOCIATION_M = 4.0f
+        private const val FILTER_TRACK_TTL_MS = 2_800L
         private val VEHICLE_LABELS = setOf("car", "truck", "bus")
     }
 }
