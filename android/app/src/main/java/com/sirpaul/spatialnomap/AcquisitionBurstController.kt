@@ -6,10 +6,13 @@ import java.util.Locale
  * Lightweight peer-synchronised acquisition burst controller.
  *
  * Both phones exchange Hello immediately after the direct TCP channel comes up.
- * Once both user/device identities are known, each side derives the same burst id
- * from the sorted identity pair and starts a short high-rate registration burst.
+ * Once both user/device identities are known, each side derives the same stable
+ * burst id from the sorted identity pair and starts a short high-rate registration
+ * burst. A new outgoing Hello is authoritative evidence of a new physical socket,
+ * so stale locked/burst state is discarded before the new peer Hello arrives.
+ *
  * The phones do not need synchronised monotonic clocks: sequence numbers are local
- * relative indices and the coordinator can still prefer equal/adjacent sequence
+ * relative indices and the coordinator strongly prefers equal/adjacent sequence
  * frames while its existing relative-recency pairing remains a fallback.
  */
 object AcquisitionBurstController {
@@ -23,35 +26,45 @@ object AcquisitionBurstController {
     private var peerIdentity = ""
     private var burstId = 0L
     private var burstStartedNs = 0L
-    private var generation = 0
     private var ready = false
     private var locked = false
 
     @Synchronized fun observeHello(local: Boolean, username: String, deviceModel: String) {
         val token = "${username.trim().lowercase(Locale.US)}|${deviceModel.trim().lowercase(Locale.US)}"
-        if (local) localIdentity = token else peerIdentity = token
-        if (localIdentity.isNotBlank() && peerIdentity.isNotBlank()) {
+        if (local) {
+            // PeerProtocol emits one local Hello per newly attached TCP socket.
+            // Reset the connection-local acquisition state here so reconnects never
+            // inherit a previous session's LOCKED flag and silently skip the burst.
+            localIdentity = token
+            peerIdentity = ""
+            burstId = 0L
+            burstStartedNs = 0L
+            ready = false
+            locked = false
+        } else {
+            peerIdentity = token
+        }
+
+        if (localIdentity.isNotBlank() && peerIdentity.isNotBlank() && !ready) {
             val stablePair = listOf(localIdentity, peerIdentity).sorted().joinToString("<->")
-            if (!ready) {
-                generation += 1
-                burstId = fnv1a64("$stablePair#$generation")
-                burstStartedNs = System.nanoTime()
-                ready = true
-                locked = false
-            }
+            // The id is intentionally stable for the connection pair. Retries reuse
+            // it; only sequence proximity is used as a live-pairing bonus.
+            burstId = fnv1a64(stablePair)
+            burstStartedNs = System.nanoTime()
+            ready = true
+            locked = false
         }
     }
 
     @Synchronized fun observeQuality(local: Boolean, isReady: Boolean) {
         if (local && isReady) locked = true
-        if (locked) return
-        if (!ready || burstStartedNs == 0L) return
+        if (locked || !ready || burstStartedNs == 0L) return
         val now = System.nanoTime()
         val burstDuration = BURST_FRAMES * BURST_INTERVAL_NS
         if (now - burstStartedNs > burstDuration + RETRY_AFTER_NS) {
-            generation += 1
-            val stablePair = listOf(localIdentity, peerIdentity).sorted().joinToString("<->")
-            burstId = fnv1a64("$stablePair#$generation")
+            // Both sides started from the Hello handshake within network latency of
+            // one another, so a periodic same-id retry remains approximately paired
+            // without requiring synchronized clocks or another control packet.
             burstStartedNs = now
         }
     }
