@@ -21,17 +21,16 @@ import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import kotlin.math.atan2
 import kotlin.math.cos
-import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * Demo-grade live 3D representation of the actual shared AR world.
+ * Live 3D representation of the actual shared AR world.
  *
- * It renders the current local + transformed peer metric point clouds, phone poses,
- * static POIs, dynamic vehicles and motion trails. The view is intentionally a
- * lightweight Canvas renderer: no second AR session, no map backend and no cloud.
- * It is designed to be screen-recorded as a presentation/wow-factor view.
+ * It renders the accumulated local + transformed peer metric map, current point
+ * cloud, phone poses, static POIs, dynamic vehicles and motion trails. It uses no
+ * second AR session and no cloud/server. The visualization is deliberately made for
+ * a screen-recordable product demo while still showing the real spatial state.
  */
 class BirdEyeWorldView(context: Context) : View(context) {
     private data class TrailPoint(val p: FloatArray, val t: Long)
@@ -54,6 +53,16 @@ class BirdEyeWorldView(context: Context) : View(context) {
     private val remotePointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x995cf4c5.toInt()
         strokeWidth = 2.4f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val accumulatedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x665cf4c5
+        strokeWidth = 2.7f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val accumulatedRemotePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x66ffc45c
+        strokeWidth = 2.7f
         strokeCap = Paint.Cap.ROUND
     }
     private val localPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -86,6 +95,11 @@ class BirdEyeWorldView(context: Context) : View(context) {
         color = 0xffc7d1d8.toInt()
         textSize = 22f
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
+    }
+    private val statusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xff5cf4c5.toInt()
+        textSize = 21f
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
@@ -133,16 +147,18 @@ class BirdEyeWorldView(context: Context) : View(context) {
         lastDrawNs = nowNs
 
         val snapshot = WorldVizBus.snapshot()
+        val persistentMap = SpatialMapAccumulator.snapshot(limit = 6500)
         updateTrails(snapshot)
-        val center = chooseCenter(snapshot)
+        val center = chooseCenter(snapshot, persistentMap)
         val groundY = snapshot.actors.firstOrNull { it.local }?.position?.getOrElse(1) { 0f } ?: center[1]
 
         drawGround(canvas, center, groundY)
-        drawPointCloud(canvas, snapshot, center)
+        drawPersistentMap(canvas, persistentMap, center)
+        drawCurrentPointCloud(canvas, snapshot, center)
         drawTrails(canvas, snapshot, center)
         drawTargets(canvas, snapshot, center)
         drawActors(canvas, snapshot, center)
-        drawHud(canvas, snapshot)
+        drawHud(canvas, snapshot, persistentMap.size)
 
         postInvalidateOnAnimation()
     }
@@ -169,9 +185,13 @@ class BirdEyeWorldView(context: Context) : View(context) {
         return true
     }
 
-    private fun chooseCenter(snapshot: WorldVizBus.Snapshot): FloatArray {
+    private fun chooseCenter(
+        snapshot: WorldVizBus.Snapshot,
+        persistentMap: List<SpatialMapAccumulator.Point>,
+    ): FloatArray {
         snapshot.actors.firstOrNull { it.local }?.position?.let { return it.copyOf(3) }
         snapshot.targets.firstOrNull()?.position?.let { return it.copyOf(3) }
+        persistentMap.firstOrNull()?.xyz?.let { return it.copyOf(3) }
         return floatArrayOf(0f, 0f, 0f)
     }
 
@@ -187,7 +207,23 @@ class BirdEyeWorldView(context: Context) : View(context) {
         }
     }
 
-    private fun drawPointCloud(canvas: Canvas, snapshot: WorldVizBus.Snapshot, center: FloatArray) {
+    private fun drawPersistentMap(
+        canvas: Canvas,
+        points: List<SpatialMapAccumulator.Point>,
+        center: FloatArray,
+    ) {
+        for (point in points) {
+            val s = project(point.xyz, center)
+            if (s.x !in -20f..width + 20f || s.y !in -20f..height + 20f) continue
+            val paint = if (point.remoteSeen) accumulatedRemotePaint else accumulatedPaint
+            paint.alpha = (70 + min(150, point.observations * 8)).coerceIn(70, 220)
+            canvas.drawPoint(s.x, s.y, paint)
+        }
+        accumulatedPaint.alpha = 255
+        accumulatedRemotePaint.alpha = 255
+    }
+
+    private fun drawCurrentPointCloud(canvas: Canvas, snapshot: WorldVizBus.Snapshot, center: FloatArray) {
         snapshot.points.forEach { point ->
             val s = project(point.xyz, center)
             if (s.x in -20f..width + 20f && s.y in -20f..height + 20f) {
@@ -223,7 +259,12 @@ class BirdEyeWorldView(context: Context) : View(context) {
             var first = true
             trail.forEach { tp ->
                 val s = project(tp.p, center)
-                if (first) { path.moveTo(s.x, s.y); first = false } else path.lineTo(s.x, s.y)
+                if (first) {
+                    path.moveTo(s.x, s.y)
+                    first = false
+                } else {
+                    path.lineTo(s.x, s.y)
+                }
             }
             val age = now - trail.last().t
             trailPaint.alpha = if (age < 3_000L) 170 else 95
@@ -268,22 +309,34 @@ class BirdEyeWorldView(context: Context) : View(context) {
         }
     }
 
-    private fun drawHud(canvas: Canvas, snapshot: WorldVizBus.Snapshot) {
+    private fun drawHud(canvas: Canvas, snapshot: WorldVizBus.Snapshot, mapSize: Int) {
         val pad = 24f
-        canvas.drawRoundRect(pad, pad, min(width - pad, 690f), 180f, 22f, 22f, panelPaint)
+        canvas.drawRoundRect(pad, pad, min(width - pad, 760f), 225f, 22f, 22f, panelPaint)
         canvas.drawText("LIVE SPATIAL WORLD", 48f, 68f, textPaint)
         val state = if (snapshot.locked) "LOCKED SHARED FRAME" else "ACQUIRING SHARED FRAME"
-        canvas.drawText(state, 48f, 103f, smallTextPaint)
+        statusPaint.color = if (snapshot.locked) 0xff5cf4c5.toInt() else 0xffffc45c.toInt()
+        canvas.drawText(state, 48f, 103f, statusPaint)
         canvas.drawText(
-            "actors ${snapshot.actors.size}   targets ${snapshot.targets.size}   cloud ${snapshot.points.size}",
+            "actors ${snapshot.actors.size}   targets ${snapshot.targets.size}   map $mapSize   live ${snapshot.points.size}",
             48f,
-            134f,
+            136f,
             smallTextPaint,
         )
+        val diagnostic = AlignmentDiagnostics.latest()
+        if (diagnostic != null) {
+            val q = diagnostic.quality
+            val metric = if (q.medianMetricResidualM.isFinite()) "%.2fm".format(q.medianMetricResidualM) else "—"
+            canvas.drawText(
+                "${diagnostic.blocker}  I ${q.inliers}/${q.correspondences}  C ${(q.imageCoverage * 100).toInt()}%  M $metric",
+                48f,
+                169f,
+                smallTextPaint,
+            )
+        }
         val burst = if (snapshot.burstProgress in 0.001f..0.999f) {
-            "   burst ${(snapshot.burstProgress * 100).toInt()}%"
+            "   acquisition ${(snapshot.burstProgress * 100).toInt()}%"
         } else ""
-        canvas.drawText("drag orbit • pinch zoom$burst", 48f, 164f, smallTextPaint)
+        canvas.drawText("drag orbit • pinch zoom$burst", 48f, 202f, smallTextPaint)
     }
 
     private fun project(p: FloatArray, center: FloatArray): PointF {
@@ -310,7 +363,10 @@ class BirdEyeWorldView(context: Context) : View(context) {
 
     private fun yawFromQuaternion(q: FloatArray): Float {
         if (q.size < 4) return 0f
-        val x = q[0]; val y = q[1]; val z = q[2]; val w = q[3]
+        val x = q[0]
+        val y = q[1]
+        val z = q[2]
+        val w = q[3]
         return atan2(2f * (w * y + x * z), 1f - 2f * (y * y + z * z))
     }
 
@@ -369,7 +425,8 @@ object BirdEyeWorldController {
             setOnClickListener { shell.visibility = View.GONE }
         }
         shell.addView(close, FrameLayout.LayoutParams(dp(92), dp(48), Gravity.TOP or Gravity.END).apply {
-            topMargin = dp(24); rightMargin = dp(18)
+            topMargin = dp(24)
+            rightMargin = dp(18)
         })
 
         val orbit = TextView(activity).apply {
@@ -385,7 +442,8 @@ object BirdEyeWorldController {
             }
         }
         shell.addView(orbit, FrameLayout.LayoutParams(dp(112), dp(48), Gravity.BOTTOM or Gravity.END).apply {
-            bottomMargin = dp(18); rightMargin = dp(18)
+            bottomMargin = dp(18)
+            rightMargin = dp(18)
         })
 
         content.addView(shell, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
