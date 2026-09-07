@@ -14,22 +14,13 @@ import kotlin.math.sqrt
 /**
  * Precision-first shared-world coordinator.
  *
- * Each phone still has to obtain an independently valid visual/metric solution,
- * but the room host is the single canonical world. Independent ARCore world-frame
- * estimates are NOT compared by raw matrix translation components: a small angular
- * difference around non-zero world origins can make those components differ by many
- * centimetres even when both transforms map the observed scene almost identically.
+ * A strong transform solved by either phone may bootstrap the peer after rigid,
+ * gravity and physical-range sanity checks. The receiver no longer has to finish a
+ * second independent full solve before it can enter the shared world. If both phones
+ * already solved independently, scene-space agreement remains the stricter path.
  *
- * Instead, the receiver compares how the two transforms map real metric scene points
- * from the peer world. A joiner may adopt the host transform only when:
- *  - its own independently solved transform is already strict/metric/range valid,
- *  - the host transform carries strong visual evidence,
- *  - fresh RTT/BLE range is physically compatible,
- *  - both transforms agree over actual observed 3D scene support.
- *
- * Once the joiner adopts the exact host transform it returns PEER_ACK. The host then
- * verifies that ACK against its canonical transform. The canonical transform is kept
- * static after initial lock; an active POI therefore cannot be dragged by refinement.
+ * Once a transform is adopted it is kept static; active manual POIs therefore cannot
+ * be dragged by later refinement. Dynamic AUTO:CAR observations remain transient.
  */
 class AlignmentCoordinator(
     private val transport: WifiAwarePeerTransport,
@@ -202,8 +193,7 @@ class AlignmentCoordinator(
     /**
      * Manual POIs are persistent and may be replayed after a transient state update.
      * AUTO:CAR packets are live observations: transform and forward each packet once,
-     * but never store it as pending state. Otherwise periodic RTT/quality emissions
-     * would keep replaying the last car forever after it had left the camera view.
+     * but never store it as pending state.
      */
     fun onRemotePoi(message: WireMessage.Poi) {
         if (isDynamicVehicleOwner(message.owner)) {
@@ -295,11 +285,6 @@ class AlignmentCoordinator(
         return Pair(translation, rotationDeg)
     }
 
-    /**
-     * Each phone solves once. The host solution becomes canonical only after the
-     * joiner has independently solved and physically compared the two mappings.
-     * We intentionally do not keep changing the world transform after this point.
-     */
     private fun maybeSolve() {
         if (!transport.connected || lockedTransform != null) return
 
@@ -524,9 +509,12 @@ class AlignmentCoordinator(
     }
 
     /**
-     * Verification is performed in scene space. We transform the SAME remote ARCore
-     * world points using both estimates and measure their separation where the scene
-     * actually exists. This is the quantity that matters for a shared POI.
+     * A receiver with no local lock may now adopt a strong peer-issued transform.
+     * The peer only broadcasts a transform after its own visual/metric/range gates
+     * and consensus have passed. The receiver independently checks rigidity, gravity
+     * and its current physical RTT/BLE range before adoption. This removes the old
+     * double-solve deadlock while retaining the stricter scene-space comparison when
+     * both phones happened to solve independently.
      */
     @Synchronized private fun tryVerifyPeerTransform() {
         val message = pendingPeerTransform ?: return
@@ -541,11 +529,47 @@ class AlignmentCoordinator(
         if (gravityTilt.isFinite() && gravityTilt > PEER_MAX_GRAVITY_TILT_DEG) return
         if (!candidateRangeCompatible(peerCandidate)) return
 
+        val isAck = message.transformSource == "PEER_ACK"
+        val bootstrapVisualEvidence = !isAck &&
+            message.confidence >= PEER_BOOTSTRAP_MIN_CONFIDENCE &&
+            message.transformInliers >= PEER_BOOTSTRAP_MIN_INLIERS &&
+            message.transformMedianReprojectionPx.isFinite() &&
+            message.transformMedianReprojectionPx <= PEER_BOOTSTRAP_MAX_REPROJECTION_PX
+
+        // Critical fast path: one successful shared-world solve is sufficient to
+        // bootstrap the pair. Previously this line effectively read
+        // `val existing = lockedTransform ?: return`, forcing a second full solve.
+        if (lockedTransform == null) {
+            if (!bootstrapVisualEvidence) return
+
+            solveSerial.incrementAndGet()
+            lockedTransform = peerCandidate.copyOf()
+            localConfidence = min(0.99f, max(localConfidence, message.confidence * 0.97f))
+            stableCount = max(stableCount, 1)
+            lastLockInliers = message.transformInliers
+            lastLockReprojectionPx = message.transformMedianReprojectionPx
+            lastLockSource = "PEER_BOOTSTRAP_ADOPTED"
+            peerReady = true
+            peerTransformVerified = true
+            pendingPeerTransform = null
+
+            transport.sendAlignmentTransform(
+                senderFromPeer = lockedTransform ?: peerCandidate,
+                confidence = localConfidence.coerceAtLeast(MIN_PEER_TRANSFORM_CONFIDENCE),
+                inliers = lastLockInliers,
+                medianReprojectionPx = lastLockReprojectionPx,
+                source = "PEER_ACK",
+            )
+            transport.sendQuality(localConfidence, stableCount, true)
+            emitQuality()
+            publishPendingPoiIfPossible()
+            return
+        }
+
         val existing = lockedTransform ?: return
         val agreement = sceneAgreement(existing, peerCandidate)
         lastAgreement = agreement
 
-        val isAck = message.transformSource == "PEER_ACK"
         if (isAck) {
             if (!ackAgreementAcceptable(agreement)) return
             peerReady = true
@@ -566,10 +590,6 @@ class AlignmentCoordinator(
         peerReady = true
 
         if (transport.isHostRole) {
-            // The host NEVER adopts the joiner's world. Its independently solved
-            // transform is the room canonical transform. Seeing a physically
-            // compatible client estimate is enough to send the canonical mapping
-            // again; the client must adopt it and ACK that exact mapping.
             pendingPeerTransform = null
             peerTransformVerified = false
             lastLockSource = "HOST_CANONICAL_WAIT_ACK"
@@ -578,9 +598,6 @@ class AlignmentCoordinator(
             return
         }
 
-        // Joiner: its own strict solve has now independently validated the host
-        // mapping over the observed 3D scene. Adopt the host transform EXACTLY so
-        // both devices use one coordinate system rather than two noisy estimates.
         lockedTransform = peerCandidate.copyOf()
         localConfidence = min(
             0.99f,
@@ -635,8 +652,6 @@ class AlignmentCoordinator(
                 i += step
             }
 
-            // Camera poses are particularly useful when depth is sparse because
-            // they are stable metric points in the peer ARCore world too.
             val ca = AlignmentEngine.transformPoint(a, frame.pose.t)
             val cb = AlignmentEngine.transformPoint(b, frame.pose.t)
             val cdx = ca[0] - cb[0]
@@ -663,10 +678,6 @@ class AlignmentCoordinator(
             return false
         }
 
-        // With lots of real metric samples, scene-space agreement is substantially
-        // more informative than raw SE(3) translation-vector equality. The relaxed
-        // tier is allowed only when both independent solves were strong; catastrophic
-        // transforms remain excluded by range, gravity, per-phone PnP and 3D gates.
         val strongLocal = localConfidence >= 0.16f
         val strongPeer = peerConfidence >= 0.16f
         val strong = strongLocal && strongPeer
@@ -702,7 +713,6 @@ class AlignmentCoordinator(
     }
 
     private fun relativeRotationDeg(a: DoubleArray, b: DoubleArray): Double {
-        // trace(Ra^T Rb) without constructing another matrix.
         val trace =
             a[0] * b[0] + a[4] * b[4] + a[8] * b[8] +
                 a[1] * b[1] + a[5] * b[5] + a[9] * b[9] +
@@ -899,7 +909,7 @@ class AlignmentCoordinator(
             rangeM = latestRangeM,
             rangeSource = latestRangeSource,
             fusionSource = when {
-                lockedTransform != null && peerTransformVerified -> "HOST CANONICAL VERIFIED"
+                lockedTransform != null && peerTransformVerified -> lastLockSource
                 lockedTransform != null -> lastLockSource
                 else -> coarseSource
             },
@@ -975,6 +985,9 @@ class AlignmentCoordinator(
         private const val PEER_MAX_GRAVITY_TILT_DEG = 12.0
         private const val MIN_PEER_TRANSFORM_CONFIDENCE = 0.10f
         private const val MAX_PEER_REPROJECTION_PX = 4.5f
+        private const val PEER_BOOTSTRAP_MIN_CONFIDENCE = 0.14f
+        private const val PEER_BOOTSTRAP_MIN_INLIERS = 10
+        private const val PEER_BOOTSTRAP_MAX_REPROJECTION_PX = 3.5f
 
         private const val MIN_LOCK_INLIERS = 8
         private const val MIN_LOCK_CORRESPONDENCES = 8
