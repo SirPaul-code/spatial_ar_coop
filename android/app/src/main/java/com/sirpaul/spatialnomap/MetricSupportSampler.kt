@@ -12,33 +12,20 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * Metric geometry sampler for cross-device registration and POI placement.
- *
- * Production policy:
- *  1. Prefer high-confidence ARCore Raw Depth as the metric backbone.
- *  2. Never throw away dense full depth just because a small raw set exists:
- *     raw depth is intentionally sparse, so full depth fills uncovered image cells.
- *  3. Reject raw pixels below the ARCore confidence midpoint (128/255).
- *  4. Fall back to ARCore's tracked point cloud when depth is unavailable.
- *
- * A single depth pixel is never trusted. All paths use a local robust median
- * with an edge/noise gate before converting the measurement to ARCore world.
+ * Dense metric geometry sampler for precision cross-device registration and POI
+ * placement. Bandwidth is intentionally traded for geometric coverage.
  */
 object MetricSupportSampler {
     private const val RAW_CONFIDENCE_MIN = 128
     private const val MIN_DEPTH_MM = 150
     private const val MAX_DEPTH_MM = 65_000
-    private const val MERGE_CELL_PX = 10f
+    private const val MERGE_CELL_PX = 6f
 
-    fun sample(frame: Frame, camera: Camera, maxPoints: Int = 2200): List<FloatArray> {
-        // Raw depth is more accurate but can contain only a few dozen confident
-        // samples. Returning it exclusively was starving SIFT->metric association
-        // on otherwise good frames. Keep raw as the first-class support and fill
-        // the holes with dense ARCore depth from the same frame.
+    fun sample(frame: Frame, camera: Camera, maxPoints: Int = 8000): List<FloatArray> {
         val raw = tryRawDepth(frame, camera, maxPoints)
         val full = tryFullDepth(frame, camera, maxPoints)
         val merged = mergeSupports(raw, full, maxPoints)
-        if (merged.size >= 24) return merged
+        if (merged.size >= 48) return merged
 
         val cloud = samplePointCloud(frame, camera, maxPoints)
         return mergeSupports(merged, cloud, maxPoints)
@@ -92,10 +79,6 @@ object MetricSupportSampler {
         }
     }
 
-    /**
-     * Raw depth is sparse but higher-fidelity. We keep only confident samples
-     * and use a confidence-weighted local robust median at every support cell.
-     */
     private fun tryRawDepth(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
         return try {
             frame.acquireRawDepthImage16Bits().use { depthImage ->
@@ -141,7 +124,6 @@ object MetricSupportSampler {
         }
     }
 
-    /** Full ARCore depth is denser and temporally smoothed; it fills raw-depth holes. */
     private fun tryFullDepth(frame: Frame, camera: Camera, maxPoints: Int): List<FloatArray> {
         return try {
             frame.acquireDepthImage16Bits().use { image ->
@@ -173,11 +155,6 @@ object MetricSupportSampler {
         }
     }
 
-    /**
-     * Keep primary supports first and fill only image cells which are not already
-     * represented. This avoids thousands of duplicate raw/full samples while
-     * preserving dense metric coverage for visual feature association.
-     */
     private fun mergeSupports(
         primary: List<FloatArray>,
         secondary: List<FloatArray>,

@@ -16,12 +16,6 @@ sealed class WireMessage {
     data object ClearPoi : WireMessage()
     data class Range(val distanceM: Float, val stdDevM: Float, val samples: Int) : WireMessage()
 
-    /**
-     * Quality normally carries only scalar readiness. Once a sender has solved
-     * T_senderWorld_from_peerWorld it can attach that SE(3) here. The receiver
-     * inverts and physically validates it, so one strong solve can bootstrap both
-     * phones instead of requiring two independent locks.
-     */
     data class Quality(
         val confidence: Float,
         val stableCount: Int,
@@ -35,7 +29,6 @@ sealed class WireMessage {
     data class ResetAlignment(val reason: String) : WireMessage()
 
     companion object {
-        /** Factory kept named for transport readability without adding a new wire subtype. */
         @Suppress("FunctionName")
         fun AlignmentTransform(
             senderFromPeer: DoubleArray,
@@ -57,8 +50,11 @@ sealed class WireMessage {
 
 object PeerProtocol {
     private const val MAGIC = 0x53505632
-    private const val VERSION = 4
-    private const val MAX_PAYLOAD = 8 * 1024 * 1024
+    // V5 intentionally breaks compatibility with older APKs: registration frames
+    // may now carry up to 8k metric supports. Both phones must run the same build.
+    private const val VERSION = 5
+    private const val MAX_PAYLOAD = 16 * 1024 * 1024
+    private const val MAX_FRAME_POINTS = 8000
     private const val T_HELLO = 1
     private const val T_FRAME = 2
     private const val T_POI = 3
@@ -197,7 +193,7 @@ object PeerProtocol {
         out.writeInt(jpeg.size)
         out.write(jpeg)
 
-        val points = frame.metricPoints.take(2500)
+        val points = frame.metricPoints.take(MAX_FRAME_POINTS)
         out.writeInt(points.size)
         for (p in points) repeat(5) { out.writeFloat(p.getOrElse(it) { 0f }) }
 
@@ -223,7 +219,7 @@ object PeerProtocol {
         input.readFully(jpeg)
 
         val count = input.readInt()
-        require(count in 0..2500) { "invalid point count $count" }
+        require(count in 0..MAX_FRAME_POINTS) { "invalid point count $count" }
         val points = ArrayList<FloatArray>(count)
         repeat(count) { points += FloatArray(5) { input.readFloat() } }
 

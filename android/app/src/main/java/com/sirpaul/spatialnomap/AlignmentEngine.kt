@@ -20,6 +20,7 @@ import org.opencv.imgcodecs.Imgcodecs
 import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.exp
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
@@ -36,6 +37,10 @@ object AlignmentEngine {
         val headingResidualDeg: Double = Double.NaN,
         val sensorPriorConfidence: Float = 0f,
         val gravityTiltDeg: Double = Double.NaN,
+        // Independent 3D->3D validation using metric depth from BOTH phones.
+        val metricPairs: Int = 0,
+        val metricInliers: Int = 0,
+        val medianMetricResidualM: Double = Double.NaN,
     )
 
     private data class MatchSet(
@@ -50,35 +55,51 @@ object AlignmentEngine {
     )
 
     fun solve(remote: CapturedFrame, local: CapturedFrame): Result? {
-        if (remote.metricPoints.size < 18) return null
+        if (remote.metricPoints.size < 24) return null
         val matchSet = siftMatches(remote, local) ?: return null
-        if (matchSet.matches.size < 8) return null
+        if (matchSet.matches.size < MIN_MATCHES_FOR_PNP) return null
 
-        val used = HashSet<Int>()
+        val usedRemoteMetric = HashSet<Int>()
+        val usedLocalMetric = HashSet<Int>()
         val objectPoints = ArrayList<Point3>()
         val imagePoints = ArrayList<Point>()
-        val gate2 = METRIC_ASSOCIATION_RADIUS_PX * METRIC_ASSOCIATION_RADIUS_PX
+        val localMetricWorld = ArrayList<Point3?>()
+
         for (m in matchSet.matches) {
-            val p = matchSet.keyRemote[m.queryIdx].pt
-            var best = -1
-            var bestD2 = Double.POSITIVE_INFINITY
-            for (j in remote.metricPoints.indices) {
-                if (j in used) continue
-                val s = remote.metricPoints[j]
-                val dx = s[0] - p.x
-                val dy = s[1] - p.y
-                val d2 = dx * dx + dy * dy
-                if (d2 < bestD2) {
-                    bestD2 = d2
-                    best = j
-                }
+            val remoteKey = matchSet.keyRemote[m.queryIdx].pt
+            val remoteMetricIndex = nearestMetricIndex(
+                remote.metricPoints,
+                remoteKey.x,
+                remoteKey.y,
+                usedRemoteMetric,
+                METRIC_ASSOCIATION_RADIUS_PX,
+            )
+            if (remoteMetricIndex < 0) continue
+            usedRemoteMetric += remoteMetricIndex
+            val remoteSupport = remote.metricPoints[remoteMetricIndex]
+
+            val localKey = matchSet.keyLocal[m.trainIdx].pt
+            val localMetricIndex = nearestMetricIndex(
+                local.metricPoints,
+                localKey.x,
+                localKey.y,
+                usedLocalMetric,
+                LOCAL_METRIC_ASSOCIATION_RADIUS_PX,
+            )
+            val localSupport = if (localMetricIndex >= 0) {
+                usedLocalMetric += localMetricIndex
+                local.metricPoints[localMetricIndex]
+            } else null
+
+            objectPoints += Point3(
+                remoteSupport[2].toDouble(),
+                remoteSupport[3].toDouble(),
+                remoteSupport[4].toDouble(),
+            )
+            imagePoints += Point(localKey.x, localKey.y)
+            localMetricWorld += localSupport?.let {
+                Point3(it[2].toDouble(), it[3].toDouble(), it[4].toDouble())
             }
-            if (best < 0 || bestD2 > gate2) continue
-            used += best
-            val s = remote.metricPoints[best]
-            objectPoints += Point3(s[2].toDouble(), s[3].toDouble(), s[4].toDouble())
-            val q = matchSet.keyLocal[m.trainIdx].pt
-            imagePoints += Point(q.x, q.y)
         }
         if (objectPoints.size < 6) return null
 
@@ -97,9 +118,9 @@ object AlignmentEngine {
             rvec,
             tvec,
             false,
-            900,
-            3.6f,
-            0.999,
+            1200,
+            3.2f,
+            0.9995,
             inlierMat,
             Calib3d.SOLVEPNP_EPNP,
         )
@@ -112,10 +133,12 @@ object AlignmentEngine {
         inlierMat.get(0, 0, inlierIndexes)
         val inObj = ArrayList<Point3>()
         val inImg = ArrayList<Point>()
+        val inOriginalIndexes = ArrayList<Int>()
         for (idx in inlierIndexes) {
             if (idx in objectPoints.indices) {
                 inObj += objectPoints[idx]
                 inImg += imagePoints[idx]
+                inOriginalIndexes += idx
             }
         }
         if (inObj.size < 6 || spatialDiameterM(inObj) < MIN_WORLD_SUPPORT_DIAMETER_M) {
@@ -182,16 +205,58 @@ object AlignmentEngine {
         errors.sort()
         val median = if (errors.isNotEmpty()) errors[errors.size / 2] else 999.0
         val coverage = imageCoverage(inImg, local.intrinsics.width, local.intrinsics.height)
+
+        // Crucial symmetric check: PnP can fit a wrong transform when a SIFT feature
+        // is accidentally associated with depth from another surface. If the local
+        // phone also has metric depth at the matched feature, the transformed remote
+        // 3D point must land near that independently measured local 3D point.
+        val metricResiduals = ArrayList<Double>()
+        var metricInliers = 0
+        for (sourceIndex in inOriginalIndexes) {
+            val localSupport = localMetricWorld.getOrNull(sourceIndex) ?: continue
+            val remoteSupport = objectPoints[sourceIndex]
+            val transformed = transformPoint(
+                localFromRemote,
+                floatArrayOf(remoteSupport.x.toFloat(), remoteSupport.y.toFloat(), remoteSupport.z.toFloat()),
+            )
+            val dx = transformed[0] - localSupport.x
+            val dy = transformed[1] - localSupport.y
+            val dz = transformed[2] - localSupport.z
+            val residual = sqrt(dx * dx + dy * dy + dz * dz)
+            if (!residual.isFinite()) continue
+            metricResiduals += residual
+            if (residual <= METRIC_RESIDUAL_INLIER_M) metricInliers += 1
+        }
+        metricResiduals.sort()
+        val metricPairs = metricResiduals.size
+        val medianMetricResidual = if (metricPairs > 0) metricResiduals[metricPairs / 2] else Double.NaN
+        if (metricPairs >= MIN_METRIC_PAIRS_FOR_GATE) {
+            val minimumMetricInliers = max(
+                MIN_METRIC_INLIERS,
+                kotlin.math.ceil(metricPairs * MIN_METRIC_INLIER_RATIO).toInt(),
+            )
+            if (metricInliers < minimumMetricInliers || medianMetricResidual > MAX_MEDIAN_METRIC_RESIDUAL_M) {
+                releaseAll(obj, img, k, dist, rvec, tvec, inlierMat, objIn, imgIn, rotation)
+                return null
+            }
+        }
+
         val ratio = inObj.size.toDouble() / objectPoints.size
-        val supportFactor = min(1.0, inObj.size / 20.0)
+        val supportFactor = min(1.0, inObj.size / 22.0)
         val coverageFactor = min(1.0, coverage / 0.16)
-        var confidence = (ratio * supportFactor * coverageFactor * exp(-median / 4.2))
+        var confidence = (ratio * supportFactor * coverageFactor * exp(-median / 4.0))
             .coerceIn(0.0, 1.0)
             .toFloat()
 
+        if (metricPairs >= 3 && medianMetricResidual.isFinite()) {
+            val metricRatio = metricInliers.toDouble() / metricPairs
+            val metricFit = (metricRatio * exp(-medianMetricResidual / 0.18)).coerceIn(0.0, 1.0)
+            confidence *= (0.62 + 0.38 * metricFit).toFloat()
+        }
+
         val gravityTilt = FusionMath.gravityTiltDeg(localFromRemote)
         if (gravityTilt.isFinite()) {
-            if (gravityTilt > 32.0) {
+            if (gravityTilt > 28.0) {
                 releaseAll(obj, img, k, dist, rvec, tvec, inlierMat, objIn, imgIn, rotation)
                 return null
             }
@@ -222,7 +287,7 @@ object AlignmentEngine {
         val predictedDistance = sqrt(dx * dx + dy * dy + dz * dz)
 
         releaseAll(obj, img, k, dist, rvec, tvec, inlierMat, objIn, imgIn, rotation)
-        if (!localFromRemote.all { it.isFinite() } || determinant3(localFromRemote) !in 0.95..1.05) return null
+        if (!localFromRemote.all { it.isFinite() } || determinant3(localFromRemote) !in 0.97..1.03) return null
 
         return Result(
             transformLocalFromRemote = localFromRemote,
@@ -236,15 +301,41 @@ object AlignmentEngine {
             headingResidualDeg = headingResidual,
             sensorPriorConfidence = yawPrior?.confidence ?: 0f,
             gravityTiltDeg = gravityTilt,
+            metricPairs = metricPairs,
+            metricInliers = metricInliers,
+            medianMetricResidualM = medianMetricResidual,
         )
     }
 
+    private fun nearestMetricIndex(
+        points: List<FloatArray>,
+        u: Double,
+        v: Double,
+        used: Set<Int>,
+        radiusPx: Double,
+    ): Int {
+        val gate2 = radiusPx * radiusPx
+        var best = -1
+        var bestD2 = Double.POSITIVE_INFINITY
+        for (j in points.indices) {
+            if (j in used) continue
+            val s = points[j]
+            if (s.size < 5) continue
+            val dx = s[0] - u
+            val dy = s[1] - v
+            val d2 = dx * dx + dy * dy
+            if (d2 < bestD2) {
+                bestD2 = d2
+                best = j
+            }
+        }
+        return if (best >= 0 && bestD2 <= gate2) best else -1
+    }
+
     /**
-     * Mutual SIFT matches remain the trusted core, but we also keep a bounded set
-     * of very strong one-way ratio matches. Previously, once eight mutual matches
-     * existed, all other high-quality matches were discarded; with sparse depth
-     * that could leave only 6-7 metric correspondences forever. RANSAC is exactly
-     * the layer which should reject the remaining outliers.
+     * High feature count is intentional. Wi-Fi Aware bandwidth is cheaper than a
+     * false shared-world lock, and RANSAC plus symmetric depth validation reject
+     * the extra outliers.
      */
     private fun siftMatches(remote: CapturedFrame, local: CapturedFrame): MatchSet? {
         val a = decodeGray(remote) ?: return null
@@ -252,7 +343,7 @@ object AlignmentEngine {
             a.release()
             return null
         }
-        val sift = SIFT.create(2600, 3, 0.016, 12.0, 1.6)
+        val sift = SIFT.create(4200, 3, 0.012, 12.0, 1.6)
         val kpa = MatOfKeyPoint()
         val kpb = MatOfKeyPoint()
         val da = Mat()
@@ -319,7 +410,6 @@ object AlignmentEngine {
             if (usedQuery.add(m.queryIdx) && usedTrain.add(m.trainIdx)) good += m
         }
 
-        // Recovery path only when the strict set is still too small to run PnP.
         if (good.size < MIN_MATCHES_FOR_PNP) {
             for (candidate in ratioAccepted.sortedWith(compareBy<RatioMatch> { it.ratio }.thenBy { it.match.distance })) {
                 if (good.size >= RECOVERY_MATCH_TARGET) break
@@ -459,13 +549,19 @@ object AlignmentEngine {
         for (m in mats) runCatching { m.release() }
     }
 
-    private const val SIFT_RATIO = 0.80f
-    private const val STRICT_FALLBACK_RATIO = 0.72f
-    private const val RECOVERY_FALLBACK_RATIO = 0.77f
+    private const val SIFT_RATIO = 0.78f
+    private const val STRICT_FALLBACK_RATIO = 0.70f
+    private const val RECOVERY_FALLBACK_RATIO = 0.76f
     private const val MIN_MATCHES_FOR_PNP = 8
-    private const val RECOVERY_MATCH_TARGET = 12
-    private const val MAX_STRICT_AUGMENT = 24
-    private const val METRIC_ASSOCIATION_RADIUS_PX = 20.0
-    private const val MIN_WORLD_SUPPORT_DIAMETER_M = 0.08
-    private const val MIN_CHEIRALITY_RATIO = 0.90
+    private const val RECOVERY_MATCH_TARGET = 18
+    private const val MAX_STRICT_AUGMENT = 48
+    private const val METRIC_ASSOCIATION_RADIUS_PX = 10.0
+    private const val LOCAL_METRIC_ASSOCIATION_RADIUS_PX = 10.0
+    private const val MIN_WORLD_SUPPORT_DIAMETER_M = 0.10
+    private const val MIN_CHEIRALITY_RATIO = 0.92
+    private const val MIN_METRIC_PAIRS_FOR_GATE = 5
+    private const val MIN_METRIC_INLIERS = 4
+    private const val MIN_METRIC_INLIER_RATIO = 0.60
+    private const val METRIC_RESIDUAL_INLIER_M = 0.20
+    private const val MAX_MEDIAN_METRIC_RESIDUAL_M = 0.24
 }

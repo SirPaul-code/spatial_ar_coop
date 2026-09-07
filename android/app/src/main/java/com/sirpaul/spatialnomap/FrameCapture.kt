@@ -16,9 +16,9 @@ import kotlin.math.min
 
 object FrameCapture {
     /**
-     * Captures the CPU Y plane as a compact grayscale JPEG plus the AR camera
-     * geometry, metric supports and a sensor snapshot taken at almost the same
-     * instant. The latter is used only as a registration prior/fallback.
+     * Captures the CPU Y plane plus dense metric supports. Registration quality is
+     * preferred over transfer size: Wi-Fi Aware/NDP is expected to carry several
+     * high-quality frames per second while the phones are acquiring a shared world.
      */
     fun capture(
         frame: Frame,
@@ -64,7 +64,7 @@ object FrameCapture {
             val src = Mat(srcH, srcW, CvType.CV_8UC1)
             val resized = Mat()
             val encoded = MatOfByte()
-            val params = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, 72)
+            val params = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, 90)
             try {
                 src.put(0, 0, grayBytes)
                 val output = if (dstW != srcW || dstH != srcH) {
@@ -87,7 +87,7 @@ object FrameCapture {
                 val f = intr.focalLength
                 val pp = intr.principalPoint
                 val pose = camera.pose
-                val metric = MetricSupportSampler.sample(frame, camera).map {
+                val metric = MetricSupportSampler.sample(frame, camera, maxPoints = 8000).map {
                     floatArrayOf(it[0] * scale, it[1] * scale, it[2], it[3], it[4])
                 }
 

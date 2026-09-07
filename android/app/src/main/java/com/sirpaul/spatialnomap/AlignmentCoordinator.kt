@@ -14,13 +14,13 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Establishes and maintains one canonical SE(3) transform between two independent
- * ARCore worlds. The room host is the canonical solver; the joiner is a fallback.
+ * Precision-first shared-world coordinator.
  *
- * Initial lock uses a spatially-diverse session micro-map. After LOCKED, the host
- * opportunistically re-solves at a much lower rate. Small high-quality drift is
- * SE(3)-smoothed, while larger corrections require multi-frame consensus. If the
- * phones stop sharing visual overlap, the last verified transform is retained.
+ * Both phones must now obtain their own visual/metric solution. A transform sent
+ * by the peer is evidence to compare against, never an authority that can create a
+ * lock by itself. RTT is a hard sanity gate while fresh, and matched depth from both
+ * cameras is an independent 3D consistency gate. Once a POI exists the canonical
+ * transform is frozen so background refinement cannot drag a physical marker.
  */
 class AlignmentCoordinator(
     private val transport: WifiAwarePeerTransport,
@@ -46,6 +46,9 @@ class AlignmentCoordinator(
         val fusionSeedConfidence: Float = 0f,
         val keyframesLocal: Int = 0,
         val keyframesRemote: Int = 0,
+        val metricPairs: Int = 0,
+        val metricInliers: Int = 0,
+        val medianMetricResidualM: Double = Double.NaN,
     ) {
         val bothReady: Boolean get() = localReady && peerReady && peerTransformVerified
     }
@@ -77,7 +80,6 @@ class AlignmentCoordinator(
     private val refinementHistory = ArrayDeque<Candidate>()
 
     @Volatile private var lockedTransform: DoubleArray? = null
-    @Volatile private var adoptedFromPeer = false
     @Volatile private var coarseConfidence = 0f
     @Volatile private var coarseSource = "NONE"
     @Volatile private var stableCount = 0
@@ -89,8 +91,10 @@ class AlignmentCoordinator(
     @Volatile private var latestRangeStdM: Float? = null
     @Volatile private var latestRangeSource = "NONE"
     @Volatile private var lastRttAtMs = 0L
+    @Volatile private var lastRangeAtMs = 0L
     @Volatile private var latestQuality = Quality()
     @Volatile private var pendingPoi: WireMessage.Poi? = null
+    @Volatile private var activePoi = false
     @Volatile private var connectedAtMs = 0L
     @Volatile private var lastSolveStartedMs = 0L
     @Volatile private var lastTransformBroadcastAtMs = 0L
@@ -123,7 +127,7 @@ class AlignmentCoordinator(
         synchronized(frameLock) { addDiverseKeyframe(localFrames, frame) }
         transport.sendFrame(frame)
         updateFusionSeed()
-        tryAdoptOrVerifyPeerTransform()
+        tryVerifyPeerTransform()
         maybeResendLockedTransform()
         maybeSolve()
     }
@@ -131,7 +135,7 @@ class AlignmentCoordinator(
     fun onRemoteFrame(frame: CapturedFrame) {
         synchronized(frameLock) { addDiverseKeyframe(remoteFrames, frame) }
         updateFusionSeed()
-        tryAdoptOrVerifyPeerTransform()
+        tryVerifyPeerTransform()
         maybeResendLockedTransform()
         maybeSolve()
     }
@@ -141,7 +145,9 @@ class AlignmentCoordinator(
             latestRangeM = distanceM
             latestRangeStdM = if (stdDevM.isFinite()) stdDevM else null
             latestRangeSource = "RTT"
-            lastRttAtMs = System.currentTimeMillis()
+            val now = System.currentTimeMillis()
+            lastRttAtMs = now
+            lastRangeAtMs = now
             updateFusionSeed()
             emitQuality()
         }
@@ -154,6 +160,7 @@ class AlignmentCoordinator(
         latestRangeM = distanceM
         latestRangeStdM = max(if (stdDevM.isFinite()) stdDevM else 1.0f, 0.75f)
         latestRangeSource = "BLE"
+        lastRangeAtMs = now
         updateFusionSeed()
         emitQuality()
     }
@@ -162,7 +169,10 @@ class AlignmentCoordinator(
         if (message.senderFromPeer != null) {
             peerReady = true
             pendingPeerTransform = message
-            tryAdoptOrVerifyPeerTransform()
+            if (message.transformSource != "PEER_ACK" && !activePoi) {
+                peerTransformVerified = false
+            }
+            tryVerifyPeerTransform()
         } else if (message.ready) {
             peerReady = true
         } else if (!peerTransformVerified) {
@@ -173,11 +183,13 @@ class AlignmentCoordinator(
 
     fun onRemotePoi(message: WireMessage.Poi) {
         pendingPoi = message
+        activePoi = true
         publishPendingPoiIfPossible()
     }
 
     fun clearPoi(sendToPeer: Boolean = true) {
         pendingPoi = null
+        activePoi = false
         if (sendToPeer) transport.sendClearPoi()
         listener.onPoiCleared()
     }
@@ -185,6 +197,7 @@ class AlignmentCoordinator(
     fun sendPoi(id: Long, pointLocalWorld: FloatArray, owner: String): Boolean {
         if (!canPlacePoi()) return false
         transport.sendPoi(id, owner, pointLocalWorld)
+        activePoi = true
         return true
     }
 
@@ -199,11 +212,6 @@ class AlignmentCoordinator(
         solveExecutor.shutdownNow()
     }
 
-    /**
-     * Keep a spatially diverse micro-map, but do not promote obviously high-angular
-     * velocity frames just because the timer elapsed. Those frames are commonly
-     * motion-blurred on phones and poison cross-view feature matching.
-     */
     private fun addDiverseKeyframe(window: ArrayDeque<CapturedFrame>, frame: CapturedFrame) {
         val last = window.peekLast()
         if (last == null) {
@@ -217,8 +225,8 @@ class AlignmentCoordinator(
         val lastNs = frameClockNs(last)
         val nowNs = frameClockNs(frame)
         val elapsedNs = if (lastNs > 0L && nowNs > lastNs) nowNs - lastNs else Long.MAX_VALUE
-        val materiallyBetterDepth = frame.metricPoints.size >= max(32, (last.metricPoints.size * 1.30).toInt())
-        val calmer = motionQuality > lastMotionQuality + 0.18
+        val materiallyBetterDepth = frame.metricPoints.size >= max(64, (last.metricPoints.size * 1.20).toInt())
+        val calmer = motionQuality > lastMotionQuality + 0.14
         val spatiallyNew = translationM >= KEYFRAME_TRANSLATION_M || rotationDeg >= KEYFRAME_ROTATION_DEG
         val temporallyNew = elapsedNs >= KEYFRAME_MAX_INTERVAL_NS
         val motionUsable = motionQuality >= MIN_KEYFRAME_MOTION_QUALITY
@@ -264,10 +272,15 @@ class AlignmentCoordinator(
         val currentLock = lockedTransform
         val refining = currentLock != null
 
-        if (refining && (!transport.isHostRole || adoptedFromPeer)) return
+        // The host is canonical for ongoing refinement, but BOTH phones solve the
+        // initial transform independently so READY cannot come from algebraic ACKs.
+        if (refining && !transport.isHostRole) return
+        if (refining && activePoi) return
 
         val now = System.currentTimeMillis()
-        if (!refining && !transport.isHostRole && now - connectedAtMs < CLIENT_FALLBACK_SOLVE_DELAY_MS) return
+        if (!refining && !transport.isHostRole && pendingPeerTransform == null &&
+            now - connectedAtMs < CLIENT_INITIAL_SOLVE_DELAY_MS
+        ) return
 
         val pairs = buildFramePairs()
         if (pairs.isEmpty()) return
@@ -316,13 +329,6 @@ class AlignmentCoordinator(
         )
     }
 
-    /**
-     * Frames from different phones do not share a monotonic clock, but both windows
-     * advance at roughly the same cadence. Prefer similar relative ages while still
-     * considering depth support, motion quality and recency. This prevents the top
-     * solve budget from repeatedly testing unrelated old/new views and missing the
-     * pair which actually shares scene overlap.
-     */
     private fun buildFramePairs(): List<FramePair> {
         val locals: List<CapturedFrame>
         val remotes: List<CapturedFrame>
@@ -339,9 +345,9 @@ class AlignmentCoordinator(
                 val remoteAge = (ri + 1).toDouble() / remotes.size
                 val recency = localAge + remoteAge
                 val temporalAffinity = (1.0 - abs(localAge - remoteAge)).coerceIn(0.0, 1.0)
-                val support = min(remote.metricPoints.size, 1800) / 1800.0
+                val support = min(min(remote.metricPoints.size, local.metricPoints.size), 6000) / 6000.0
                 val motionScore = min(frameMotionQuality(local), frameMotionQuality(remote))
-                val score = recency * 0.34 + temporalAffinity * 0.72 + support * 0.95 + motionScore * 0.52
+                val score = recency * 0.38 + temporalAffinity * 0.78 + support * 1.15 + motionScore * 0.48
                 out += FramePair(remote, local, score)
             }
         }
@@ -358,7 +364,7 @@ class AlignmentCoordinator(
     }
 
     @Synchronized private fun acceptInitialResult(result: AlignmentEngine.Result?) {
-        if (lockedTransform != null || adoptedFromPeer) return
+        if (lockedTransform != null) return
         if (result == null) {
             emitQuality()
             return
@@ -367,11 +373,13 @@ class AlignmentCoordinator(
         val confidence = max(result.confidence, geometricConfidence(result))
         val rangeDelta = latestRangeM?.let { range -> abs(result.predictedDeviceDistanceM.toFloat() - range) }
         val gravityOk = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= MAX_VISUAL_GRAVITY_TILT_DEG
+        val rangeOk = isRangeCompatible(result)
+        val metricOk = isMetricConsistent(result)
         val passes = result.inliers >= MIN_LOCK_INLIERS &&
             result.correspondences >= MIN_LOCK_CORRESPONDENCES &&
             result.medianReprojectionPx <= MAX_LOCK_REPROJECTION_PX &&
             result.imageCoverage >= MIN_LOCK_COVERAGE &&
-            confidence >= MIN_LOCK_CONFIDENCE && gravityOk
+            confidence >= MIN_LOCK_CONFIDENCE && gravityOk && rangeOk && metricOk
 
         localConfidence = confidence
         if (passes) {
@@ -381,23 +389,19 @@ class AlignmentCoordinator(
             val cluster = strongestCluster(candidateHistory, CLUSTER_TRANSLATION_M, CLUSTER_ROTATION_DEG)
             stableCount = cluster.size
             val singleStrong = isSingleFrameLockQuality(result)
-            val robustCandidate = result.inliers >= 9 && confidence >= 0.13f
+            val robustCandidate = result.inliers >= 10 && confidence >= 0.14f && metricOk && rangeOk
             val requiredConsensus = if (robustCandidate) 2 else 3
             val clustered = cluster.size >= requiredConsensus
 
             if (singleStrong || clustered) {
                 lockedTransform = consensusMedoid(if (cluster.isNotEmpty()) cluster else candidateHistory.toList())
-                adoptedFromPeer = false
                 lastLockInliers = result.inliers
                 lastLockReprojectionPx = result.medianReprojectionPx.toFloat()
-                lastLockSource = if (transport.isHostRole) "HOST_VISUAL" else "CLIENT_FALLBACK_VISUAL"
+                lastLockSource = if (transport.isHostRole) "HOST_VISUAL_2SIDED" else "CLIENT_VISUAL_2SIDED"
             }
         }
 
         val ready = lockedTransform != null
-        transport.sendQuality(confidence, stableCount, ready)
-        if (ready) broadcastLockedTransform(force = true)
-
         latestQuality = Quality(
             confidence = confidence,
             inliers = result.inliers,
@@ -418,15 +422,23 @@ class AlignmentCoordinator(
             fusionSeedConfidence = coarseConfidence,
             keyframesLocal = synchronized(frameLock) { localFrames.size },
             keyframesRemote = synchronized(frameLock) { remoteFrames.size },
+            metricPairs = result.metricPairs,
+            metricInliers = result.metricInliers,
+            medianMetricResidualM = result.medianMetricResidualM,
         )
-        listener.onAlignmentQuality(latestQuality)
-        publishPendingPoiIfPossible()
+
+        transport.sendQuality(confidence, stableCount, ready)
+        if (ready) {
+            broadcastLockedTransform(force = true)
+            tryVerifyPeerTransform()
+        }
+        emitQuality()
     }
 
     @Synchronized private fun acceptRefinement(result: AlignmentEngine.Result?) {
         val current = lockedTransform ?: return
-        if (adoptedFromPeer || !transport.isHostRole || result == null) return
-        if (!isRefinementQuality(result)) return
+        if (!transport.isHostRole || result == null || activePoi) return
+        if (!isRefinementQuality(result) || !isRangeCompatible(result) || !isMetricConsistent(result)) return
 
         val confidence = max(result.confidence, geometricConfidence(result))
         val measurement = result.transformLocalFromRemote
@@ -440,7 +452,7 @@ class AlignmentCoordinator(
 
         var updated: DoubleArray? = null
         if (translationDelta <= REFINEMENT_DIRECT_TRANSLATION_M && rotationDelta <= REFINEMENT_DIRECT_ROTATION_DEG) {
-            val alpha = if (isStrongRefinementQuality(result)) 0.28 else 0.16
+            val alpha = if (isStrongRefinementQuality(result)) 0.16 else 0.10
             updated = smoothRigid(current, measurement, alpha)
         } else {
             val cluster = strongestCluster(
@@ -448,25 +460,25 @@ class AlignmentCoordinator(
                 REFINEMENT_CLUSTER_TRANSLATION_M,
                 REFINEMENT_CLUSTER_ROTATION_DEG,
             )
-            val required = if (isStrongRefinementQuality(result)) 3 else 4
-            if (cluster.size >= required) {
+            if (cluster.size >= 3) {
                 val consensus = consensusMedoid(cluster)
                 val (consensusT, consensusR) = AlignmentEngine.transformDelta(current, consensus)
                 if (consensusT <= REFINEMENT_CONSENSUS_MAX_TRANSLATION_M && consensusR <= REFINEMENT_CONSENSUS_MAX_ROTATION_DEG) {
-                    updated = smoothRigid(current, consensus, 0.62)
+                    updated = smoothRigid(current, consensus, 0.25)
                 }
             }
         }
 
         if (updated == null) return
         val (appliedT, appliedR) = AlignmentEngine.transformDelta(current, updated)
-        if (appliedT < 0.004 && appliedR < 0.08) return
+        if (appliedT < 0.003 && appliedR < 0.05) return
 
         lockedTransform = updated
-        localConfidence = max(localConfidence * 0.985f, confidence * 0.97f).coerceIn(0.10f, 0.99f)
+        localConfidence = max(localConfidence * 0.992f, confidence * 0.98f).coerceIn(0.10f, 0.99f)
         lastLockInliers = result.inliers
         lastLockReprojectionPx = result.medianReprojectionPx.toFloat()
-        lastLockSource = "HOST_REFINED"
+        lastLockSource = "HOST_REFINED_2SIDED"
+        peerTransformVerified = false
 
         latestQuality = latestQuality.copy(
             confidence = localConfidence,
@@ -476,41 +488,76 @@ class AlignmentCoordinator(
             imageCoverage = result.imageCoverage,
             localReady = true,
             peerReady = peerReady,
-            peerTransformVerified = peerTransformVerified,
+            peerTransformVerified = false,
+            rangeDeltaM = latestRangeM?.let { abs(result.predictedDeviceDistanceM.toFloat() - it) },
             gravityTiltDeg = result.gravityTiltDeg,
             fusionSource = lastLockSource,
+            metricPairs = result.metricPairs,
+            metricInliers = result.metricInliers,
+            medianMetricResidualM = result.medianMetricResidualM,
         )
         broadcastLockedTransform(force = true)
-        listener.onAlignmentQuality(latestQuality)
-        publishPendingPoiIfPossible()
+        tryVerifyPeerTransform()
+        emitQuality()
+    }
+
+    private fun isRangeCompatible(result: AlignmentEngine.Result): Boolean {
+        val range = latestRangeM ?: return true
+        val now = System.currentTimeMillis()
+        if (lastRangeAtMs <= 0L || now - lastRangeAtMs > RANGE_GATE_FRESH_MS) return true
+        val delta = abs(result.predictedDeviceDistanceM - range.toDouble())
+        val std = latestRangeStdM?.takeIf { it.isFinite() && it > 0f }
+        val allowed = when (latestRangeSource) {
+            "RTT" -> max(RTT_MIN_RANGE_TOLERANCE_M, (std?.toDouble() ?: 0.15) * 4.0 + 0.30)
+            "BLE" -> max(BLE_MIN_RANGE_TOLERANCE_M, (std?.toDouble() ?: 1.0) * 2.0 + 0.75)
+            else -> return true
+        }
+        return delta <= allowed
+    }
+
+    private fun isMetricConsistent(result: AlignmentEngine.Result): Boolean {
+        if (result.metricPairs < MIN_METRIC_PAIRS_FOR_LOCK) return true
+        if (!result.medianMetricResidualM.isFinite()) return false
+        val required = max(MIN_METRIC_INLIERS_FOR_LOCK, kotlin.math.ceil(result.metricPairs * 0.60).toInt())
+        return result.metricInliers >= required && result.medianMetricResidualM <= MAX_METRIC_RESIDUAL_M
     }
 
     private fun isRefinementQuality(result: AlignmentEngine.Result): Boolean {
         val confidence = max(result.confidence, geometricConfidence(result))
-        val gravityOk = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 12.0
-        return result.inliers >= 9 && result.correspondences >= 9 &&
-            result.medianReprojectionPx <= 3.8 && result.imageCoverage >= 0.065 &&
-            confidence >= 0.13f && gravityOk
+        val gravityOk = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 8.0
+        return result.inliers >= 12 && result.correspondences >= 12 &&
+            result.medianReprojectionPx <= 2.8 && result.imageCoverage >= 0.08 &&
+            confidence >= 0.16f && gravityOk && isMetricConsistent(result)
     }
 
     private fun isStrongRefinementQuality(result: AlignmentEngine.Result): Boolean {
         val confidence = max(result.confidence, geometricConfidence(result))
-        val gravityOk = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 8.0
-        return result.inliers >= 14 && result.correspondences >= 14 &&
-            result.medianReprojectionPx <= 2.9 && result.imageCoverage >= 0.09 &&
-            confidence >= 0.20f && gravityOk
+        val gravityOk = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 6.0
+        return result.inliers >= 18 && result.correspondences >= 18 &&
+            result.medianReprojectionPx <= 2.2 && result.imageCoverage >= 0.12 &&
+            confidence >= 0.24f && gravityOk && isMetricConsistent(result)
     }
 
     private fun geometricConfidence(result: AlignmentEngine.Result): Float {
         if (result.correspondences <= 0 || !result.medianReprojectionPx.isFinite()) return 0f
         val ratio = (result.inliers.toDouble() / result.correspondences).coerceIn(0.0, 1.0)
-        val support = min(1.0, result.inliers / 18.0)
+        val support = min(1.0, result.inliers / 20.0)
         val coverage = min(1.0, result.imageCoverage / 0.14)
-        val reprojection = exp(-result.medianReprojectionPx / 5.0)
-        return (ratio * support * coverage * reprojection).coerceIn(0.0, 1.0).toFloat()
+        val reprojection = exp(-result.medianReprojectionPx / 4.5)
+        var confidence = ratio * support * coverage * reprojection
+        if (result.metricPairs >= 4 && result.medianMetricResidualM.isFinite()) {
+            val metricRatio = result.metricInliers.toDouble() / result.metricPairs
+            confidence *= 0.70 + 0.30 * (metricRatio * exp(-result.medianMetricResidualM / 0.18))
+        }
+        return confidence.coerceIn(0.0, 1.0).toFloat()
     }
 
-    @Synchronized private fun tryAdoptOrVerifyPeerTransform() {
+    /**
+     * A peer transform is accepted only after this phone has independently solved
+     * the same SE(3). We then harmonize the two estimates within a tight gate and
+     * ACK the harmonized result. No peer message can manufacture READY by itself.
+     */
+    @Synchronized private fun tryVerifyPeerTransform() {
         val message = pendingPeerTransform ?: return
         val peerSenderFromLocal = message.senderFromPeer ?: return
         if (peerSenderFromLocal.size < 16 || message.confidence < MIN_PEER_TRANSFORM_CONFIDENCE) return
@@ -524,107 +571,49 @@ class AlignmentCoordinator(
 
         val isAck = message.transformSource == "PEER_ACK"
         val hasVisualEvidence = message.transformInliers >= MIN_LOCK_INLIERS &&
-            (!message.transformMedianReprojectionPx.isFinite() || message.transformMedianReprojectionPx <= 5.0f)
+            (!message.transformMedianReprojectionPx.isFinite() || message.transformMedianReprojectionPx <= MAX_LOCK_REPROJECTION_PX.toFloat())
         if (!isAck && !hasVisualEvidence) return
 
-        val existing = lockedTransform
-        if (existing == null) {
-            if (isAck) return
-            adoptPeerTransform(localFromPeerSender, message, gravityTilt)
+        val existing = lockedTransform ?: return
+        val (translationDelta, rotationDelta) = AlignmentEngine.transformDelta(existing, localFromPeerSender)
+        if (translationDelta > PEER_VERIFY_TRANSLATION_M || rotationDelta > PEER_VERIFY_ROTATION_DEG) {
+            peerTransformVerified = false
             return
         }
 
-        if (isAck) {
-            val (translationDelta, rotationDelta) = AlignmentEngine.transformDelta(existing, localFromPeerSender)
-            if (translationDelta <= ACK_VERIFY_TRANSLATION_M && rotationDelta <= ACK_VERIFY_ROTATION_DEG) {
-                peerReady = true
-                peerTransformVerified = true
-                pendingPeerTransform = null
-                emitQuality()
-                publishPendingPoiIfPossible()
-            }
-            return
+        // Both transforms are independently justified. Before a POI exists, blend
+        // them so each direction converges instead of preserving two slightly
+        // different coordinate mappings.
+        if (!activePoi) {
+            lockedTransform = smoothRigid(existing, localFromPeerSender, if (isAck) 0.25 else 0.50)
         }
-
-        if (!transport.isHostRole || adoptedFromPeer) {
-            adoptPeerTransform(localFromPeerSender, message, gravityTilt)
-            return
-        }
-
-        peerReady = true
-        pendingPeerTransform = null
-        peerTransformVerified = false
-        broadcastLockedTransform(force = true)
-        emitQuality()
-    }
-
-    private fun adoptPeerTransform(
-        localFromPeerSender: DoubleArray,
-        message: WireMessage.Quality,
-        gravityTilt: Double,
-    ) {
-        val existing = lockedTransform
-        lockedTransform = if (existing != null && adoptedFromPeer) {
-            val (dt, dr) = AlignmentEngine.transformDelta(existing, localFromPeerSender)
-            if (dt <= PEER_UPDATE_DIRECT_TRANSLATION_M && dr <= PEER_UPDATE_DIRECT_ROTATION_DEG) {
-                smoothRigid(existing, localFromPeerSender, 0.55)
-            } else {
-                localFromPeerSender.copyOf()
-            }
-        } else {
-            localFromPeerSender.copyOf()
-        }
-        adoptedFromPeer = true
-        localConfidence = (message.confidence * 0.97f).coerceIn(MIN_PEER_TRANSFORM_CONFIDENCE, 0.99f)
-        stableCount = max(stableCount, 1)
         peerReady = true
         peerTransformVerified = true
         pendingPeerTransform = null
-        lastLockInliers = message.transformInliers
-        lastLockReprojectionPx = message.transformMedianReprojectionPx
-        lastLockSource = "PEER:${message.transformSource.ifBlank { "VISUAL" }}"
 
-        latestQuality = latestQuality.copy(
-            confidence = localConfidence,
-            inliers = message.transformInliers,
-            medianReprojectionPx = message.transformMedianReprojectionPx.toDouble(),
-            stableCount = stableCount,
-            localReady = true,
-            peerReady = true,
-            peerTransformVerified = true,
-            rangeM = latestRangeM,
-            rangeSource = latestRangeSource,
-            gravityTiltDeg = gravityTilt,
-            fusionSource = lastLockSource,
-            fusionSeedConfidence = coarseConfidence,
-            keyframesLocal = synchronized(frameLock) { localFrames.size },
-            keyframesRemote = synchronized(frameLock) { remoteFrames.size },
-        )
-
-        transport.sendAlignmentTransform(
-            senderFromPeer = lockedTransform ?: localFromPeerSender,
-            confidence = localConfidence,
-            inliers = message.transformInliers,
-            medianReprojectionPx = message.transformMedianReprojectionPx,
-            source = "PEER_ACK",
-        )
-        transport.sendQuality(localConfidence, stableCount, true)
-        listener.onAlignmentQuality(latestQuality)
-        publishPendingPoiIfPossible()
+        if (!isAck) {
+            transport.sendAlignmentTransform(
+                senderFromPeer = lockedTransform ?: existing,
+                confidence = localConfidence.coerceAtLeast(MIN_PEER_TRANSFORM_CONFIDENCE),
+                inliers = lastLockInliers,
+                medianReprojectionPx = lastLockReprojectionPx,
+                source = "PEER_ACK",
+            )
+            transport.sendQuality(localConfidence, stableCount, true)
+        }
     }
 
     private fun maybeResendLockedTransform() {
-        if (lockedTransform == null || peerTransformVerified || adoptedFromPeer) return
+        if (lockedTransform == null || peerTransformVerified) return
         val now = System.currentTimeMillis()
         if (now - lastTransformBroadcastAtMs >= TRANSFORM_RETRY_MS) broadcastLockedTransform(force = true)
     }
 
     private fun broadcastLockedTransform(force: Boolean) {
         val transform = lockedTransform ?: return
-        if (adoptedFromPeer) return
         val now = System.currentTimeMillis()
-        if (!force && now - lastTransformBroadcastAtMs < 3000L) return
-        if (force && lastTransformBroadcastAtMs != 0L && now - lastTransformBroadcastAtMs < 550L) return
+        if (!force && now - lastTransformBroadcastAtMs < 2500L) return
+        if (force && lastTransformBroadcastAtMs != 0L && now - lastTransformBroadcastAtMs < 450L) return
 
         lastTransformBroadcastAtMs = now
         transport.sendAlignmentTransform(
@@ -687,19 +676,23 @@ class AlignmentCoordinator(
 
     private fun isSingleFrameLockQuality(result: AlignmentEngine.Result): Boolean {
         val confidence = max(result.confidence, geometricConfidence(result))
-        val gravityAcceptable = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 8.0
-        return result.inliers >= 14 && result.correspondences >= 14 &&
-            result.medianReprojectionPx <= 3.4 && result.imageCoverage >= 0.085 &&
-            confidence >= 0.19f && gravityAcceptable
+        val gravityAcceptable = !result.gravityTiltDeg.isFinite() || result.gravityTiltDeg <= 7.0
+        return result.inliers >= 12 && result.correspondences >= 12 &&
+            result.medianReprojectionPx <= 3.0 && result.imageCoverage >= 0.07 &&
+            confidence >= 0.16f && gravityAcceptable && isRangeCompatible(result) && isMetricConsistent(result)
     }
 
     private fun resultScore(result: AlignmentEngine.Result): Double {
+        if (!isRangeCompatible(result) || !isMetricConsistent(result)) return -1_000_000.0
         val confidence = max(result.confidence, geometricConfidence(result))
         val gravityBonus = if (result.gravityTiltDeg.isFinite()) {
-            (1.0 - result.gravityTiltDeg / 25.0).coerceIn(0.0, 1.0) * 0.65
+            (1.0 - result.gravityTiltDeg / 20.0).coerceIn(0.0, 1.0) * 0.70
         } else 0.0
-        return confidence * 4.0 + min(result.inliers, 40) / 18.0 +
-            min(result.imageCoverage, 0.30) * 3.2 + gravityBonus
+        val metricBonus = if (result.metricPairs >= 4 && result.medianMetricResidualM.isFinite()) {
+            (1.0 - result.medianMetricResidualM / 0.30).coerceIn(0.0, 1.0) * 1.2
+        } else 0.0
+        return confidence * 4.5 + min(result.inliers, 50) / 18.0 +
+            min(result.imageCoverage, 0.35) * 3.4 + gravityBonus + metricBonus
     }
 
     private fun consensusMedoid(history: Collection<Candidate>): DoubleArray {
@@ -737,7 +730,6 @@ class AlignmentCoordinator(
         return out
     }
 
-    /** Quaternion is [x,y,z,w]. */
     private fun rotationMatrixToQuaternion(m: DoubleArray): DoubleArray {
         val trace = m[0] + m[5] + m[10]
         val q = DoubleArray(4)
@@ -830,7 +822,6 @@ class AlignmentCoordinator(
             }
         }
         lockedTransform = null
-        adoptedFromPeer = false
         coarseConfidence = 0f
         coarseSource = "NONE"
         candidateHistory.clear()
@@ -849,6 +840,7 @@ class AlignmentCoordinator(
         latestQuality = Quality(rangeM = latestRangeM, rangeSource = latestRangeSource)
         if (clearPoi) {
             pendingPoi = null
+            activePoi = false
             listener.onPoiCleared()
         }
         if (transport.connected) transport.sendQuality(0f, 0, false)
@@ -865,8 +857,7 @@ class AlignmentCoordinator(
             rangeM = latestRangeM,
             rangeSource = latestRangeSource,
             fusionSource = when {
-                lockedTransform != null && peerTransformVerified -> "BIDIRECTIONAL VERIFIED"
-                lockedTransform != null && adoptedFromPeer -> lastLockSource
+                lockedTransform != null && peerTransformVerified -> "BIDIRECTIONAL VISUAL VERIFIED"
                 lockedTransform != null -> lastLockSource
                 else -> coarseSource
             },
@@ -887,8 +878,8 @@ class AlignmentCoordinator(
         val c2 = doubleArrayOf(t[2], t[6], t[10])
         fun norm(c: DoubleArray) = sqrt(c.sumOf { it * it })
         fun dot(a: DoubleArray, b: DoubleArray) = a.indices.sumOf { a[it] * b[it] }
-        if (abs(norm(c0) - 1.0) > 0.08 || abs(norm(c1) - 1.0) > 0.08 || abs(norm(c2) - 1.0) > 0.08) return false
-        if (abs(dot(c0, c1)) > 0.08 || abs(dot(c0, c2)) > 0.08 || abs(dot(c1, c2)) > 0.08) return false
+        if (abs(norm(c0) - 1.0) > 0.05 || abs(norm(c1) - 1.0) > 0.05 || abs(norm(c2) - 1.0) > 0.05) return false
+        if (abs(dot(c0, c1)) > 0.05 || abs(dot(c0, c2)) > 0.05 || abs(dot(c1, c2)) > 0.05) return false
         return true
     }
 
@@ -908,42 +899,46 @@ class AlignmentCoordinator(
     }
 
     companion object {
-        private const val KEYFRAME_WINDOW = 12
-        private const val KEYFRAME_TRANSLATION_M = 0.08
-        private const val KEYFRAME_ROTATION_DEG = 5.0
-        private const val KEYFRAME_MAX_INTERVAL_NS = 1_500_000_000L
-        private const val MIN_KEYFRAME_MOTION_QUALITY = 0.50
-        private const val SOLVE_MIN_INTERVAL_MS = 330L
-        private const val REFINEMENT_SOLVE_INTERVAL_MS = 1_800L
-        private const val MAX_PAIR_ATTEMPTS = 10
-        private const val REFINEMENT_PAIR_ATTEMPTS = 3
-        private const val CANDIDATE_WINDOW = 14
-        private const val REFINEMENT_HISTORY = 8
-        private const val CLUSTER_TRANSLATION_M = 0.45
-        private const val CLUSTER_ROTATION_DEG = 8.0
-        private const val REFINEMENT_DIRECT_TRANSLATION_M = 0.20
-        private const val REFINEMENT_DIRECT_ROTATION_DEG = 3.5
-        private const val REFINEMENT_CLUSTER_TRANSLATION_M = 0.18
-        private const val REFINEMENT_CLUSTER_ROTATION_DEG = 3.5
-        private const val REFINEMENT_CONSENSUS_MAX_TRANSLATION_M = 0.85
-        private const val REFINEMENT_CONSENSUS_MAX_ROTATION_DEG = 11.0
-        private const val REFINEMENT_ABSOLUTE_MAX_TRANSLATION_M = 1.5
-        private const val REFINEMENT_ABSOLUTE_MAX_ROTATION_DEG = 18.0
-        private const val PEER_UPDATE_DIRECT_TRANSLATION_M = 0.30
-        private const val PEER_UPDATE_DIRECT_ROTATION_DEG = 5.0
+        private const val KEYFRAME_WINDOW = 16
+        private const val KEYFRAME_TRANSLATION_M = 0.055
+        private const val KEYFRAME_ROTATION_DEG = 3.5
+        private const val KEYFRAME_MAX_INTERVAL_NS = 900_000_000L
+        private const val MIN_KEYFRAME_MOTION_QUALITY = 0.44
+        private const val SOLVE_MIN_INTERVAL_MS = 220L
+        private const val REFINEMENT_SOLVE_INTERVAL_MS = 1_200L
+        private const val MAX_PAIR_ATTEMPTS = 8
+        private const val REFINEMENT_PAIR_ATTEMPTS = 4
+        private const val CANDIDATE_WINDOW = 18
+        private const val REFINEMENT_HISTORY = 10
+        private const val CLUSTER_TRANSLATION_M = 0.22
+        private const val CLUSTER_ROTATION_DEG = 4.0
+        private const val REFINEMENT_DIRECT_TRANSLATION_M = 0.05
+        private const val REFINEMENT_DIRECT_ROTATION_DEG = 1.0
+        private const val REFINEMENT_CLUSTER_TRANSLATION_M = 0.08
+        private const val REFINEMENT_CLUSTER_ROTATION_DEG = 1.5
+        private const val REFINEMENT_CONSENSUS_MAX_TRANSLATION_M = 0.20
+        private const val REFINEMENT_CONSENSUS_MAX_ROTATION_DEG = 2.5
+        private const val REFINEMENT_ABSOLUTE_MAX_TRANSLATION_M = 0.30
+        private const val REFINEMENT_ABSOLUTE_MAX_ROTATION_DEG = 4.0
         private const val ROTATION_TO_METERS_WEIGHT = 0.015
         private const val RTT_FRESH_MS = 5000L
-        private const val CLIENT_FALLBACK_SOLVE_DELAY_MS = 4500L
-        private const val TRANSFORM_RETRY_MS = 750L
-        private const val MAX_VISUAL_GRAVITY_TILT_DEG = 16.0
-        private const val PEER_MAX_GRAVITY_TILT_DEG = 16.0
+        private const val RANGE_GATE_FRESH_MS = 8_000L
+        private const val CLIENT_INITIAL_SOLVE_DELAY_MS = 750L
+        private const val TRANSFORM_RETRY_MS = 650L
+        private const val MAX_VISUAL_GRAVITY_TILT_DEG = 12.0
+        private const val PEER_MAX_GRAVITY_TILT_DEG = 12.0
         private const val MIN_PEER_TRANSFORM_CONFIDENCE = 0.10f
-        private const val ACK_VERIFY_TRANSLATION_M = 0.18
-        private const val ACK_VERIFY_ROTATION_DEG = 3.5
-        private const val MIN_LOCK_INLIERS = 7
-        private const val MIN_LOCK_CORRESPONDENCES = 7
-        private const val MAX_LOCK_REPROJECTION_PX = 5.0
-        private const val MIN_LOCK_COVERAGE = 0.045
+        private const val PEER_VERIFY_TRANSLATION_M = 0.20
+        private const val PEER_VERIFY_ROTATION_DEG = 3.0
+        private const val MIN_LOCK_INLIERS = 8
+        private const val MIN_LOCK_CORRESPONDENCES = 8
+        private const val MAX_LOCK_REPROJECTION_PX = 4.0
+        private const val MIN_LOCK_COVERAGE = 0.05
         private const val MIN_LOCK_CONFIDENCE = 0.10f
+        private const val MIN_METRIC_PAIRS_FOR_LOCK = 5
+        private const val MIN_METRIC_INLIERS_FOR_LOCK = 4
+        private const val MAX_METRIC_RESIDUAL_M = 0.24
+        private const val RTT_MIN_RANGE_TOLERANCE_M = 0.70
+        private const val BLE_MIN_RANGE_TOLERANCE_M = 2.0
     }
 }

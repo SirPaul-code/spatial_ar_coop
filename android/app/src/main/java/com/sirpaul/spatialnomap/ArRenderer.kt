@@ -9,6 +9,7 @@ import com.google.ar.core.Camera
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
+import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
 import com.google.ar.core.Pose
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.atan2
+import kotlin.math.max
 import kotlin.math.sqrt
 
 class ArRenderer(
@@ -47,15 +49,12 @@ class ArRenderer(
 
     private var remoteAnchor: Anchor? = null
     private var remoteAnchorId = Long.MIN_VALUE
-    private var remoteAnchorInputPoint: FloatArray? = null
     private var remoteOwner = ""
     private var remoteConfidence = 0f
 
     private var localAnchor: Anchor? = null
     private var localPoiId = Long.MIN_VALUE
     private var localOwner = ""
-    private var lastLocalSentPoint: FloatArray? = null
-    private var lastLocalSentNs = 0L
 
     private var width = 1
     private var height = 1
@@ -65,8 +64,6 @@ class ArRenderer(
     private var lastFrameErrorAtMs = 0L
 
     init {
-        // TargetOverlayView sits above GLSurfaceView and owns the complete gesture
-        // stream. Forward accepted short taps into the GL-thread POI queue.
         overlay.onSceneTap = { x, y -> queueTap(x, y) }
     }
 
@@ -80,7 +77,7 @@ class ArRenderer(
                 RemoteTargetRequest(id, it.copyOf(3), owner, confidence)
             },
         )
-        if (pointLocalWorld == null) overlay.setTarget(null)
+        if (pointLocalWorld == null && localAnchor == null) overlay.setTarget(null)
     }
 
     fun setRemoteTarget(pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
@@ -151,9 +148,8 @@ class ArRenderer(
             if (!tracking) return
 
             handleTap(s, frame, camera)
-            updateLocalAnchorPose()
             captureIfDue(frame, camera)
-            projectRemoteTarget(camera)
+            projectActiveTarget(camera)
         } catch (t: Throwable) {
             if (t.javaClass.simpleName == "SessionPausedException") return
             val error = errorText(t)
@@ -166,6 +162,11 @@ class ArRenderer(
         }
     }
 
+    /**
+     * A tap is accepted only when ARCore hit testing and metric depth agree, when
+     * both are available. This prevents a valid screen tap from silently landing on
+     * a different plane several metres behind the intended surface.
+     */
     private fun handleTap(session: Session, frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
@@ -173,7 +174,15 @@ class ArRenderer(
             return
         }
 
-        var newAnchor: Anchor? = null
+        val imagePixel = FloatArray(2)
+        frame.transformCoordinates2d(Coordinates2d.VIEW, tap, Coordinates2d.IMAGE_PIXELS, imagePixel)
+        val metricWorld = MetricSupportSampler.pointAtCpuPixel(frame, camera, imagePixel[0], imagePixel[1])
+        val cameraWorld = camera.pose.translation
+        val metricDistance = metricWorld?.let { pointDistance(cameraWorld, it) }
+        val depthTolerance = metricDistance?.let { max(TAP_DEPTH_MIN_TOLERANCE_M, it * TAP_DEPTH_TOLERANCE_RATIO) }
+
+        var bestHit: HitResult? = null
+        var bestScore = Float.POSITIVE_INFINITY
         for (hit in frame.hitTest(tap[0], tap[1])) {
             val trackable = hit.trackable
             val usable = when (trackable) {
@@ -183,35 +192,54 @@ class ArRenderer(
                 else -> false
             }
             if (!usable) continue
-            newAnchor = runCatching { hit.createAnchor() }.getOrNull()
-            if (newAnchor != null) break
-        }
 
-        if (newAnchor == null) {
-            val imagePixel = FloatArray(2)
-            frame.transformCoordinates2d(Coordinates2d.VIEW, tap, Coordinates2d.IMAGE_PIXELS, imagePixel)
-            val pointWorld = MetricSupportSampler.pointAtCpuPixel(frame, camera, imagePixel[0], imagePixel[1])
-            if (pointWorld != null) {
-                newAnchor = runCatching { session.createAnchor(Pose.makeTranslation(pointWorld)) }.getOrNull()
+            val hitPoint = hit.hitPose.translation
+            val hitDistance = pointDistance(cameraWorld, hitPoint)
+            if (!hitDistance.isFinite() || hitDistance > MAX_POI_DISTANCE_M) continue
+
+            val disagreement = metricWorld?.let { pointDistance(it, hitPoint) }
+            if (disagreement != null && depthTolerance != null && disagreement > depthTolerance) continue
+
+            val typePenalty = when (trackable) {
+                is DepthPoint -> 0f
+                is Plane -> 0.02f
+                else -> 0.04f
+            }
+            val score = (disagreement ?: 0f) + typePenalty + hitDistance * 0.0005f
+            if (score < bestScore) {
+                bestScore = score
+                bestHit = hit
             }
         }
 
+        var newAnchor = bestHit?.let { runCatching { it.createAnchor() }.getOrNull() }
+        if (newAnchor == null && metricWorld != null &&
+            metricDistance != null && metricDistance.isFinite() && metricDistance <= MAX_POI_DISTANCE_M
+        ) {
+            newAnchor = runCatching { session.createAnchor(Pose.makeTranslation(metricWorld)) }.getOrNull()
+        }
+
         if (newAnchor == null) {
-            status("No reliable metric depth at the tap. Move the phone slightly and tap again.")
+            status("No corroborated metric surface at the tap. Move slightly and tap again.")
             return
         }
 
+        // A new local ping is the active room POI. Keep a real local ARCore anchor
+        // so the owner sees exactly what was selected, not just the remote phone.
         runCatching { localAnchor?.detach() }
+        runCatching { remoteAnchor?.detach() }
+        remoteAnchor = null
+        remoteAnchorId = Long.MIN_VALUE
+        remoteTargetRequest.set(null)
+        remoteOwner = ""
+        remoteConfidence = 0f
+
         localAnchor = newAnchor
         localPoiId = SystemClock.elapsedRealtimeNanos()
         localOwner = usernameProvider()
-        lastLocalSentPoint = null
-        lastLocalSentNs = 0L
 
         val p = newAnchor.pose.translation
         if (coordinator.sendPoi(localPoiId, p, localOwner)) {
-            lastLocalSentPoint = p.copyOf()
-            lastLocalSentNs = SystemClock.elapsedRealtimeNanos()
             status("POI sent")
         } else {
             runCatching { newAnchor.detach() }
@@ -221,22 +249,11 @@ class ArRenderer(
         }
     }
 
-    private fun updateLocalAnchorPose() {
-        val anchor = localAnchor ?: return
-        if (anchor.trackingState != TrackingState.TRACKING || localPoiId == Long.MIN_VALUE) return
-        val now = SystemClock.elapsedRealtimeNanos()
-        val p = anchor.pose.translation
-        val previous = lastLocalSentPoint
-        val moved = previous == null || pointDistance(previous, p) >= LOCAL_ANCHOR_UPDATE_M
-        val heartbeat = now - lastLocalSentNs >= LOCAL_ANCHOR_HEARTBEAT_NS
-        if (!moved && !heartbeat) return
-
-        if (coordinator.sendPoi(localPoiId, p, localOwner)) {
-            lastLocalSentPoint = p.copyOf()
-            lastLocalSentNs = now
-        }
-    }
-
+    /**
+     * For one POI id, create the receiving ARCore anchor exactly once. A later
+     * transform refinement must never drag an already-established physical anchor
+     * around the room. Only a new POI id is allowed to replace it.
+     */
     private fun applyRemoteTargetRequest(session: Session, tracking: Boolean) {
         val request = remoteTargetRequest.get()
         if (request == null) {
@@ -244,7 +261,6 @@ class ArRenderer(
                 runCatching { remoteAnchor?.detach() }
                 remoteAnchor = null
                 remoteAnchorId = Long.MIN_VALUE
-                remoteAnchorInputPoint = null
                 remoteOwner = ""
                 remoteConfidence = 0f
             }
@@ -252,15 +268,9 @@ class ArRenderer(
         }
         if (!tracking) return
 
-        val previousInput = remoteAnchorInputPoint
-        val needsAnchor = remoteAnchor == null ||
-            request.id != remoteAnchorId ||
-            previousInput == null ||
-            pointDistance(previousInput, request.point) >= REMOTE_REANCHOR_THRESHOLD_M
-
         remoteOwner = request.owner
         remoteConfidence = request.confidence
-        if (!needsAnchor) return
+        if (remoteAnchor != null && request.id == remoteAnchorId) return
 
         val replacement = runCatching {
             session.createAnchor(Pose.makeTranslation(request.point))
@@ -269,7 +279,6 @@ class ArRenderer(
         val old = remoteAnchor
         remoteAnchor = replacement
         remoteAnchorId = request.id
-        remoteAnchorInputPoint = request.point.copyOf()
         runCatching { old?.detach() }
     }
 
@@ -288,12 +297,26 @@ class ArRenderer(
         lastCaptureNs = now
     }
 
-    private fun projectRemoteTarget(camera: Camera) {
-        val anchor = remoteAnchor ?: return
-        if (anchor.trackingState != TrackingState.TRACKING) {
+    private fun projectActiveTarget(camera: Camera) {
+        val remote = remoteAnchor
+        val local = localAnchor
+        val anchor: Anchor
+        val owner: String
+        val confidence: Float
+
+        if (remote != null && remote.trackingState == TrackingState.TRACKING) {
+            anchor = remote
+            owner = remoteOwner
+            confidence = remoteConfidence
+        } else if (local != null && local.trackingState == TrackingState.TRACKING) {
+            anchor = local
+            owner = if (localOwner.isBlank()) "YOU" else "YOU • $localOwner"
+            confidence = coordinator.quality().confidence
+        } else {
             overlay.setTarget(null)
             return
         }
+
         val p = anchor.pose.translation
         val view = FloatArray(16)
         val projection = FloatArray(16)
@@ -328,8 +351,8 @@ class ArRenderer(
                 inFront,
                 bearing,
                 distance,
-                remoteOwner,
-                remoteConfidence,
+                owner,
+                confidence,
             ),
         )
     }
@@ -341,8 +364,6 @@ class ArRenderer(
         remoteAnchor = null
         localPoiId = Long.MIN_VALUE
         remoteAnchorId = Long.MIN_VALUE
-        lastLocalSentPoint = null
-        remoteAnchorInputPoint = null
         localOwner = ""
         remoteOwner = ""
         remoteConfidence = 0f
@@ -372,8 +393,8 @@ class ArRenderer(
     }
 
     companion object {
-        private const val LOCAL_ANCHOR_UPDATE_M = 0.015f
-        private const val LOCAL_ANCHOR_HEARTBEAT_NS = 2_000_000_000L
-        private const val REMOTE_REANCHOR_THRESHOLD_M = 0.04f
+        private const val TAP_DEPTH_MIN_TOLERANCE_M = 0.18f
+        private const val TAP_DEPTH_TOLERANCE_RATIO = 0.06f
+        private const val MAX_POI_DISTANCE_M = 30f
     }
 }

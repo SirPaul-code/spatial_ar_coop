@@ -6,12 +6,10 @@ import android.os.PowerManager
 import android.os.SystemClock
 
 /**
- * Protects ARCore VIO from app-side CPU/thermal starvation.
- *
- * getThermalHeadroom() must not be polled aggressively. We sample at a safe
- * cadence and translate the device-specific thermal signal into conservative
- * capture/matcher budgets. ARCore camera/VIO remains untouched; only our own
- * CPU-heavy grayscale/depth/feature-matching workload is reduced.
+ * Protects ARCore VIO from thermal starvation while keeping registration quality
+ * as the primary objective. Spatial Sync is deliberately bandwidth-heavy: on a
+ * cool device we capture high-resolution registration frames at several Hz and
+ * only back off when Android reports real thermal pressure.
  */
 class RuntimePerformanceGovernor(context: Context) {
     data class CaptureBudget(
@@ -32,17 +30,17 @@ class RuntimePerformanceGovernor(context: Context) {
     fun captureBudget(locked: Boolean): CaptureBudget {
         sampleIfDue()
         return when (tier) {
-            Tier.FULL -> if (locked) CaptureBudget(2_000_000_000L, 896, tier)
+            Tier.FULL -> if (locked) CaptureBudget(750_000_000L, 1152, tier)
+            else CaptureBudget(250_000_000L, 1280, tier)
+
+            Tier.WARM -> if (locked) CaptureBudget(1_000_000_000L, 960, tier)
+            else CaptureBudget(350_000_000L, 1152, tier)
+
+            Tier.HOT -> if (locked) CaptureBudget(1_500_000_000L, 896, tier)
             else CaptureBudget(500_000_000L, 960, tier)
 
-            Tier.WARM -> if (locked) CaptureBudget(3_000_000_000L, 800, tier)
-            else CaptureBudget(650_000_000L, 896, tier)
-
-            Tier.HOT -> if (locked) CaptureBudget(4_500_000_000L, 704, tier)
-            else CaptureBudget(900_000_000L, 768, tier)
-
-            Tier.CRITICAL -> if (locked) CaptureBudget(7_000_000_000L, 576, tier)
-            else CaptureBudget(1_350_000_000L, 640, tier)
+            Tier.CRITICAL -> if (locked) CaptureBudget(2_500_000_000L, 704, tier)
+            else CaptureBudget(800_000_000L, 800, tier)
         }
     }
 
@@ -82,8 +80,6 @@ class RuntimePerformanceGovernor(context: Context) {
                 else -> Tier.FULL
             }
 
-            // Escalate immediately. Recover one tier at a time to avoid thermal
-            // oscillation when the device hovers around a firmware threshold.
             tier = when {
                 requested.ordinal > tier.ordinal -> requested
                 requested.ordinal < tier.ordinal -> Tier.entries[tier.ordinal - 1]
