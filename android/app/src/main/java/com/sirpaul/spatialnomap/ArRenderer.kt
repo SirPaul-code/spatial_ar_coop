@@ -15,6 +15,9 @@ import com.google.ar.core.Point
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import java.util.LinkedHashMap
+import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
@@ -33,7 +36,18 @@ class ArRenderer(
 ) : GLSurfaceView.Renderer {
     private data class RemoteTargetRequest(
         val id: Long,
-        val point: FloatArray,
+        val point: FloatArray?,
+        val owner: String,
+        val confidence: Float,
+    )
+
+    private data class LocalTarget(
+        val anchor: Anchor,
+        val owner: String,
+    )
+
+    private data class RemoteTarget(
+        val anchor: Anchor,
         val owner: String,
         val confidence: Float,
     )
@@ -43,18 +57,19 @@ class ArRenderer(
 
     private val background = CameraBackgroundRenderer()
     private val pendingTap = AtomicReference<FloatArray?>(null)
-    private val remoteTargetRequest = AtomicReference<RemoteTargetRequest?>(null)
+    private val remoteTargetRequests = ConcurrentLinkedQueue<RemoteTargetRequest>()
     private val clearTargetsRequested = AtomicBoolean(false)
     private val trackingGate = TrackingStabilityGate(acquireMs = 300L, lossMs = 1000L)
+    private val targetLock = Any()
 
-    private var remoteAnchor: Anchor? = null
-    private var remoteAnchorId = Long.MIN_VALUE
-    private var remoteOwner = ""
-    private var remoteConfidence = 0f
-
-    private var localAnchor: Anchor? = null
-    private var localPoiId = Long.MIN_VALUE
-    private var localOwner = ""
+    /**
+     * Targets are intentionally additive. A new tap must never detach an older
+     * anchor: every manual ping gets its own ARCore anchor and remains pinned until
+     * the user explicitly clears the room. The same representation can later be
+     * fed by person/car detections without changing the rendering path.
+     */
+    private val localTargets = LinkedHashMap<Long, LocalTarget>()
+    private val remoteTargets = LinkedHashMap<Long, RemoteTarget>()
 
     private var width = 1
     private var height = 1
@@ -62,6 +77,7 @@ class ArRenderer(
     private var lastCaptureNs = 0L
     private var lastFrameError = ""
     private var lastFrameErrorAtMs = 0L
+    private var lastSyncHintAtMs = 0L
 
     init {
         overlay.onSceneTap = { x, y -> queueTap(x, y) }
@@ -71,13 +87,20 @@ class ArRenderer(
         pendingTap.set(floatArrayOf(x, y))
     }
 
+    /**
+     * Network/UI threads only enqueue mutations. ARCore anchor creation happens on
+     * the render thread, which keeps target lifetime deterministic and avoids races
+     * while a camera frame is being projected.
+     */
     fun setRemoteTarget(id: Long, pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
-        remoteTargetRequest.set(
-            pointLocalWorld?.let {
-                RemoteTargetRequest(id, it.copyOf(3), owner, confidence)
-            },
+        remoteTargetRequests.add(
+            RemoteTargetRequest(
+                id = id,
+                point = pointLocalWorld?.copyOf(3),
+                owner = owner,
+                confidence = confidence,
+            ),
         )
-        if (pointLocalWorld == null && localAnchor == null) overlay.setTarget(null)
     }
 
     fun setRemoteTarget(pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
@@ -85,22 +108,25 @@ class ArRenderer(
     }
 
     fun clearTargets() {
-        remoteTargetRequest.set(null)
+        remoteTargetRequests.clear()
         clearTargetsRequested.set(true)
         pendingTap.set(null)
-        overlay.setTarget(null)
+        overlay.setTargets(emptyList())
     }
+
+    fun targetCount(): Int = synchronized(targetLock) { localTargets.size + remoteTargets.size }
 
     fun detachSession() {
         sessionResumed = false
         session = null
         textureBoundSession = null
         pendingTap.set(null)
-        remoteTargetRequest.set(null)
+        remoteTargetRequests.clear()
         clearTargetsRequested.set(false)
         detachAnchors()
         lastCaptureNs = 0L
         lastFrameError = ""
+        lastSyncHintAtMs = 0L
         trackingGate.reset()
     }
 
@@ -138,7 +164,7 @@ class ArRenderer(
             val tracking = camera.trackingState == TrackingState.TRACKING
 
             if (clearTargetsRequested.getAndSet(false)) detachAnchors()
-            applyRemoteTargetRequest(s, tracking)
+            applyRemoteTargetRequests(s, tracking)
 
             when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
                 true -> status("AR tracking")
@@ -149,7 +175,8 @@ class ArRenderer(
 
             handleTap(s, frame, camera)
             captureIfDue(frame, camera)
-            projectActiveTarget(camera)
+            publishSyncGuidanceIfNeeded()
+            projectTargets(camera)
         } catch (t: Throwable) {
             if (t.javaClass.simpleName == "SessionPausedException") return
             val error = errorText(t)
@@ -170,7 +197,7 @@ class ArRenderer(
     private fun handleTap(session: Session, frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
-            status("SYNCING — keep both cameras on overlapping detail until READY")
+            status("SYNCING — keep both cameras on the same detailed area and move slowly side-to-side")
             return
         }
 
@@ -224,62 +251,65 @@ class ArRenderer(
             return
         }
 
-        // A new local ping is the active room POI. Keep a real local ARCore anchor
-        // so the owner sees exactly what was selected, not just the remote phone.
-        runCatching { localAnchor?.detach() }
-        runCatching { remoteAnchor?.detach() }
-        remoteAnchor = null
-        remoteAnchorId = Long.MIN_VALUE
-        remoteTargetRequest.set(null)
-        remoteOwner = ""
-        remoteConfidence = 0f
+        var id = SystemClock.elapsedRealtimeNanos()
+        synchronized(targetLock) {
+            while (localTargets.containsKey(id) || remoteTargets.containsKey(id)) id += 1L
+        }
+        val owner = usernameProvider()
+        val point = newAnchor.pose.translation
 
-        localAnchor = newAnchor
-        localPoiId = SystemClock.elapsedRealtimeNanos()
-        localOwner = usernameProvider()
-
-        val p = newAnchor.pose.translation
-        if (coordinator.sendPoi(localPoiId, p, localOwner)) {
+        if (coordinator.sendPoi(id, point, owner)) {
+            synchronized(targetLock) {
+                localTargets[id] = LocalTarget(newAnchor, owner)
+            }
             status("POI sent")
         } else {
             runCatching { newAnchor.detach() }
-            localAnchor = null
-            localPoiId = Long.MIN_VALUE
-            status("POI blocked: spatial fusion is not ready")
+            status("Target blocked: spatial alignment is not ready")
         }
     }
 
     /**
-     * For one POI id, create the receiving ARCore anchor exactly once. A later
-     * transform refinement must never drag an already-established physical anchor
-     * around the room. Only a new POI id is allowed to replace it.
+     * Every remote POI id owns one ARCore anchor. Repeated packets for the same id
+     * update metadata but never re-anchor the physical point, so later networking or
+     * alignment messages cannot drag an existing target across the scene.
      */
-    private fun applyRemoteTargetRequest(session: Session, tracking: Boolean) {
-        val request = remoteTargetRequest.get()
-        if (request == null) {
-            if (remoteAnchor != null) {
-                runCatching { remoteAnchor?.detach() }
-                remoteAnchor = null
-                remoteAnchorId = Long.MIN_VALUE
-                remoteOwner = ""
-                remoteConfidence = 0f
-            }
-            return
-        }
+    private fun applyRemoteTargetRequests(session: Session, tracking: Boolean) {
         if (!tracking) return
 
-        remoteOwner = request.owner
-        remoteConfidence = request.confidence
-        if (remoteAnchor != null && request.id == remoteAnchorId) return
+        while (true) {
+            val request = remoteTargetRequests.poll() ?: break
+            if (request.point == null) {
+                val removed = synchronized(targetLock) { remoteTargets.remove(request.id) }
+                runCatching { removed?.anchor?.detach() }
+                continue
+            }
 
-        val replacement = runCatching {
-            session.createAnchor(Pose.makeTranslation(request.point))
-        }.getOrNull() ?: return
+            val existing = synchronized(targetLock) { remoteTargets[request.id] }
+            if (existing != null) {
+                synchronized(targetLock) {
+                    remoteTargets[request.id] = existing.copy(
+                        owner = request.owner,
+                        confidence = request.confidence,
+                    )
+                }
+                continue
+            }
 
-        val old = remoteAnchor
-        remoteAnchor = replacement
-        remoteAnchorId = request.id
-        runCatching { old?.detach() }
+            val anchor = runCatching {
+                session.createAnchor(Pose.makeTranslation(request.point))
+            }.getOrNull() ?: continue
+
+            synchronized(targetLock) {
+                // Another request for the same id cannot normally race because this
+                // function is render-thread-only, but keep the invariant explicit.
+                val prior = remoteTargets.putIfAbsent(
+                    request.id,
+                    RemoteTarget(anchor, request.owner, request.confidence),
+                )
+                if (prior != null) runCatching { anchor.detach() }
+            }
+        }
     }
 
     private fun captureIfDue(frame: Frame, camera: Camera) {
@@ -297,32 +327,75 @@ class ArRenderer(
         lastCaptureNs = now
     }
 
-    private fun projectActiveTarget(camera: Camera) {
-        val remote = remoteAnchor
-        val local = localAnchor
-        val anchor: Anchor
-        val owner: String
-        val confidence: Float
+    /**
+     * While alignment is still being acquired, periodically surface one concise
+     * instruction through the existing English UI banner. This does not alter any
+     * solver threshold; it only tells the operator how to generate useful parallax.
+     */
+    private fun publishSyncGuidanceIfNeeded() {
+        if (coordinator.quality().bothReady) return
+        val now = System.currentTimeMillis()
+        if (now - lastSyncHintAtMs < SYNC_HINT_INTERVAL_MS) return
+        lastSyncHintAtMs = now
+        status("SYNCING — point both phones at the same textured area and move slowly side-to-side")
+    }
 
-        if (remote != null && remote.trackingState == TrackingState.TRACKING) {
-            anchor = remote
-            owner = remoteOwner
-            confidence = remoteConfidence
-        } else if (local != null && local.trackingState == TrackingState.TRACKING) {
-            anchor = local
-            owner = if (localOwner.isBlank()) "YOU" else "YOU • $localOwner"
-            confidence = coordinator.quality().confidence
-        } else {
-            overlay.setTarget(null)
-            return
-        }
-
-        val p = anchor.pose.translation
+    private fun projectTargets(camera: Camera) {
         val view = FloatArray(16)
         val projection = FloatArray(16)
         camera.getViewMatrix(view, 0)
         camera.getProjectionMatrix(projection, 0, 0.05f, 500f)
 
+        val localSnapshot: List<Pair<Long, LocalTarget>>
+        val remoteSnapshot: List<Pair<Long, RemoteTarget>>
+        synchronized(targetLock) {
+            localSnapshot = localTargets.entries.map { it.key to it.value }
+            remoteSnapshot = remoteTargets.entries.map { it.key to it.value }
+        }
+
+        val projected = ArrayList<TargetOverlayView.Target>(localSnapshot.size + remoteSnapshot.size)
+        for ((id, target) in localSnapshot) {
+            projectAnchor(
+                camera = camera,
+                anchor = target.anchor,
+                id = id,
+                label = "YOU • ${shortTargetId(id)}",
+                confidence = coordinator.quality().confidence,
+                isLocal = true,
+                view = view,
+                projection = projection,
+            )?.let { projected += it }
+        }
+        for ((id, target) in remoteSnapshot) {
+            val owner = target.owner.ifBlank { "PEER" }
+            projectAnchor(
+                camera = camera,
+                anchor = target.anchor,
+                id = id,
+                label = "$owner • ${shortTargetId(id)}",
+                confidence = target.confidence,
+                isLocal = false,
+                view = view,
+                projection = projection,
+            )?.let { projected += it }
+        }
+
+        overlay.setTargets(projected)
+    }
+
+    private fun projectAnchor(
+        camera: Camera,
+        anchor: Anchor,
+        id: Long,
+        label: String,
+        confidence: Float,
+        isLocal: Boolean,
+        view: FloatArray,
+        projection: FloatArray,
+    ): TargetOverlayView.Target? {
+        if (anchor.trackingState != TrackingState.TRACKING) return null
+
+        val p = anchor.pose.translation
         val world = floatArrayOf(p[0], p[1], p[2], 1f)
         val cameraV = FloatArray(4)
         val clip = FloatArray(4)
@@ -344,30 +417,34 @@ class ArRenderer(
         val dy = p[1] - camera.pose.ty()
         val dz = p[2] - camera.pose.tz()
         val distance = sqrt(dx * dx + dy * dy + dz * dz)
-        overlay.setTarget(
-            TargetOverlayView.Target(
-                x,
-                y,
-                inFront,
-                bearing,
-                distance,
-                owner,
-                confidence,
-            ),
+        return TargetOverlayView.Target(
+            id = id,
+            screenX = x,
+            screenY = y,
+            inFront = inFront,
+            bearingRad = bearing,
+            distanceM = distance,
+            label = label,
+            confidence = confidence,
+            isLocal = isLocal,
         )
     }
 
+    private fun shortTargetId(id: Long): String =
+        java.lang.Long.toHexString(id).takeLast(3).uppercase(Locale.US).padStart(3, '0')
+
     private fun detachAnchors() {
-        runCatching { localAnchor?.detach() }
-        runCatching { remoteAnchor?.detach() }
-        localAnchor = null
-        remoteAnchor = null
-        localPoiId = Long.MIN_VALUE
-        remoteAnchorId = Long.MIN_VALUE
-        localOwner = ""
-        remoteOwner = ""
-        remoteConfidence = 0f
-        overlay.setTarget(null)
+        val locals: List<Anchor>
+        val remotes: List<Anchor>
+        synchronized(targetLock) {
+            locals = localTargets.values.map { it.anchor }
+            remotes = remoteTargets.values.map { it.anchor }
+            localTargets.clear()
+            remoteTargets.clear()
+        }
+        locals.forEach { anchor -> runCatching { anchor.detach() } }
+        remotes.forEach { anchor -> runCatching { anchor.detach() } }
+        overlay.setTargets(emptyList())
     }
 
     private fun pointDistance(a: FloatArray, b: FloatArray): Float {
@@ -396,5 +473,6 @@ class ArRenderer(
         private const val TAP_DEPTH_MIN_TOLERANCE_M = 0.18f
         private const val TAP_DEPTH_TOLERANCE_RATIO = 0.06f
         private const val MAX_POI_DISTANCE_M = 30f
+        private const val SYNC_HINT_INTERVAL_MS = 9000L
     }
 }
