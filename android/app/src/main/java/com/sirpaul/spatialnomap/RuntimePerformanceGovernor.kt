@@ -7,13 +7,11 @@ import android.os.SystemClock
 
 /**
  * Protects ARCore VIO from thermal starvation while keeping registration quality
- * as the primary objective. Spatial Sync is deliberately bandwidth-heavy: on a
- * cool device we capture high-resolution registration frames at several Hz and
- * only back off when Android reports real thermal pressure.
- *
- * Locked mode deliberately remains high-rate too. Besides making background
- * relocalisation more resilient, these frames drive the live shared-world actor
- * visualization and preserve enough temporal density for motion trails/replay.
+ * as the primary objective. During acquisition this intentionally behaves like a
+ * short-range sensor firehose: high-resolution registration frames arrive at up to
+ * ~8 Hz so the solver sees many overlapping RGB/depth observations quickly. Locked
+ * mode remains relatively dense because vehicle tracks and world-view trails benefit
+ * from temporal continuity.
  */
 class RuntimePerformanceGovernor(context: Context) {
     data class CaptureBudget(
@@ -34,10 +32,17 @@ class RuntimePerformanceGovernor(context: Context) {
     fun captureBudget(locked: Boolean): CaptureBudget {
         sampleIfDue()
         return when (tier) {
-            Tier.FULL -> CaptureBudget(250_000_000L, if (locked) 1152 else 1280, tier)
-            Tier.WARM -> CaptureBudget(350_000_000L, if (locked) 960 else 1152, tier)
-            Tier.HOT -> CaptureBudget(500_000_000L, if (locked) 896 else 960, tier)
-            Tier.CRITICAL -> CaptureBudget(800_000_000L, if (locked) 704 else 800, tier)
+            Tier.FULL -> if (locked) CaptureBudget(250_000_000L, 1152, tier)
+            else CaptureBudget(125_000_000L, 1440, tier)
+
+            Tier.WARM -> if (locked) CaptureBudget(350_000_000L, 960, tier)
+            else CaptureBudget(190_000_000L, 1280, tier)
+
+            Tier.HOT -> if (locked) CaptureBudget(500_000_000L, 896, tier)
+            else CaptureBudget(300_000_000L, 1152, tier)
+
+            Tier.CRITICAL -> if (locked) CaptureBudget(800_000_000L, 704, tier)
+            else CaptureBudget(500_000_000L, 960, tier)
         }
     }
 
