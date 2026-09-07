@@ -90,6 +90,7 @@ object FrameCapture {
                 val metric = MetricSupportSampler.sample(frame, camera, maxPoints = 8000).map {
                     floatArrayOf(it[0] * scale, it[1] * scale, it[2], it[3], it[4])
                 }
+                val burst = AcquisitionBurstController.tagForCapture()
 
                 return CapturedFrame(
                     timestampNs = frame.timestamp,
@@ -105,6 +106,8 @@ object FrameCapture {
                     jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
                     metricPoints = metric,
                     sensors = sensors,
+                    burstId = burst.burstId,
+                    burstSequence = burst.sequence,
                 )
             } finally {
                 src.release()
