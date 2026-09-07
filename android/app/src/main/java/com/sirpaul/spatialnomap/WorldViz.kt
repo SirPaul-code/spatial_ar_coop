@@ -1,7 +1,6 @@
 package com.sirpaul.spatialnomap
 
 import java.util.LinkedHashMap
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.sqrt
 
@@ -118,6 +117,11 @@ object WorldVizBus {
                 localReady = false
                 peerReady = false
                 localFromPeer = null
+                latestLocalFrame = null
+                latestRemoteFrame = null
+                localTargets.clear()
+                remoteTargets.clear()
+                SpatialMapAccumulator.clear()
                 AcquisitionBurstController.reset()
             }
             is WireMessage.Range -> Unit
@@ -224,8 +228,14 @@ object WorldVizBus {
     private fun transformQuaternion(transform: DoubleArray, q: FloatArray): FloatArray? {
         if (transform.size < 16 || q.size < 4) return null
         val rq = rotationMatrixToQuaternion(transform) ?: return null
-        val x1 = rq[0]; val y1 = rq[1]; val z1 = rq[2]; val w1 = rq[3]
-        val x2 = q[0]; val y2 = q[1]; val z2 = q[2]; val w2 = q[3]
+        val x1 = rq[0]
+        val y1 = rq[1]
+        val z1 = rq[2]
+        val w1 = rq[3]
+        val x2 = q[0]
+        val y2 = q[1]
+        val z2 = q[2]
+        val w2 = q[3]
         val out = floatArrayOf(
             w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
             w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
@@ -278,7 +288,9 @@ object WorldVizBus {
             t[2], t[6], t[10], 0.0,
             0.0, 0.0, 0.0, 1.0,
         )
-        val tx = t[3]; val ty = t[7]; val tz = t[11]
+        val tx = t[3]
+        val ty = t[7]
+        val tz = t[11]
         out[3] = -(out[0] * tx + out[1] * ty + out[2] * tz)
         out[7] = -(out[4] * tx + out[5] * ty + out[6] * tz)
         out[11] = -(out[8] * tx + out[9] * ty + out[10] * tz)
