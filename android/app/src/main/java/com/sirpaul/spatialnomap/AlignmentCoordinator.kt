@@ -14,10 +14,16 @@ import kotlin.math.sqrt
 /**
  * Precision-first shared-world coordinator.
  *
+ * The room host is the preferred canonical solver. During the first few seconds the
+ * client does not burn compute solving an independent world; it captures and ships a
+ * synchronized acquisition burst and waits for the host's verified transform. If the
+ * host cannot solve within the grace period, the client automatically becomes a
+ * recovery solver so a vendor-specific weak host camera/depth path cannot deadlock
+ * the room.
+ *
  * A strong transform solved by either phone may bootstrap the peer after rigid,
- * gravity and physical-range sanity checks. The receiver no longer has to finish a
- * second independent full solve before it can enter the shared world. If both phones
- * already solved independently, scene-space agreement remains the stricter path.
+ * gravity and physical-range sanity checks. If both phones happen to solve
+ * independently, scene-space agreement remains the stricter path.
  *
  * Once a transform is adopted it is kept static; active manual POIs therefore cannot
  * be dragged by later refinement. Dynamic AUTO:CAR observations remain transient.
@@ -237,6 +243,9 @@ class AlignmentCoordinator(
             return
         }
 
+        val sameBurst = frame.burstId != 0L && frame.burstId == last.burstId
+        val newBurstSequence = frame.burstId != 0L && frame.burstSequence >= 0 &&
+            (!sameBurst || frame.burstSequence != last.burstSequence)
         val motionQuality = frameMotionQuality(frame)
         val lastMotionQuality = frameMotionQuality(last)
         val (translationM, rotationDeg) = cameraPoseDelta(last.pose, frame.pose)
@@ -249,7 +258,11 @@ class AlignmentCoordinator(
         val temporallyNew = elapsedNs >= KEYFRAME_MAX_INTERVAL_NS
         val motionUsable = motionQuality >= MIN_KEYFRAME_MOTION_QUALITY
 
-        if (motionUsable && (spatiallyNew || temporallyNew)) {
+        // During the short acquisition burst keep one frame for every sequence even
+        // when the phones are nearly stationary. Pair identity is more useful here
+        // than aggressive local keyframe pruning; blur is still naturally punished
+        // later by SIFT/inlier scoring.
+        if (newBurstSequence || (motionUsable && (spatiallyNew || temporallyNew))) {
             window.addLast(frame)
         } else if (motionUsable && (materiallyBetterDepth || calmer)) {
             window.removeLast()
@@ -289,8 +302,13 @@ class AlignmentCoordinator(
         if (!transport.connected || lockedTransform != null) return
 
         val now = System.currentTimeMillis()
+        // Host-first canonical acquisition: the joiner spends its first seconds
+        // capturing/streaming high-quality frames instead of competing with the host
+        // on an independent solve. If the host produces a transform it is adopted by
+        // tryVerifyPeerTransform(). Only after the grace period does the client solve
+        // locally as a recovery path.
         if (!transport.isHostRole && pendingPeerTransform == null &&
-            now - connectedAtMs < CLIENT_INITIAL_SOLVE_DELAY_MS
+            now - connectedAtMs < CLIENT_HOST_SOLVE_GRACE_MS
         ) return
 
         val pairs = buildFramePairs()
@@ -353,11 +371,24 @@ class AlignmentCoordinator(
                 val temporalAffinity = (1.0 - abs(localAge - remoteAge)).coerceIn(0.0, 1.0)
                 val support = min(min(remote.metricPoints.size, local.metricPoints.size), 6000) / 6000.0
                 val motionScore = min(frameMotionQuality(local), frameMotionQuality(remote))
-                val score = recency * 0.38 + temporalAffinity * 0.78 + support * 1.15 + motionScore * 0.48
+                val burstAffinity = burstPairAffinity(local, remote)
+                val score = recency * 0.38 + temporalAffinity * 0.78 + support * 1.15 +
+                    motionScore * 0.48 + burstAffinity
                 out += FramePair(remote, local, score)
             }
         }
         return out.sortedByDescending { it.score }
+    }
+
+    private fun burstPairAffinity(local: CapturedFrame, remote: CapturedFrame): Double {
+        if (local.burstId == 0L || local.burstId != remote.burstId) return 0.0
+        if (local.burstSequence < 0 || remote.burstSequence < 0) return 0.35
+        return when (abs(local.burstSequence - remote.burstSequence)) {
+            0 -> 4.0
+            1 -> 2.4
+            2 -> 1.1
+            else -> 0.25
+        }
     }
 
     private fun frameMotionQuality(frame: CapturedFrame): Double {
@@ -402,7 +433,7 @@ class AlignmentCoordinator(
                 lockedTransform = consensusMedoid(if (cluster.isNotEmpty()) cluster else candidateHistory.toList())
                 lastLockInliers = result.inliers
                 lastLockReprojectionPx = result.medianReprojectionPx.toFloat()
-                lastLockSource = if (transport.isHostRole) "HOST_CANONICAL" else "CLIENT_INDEPENDENT"
+                lastLockSource = if (transport.isHostRole) "HOST_CANONICAL" else "CLIENT_RECOVERY"
             }
         }
 
@@ -509,12 +540,10 @@ class AlignmentCoordinator(
     }
 
     /**
-     * A receiver with no local lock may now adopt a strong peer-issued transform.
-     * The peer only broadcasts a transform after its own visual/metric/range gates
-     * and consensus have passed. The receiver independently checks rigidity, gravity
-     * and its current physical RTT/BLE range before adoption. This removes the old
-     * double-solve deadlock while retaining the stricter scene-space comparison when
-     * both phones happened to solve independently.
+     * A receiver with no local lock may adopt a strong peer-issued transform. The
+     * peer only broadcasts after its own visual/metric/range gates and consensus
+     * have passed. The receiver independently checks rigidity, gravity and current
+     * physical range before adoption.
      */
     @Synchronized private fun tryVerifyPeerTransform() {
         val message = pendingPeerTransform ?: return
@@ -536,9 +565,6 @@ class AlignmentCoordinator(
             message.transformMedianReprojectionPx.isFinite() &&
             message.transformMedianReprojectionPx <= PEER_BOOTSTRAP_MAX_REPROJECTION_PX
 
-        // Critical fast path: one successful shared-world solve is sufficient to
-        // bootstrap the pair. Previously this line effectively read
-        // `val existing = lockedTransform ?: return`, forcing a second full solve.
         if (lockedTransform == null) {
             if (!bootstrapVisualEvidence) return
 
@@ -978,7 +1004,7 @@ class AlignmentCoordinator(
 
         private const val RTT_FRESH_MS = 5000L
         private const val RANGE_GATE_FRESH_MS = 8_000L
-        private const val CLIENT_INITIAL_SOLVE_DELAY_MS = 900L
+        private const val CLIENT_HOST_SOLVE_GRACE_MS = 7_000L
         private const val TRANSFORM_RETRY_MS = 650L
 
         private const val MAX_VISUAL_GRAVITY_TILT_DEG = 12.0
