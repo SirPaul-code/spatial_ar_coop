@@ -83,9 +83,10 @@ class ArRenderer(
     private val localTargets = LinkedHashMap<Long, LocalTarget>()
     private val remoteTargets = LinkedHashMap<Long, RemoteTarget>()
 
-    /** Moving objects are dynamic tracks, never permanent ARCore anchors. */
+    /** Moving objects and peer devices are dynamic tracks, never permanent anchors. */
     private val localVehicles = LinkedHashMap<Long, DynamicTarget>()
     private val remoteVehicles = LinkedHashMap<Long, DynamicTarget>()
+    private val remoteDevices = LinkedHashMap<Long, DynamicTarget>()
 
     private var width = 1
     private var height = 1
@@ -95,6 +96,7 @@ class ArRenderer(
     private var lastFrameErrorAtMs = 0L
     private var lastSyncHintAtMs = 0L
     private var lastVehicleSubmitMs = 0L
+    private var lastDevicePoseShareMs = 0L
     private var lastVehicleError = ""
 
     init {
@@ -132,7 +134,7 @@ class ArRenderer(
     }
 
     fun targetCount(): Int = synchronized(targetLock) {
-        localTargets.size + remoteTargets.size + localVehicles.size + remoteVehicles.size
+        localTargets.size + remoteTargets.size + localVehicles.size + remoteVehicles.size + remoteDevices.size
     }
 
     fun detachSession() {
@@ -148,6 +150,7 @@ class ArRenderer(
         lastFrameError = ""
         lastSyncHintAtMs = 0L
         lastVehicleSubmitMs = 0L
+        lastDevicePoseShareMs = 0L
         trackingGate.reset()
         flightRecorder.event("ar_session_detached")
     }
@@ -167,9 +170,7 @@ class ArRenderer(
         this.width = width
         this.height = height
         GLES20.glViewport(0, 0, width, height)
-        if (sessionResumed) {
-            runCatching { session?.setDisplayGeometry(rotationProvider(), width, height) }
-        }
+        if (sessionResumed) runCatching { session?.setDisplayGeometry(rotationProvider(), width, height) }
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -209,6 +210,7 @@ class ArRenderer(
             flightRecorder.quality(coordinator.quality())
             handleTap(s, frame, camera)
             captureIfDue(frame, camera)
+            shareLocalDevicePose(camera)
             maybeDetectVehicles(s, frame, camera)
             applyVehicleDetections()
             expireVehicleTracks()
@@ -228,7 +230,6 @@ class ArRenderer(
         }
     }
 
-    /** A tap is accepted only when ARCore hit testing and metric depth agree. */
     private fun handleTap(session: Session, frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
@@ -291,7 +292,7 @@ class ArRenderer(
         var id = newTargetId()
         synchronized(targetLock) {
             while (localTargets.containsKey(id) || remoteTargets.containsKey(id) ||
-                localVehicles.containsKey(id) || remoteVehicles.containsKey(id)
+                localVehicles.containsKey(id) || remoteVehicles.containsKey(id) || remoteDevices.containsKey(id)
             ) id += 1L
         }
         val owner = usernameProvider()
@@ -313,23 +314,30 @@ class ArRenderer(
         while (true) {
             val request = remoteTargetRequests.poll() ?: break
             val dynamicCar = request.owner.startsWith(AUTO_CAR_PREFIX)
-            if (dynamicCar) {
-                val cleanOwner = request.owner.removePrefix(AUTO_CAR_PREFIX).ifBlank { "Peer" }
+            val dynamicDevice = request.owner.startsWith(AUTO_DEVICE_PREFIX)
+            if (dynamicCar || dynamicDevice) {
+                val prefix = if (dynamicCar) AUTO_CAR_PREFIX else AUTO_DEVICE_PREFIX
+                val cleanOwner = request.owner.removePrefix(prefix).ifBlank { "Peer" }
+                val store = if (dynamicCar) remoteVehicles else remoteDevices
                 synchronized(targetLock) {
                     if (request.point == null) {
-                        remoteVehicles.remove(request.id)
+                        store.remove(request.id)
                     } else {
                         val now = System.currentTimeMillis()
-                        val prior = remoteVehicles[request.id]
-                        remoteVehicles[request.id] = filterDynamicTarget(
+                        val prior = store[request.id]
+                        store[request.id] = filterDynamicTarget(
                             prior = prior,
                             measurement = request.point,
                             owner = cleanOwner,
-                            label = "CAR",
+                            label = if (dynamicCar) "CAR" else "PHONE",
                             confidence = request.confidence,
                             nowMs = now,
+                            alpha = if (dynamicCar) VEHICLE_ALPHA else DEVICE_ALPHA,
+                            beta = if (dynamicCar) VEHICLE_BETA else DEVICE_BETA,
                         )
-                        flightRecorder.vehicle(request.id, "CAR", request.confidence, request.point, true)
+                        if (dynamicCar) {
+                            flightRecorder.vehicle(request.id, "CAR", request.confidence, request.point, true)
+                        }
                     }
                 }
                 continue
@@ -374,6 +382,23 @@ class ArRenderer(
         lastCaptureNs = now
     }
 
+    /**
+     * Share the observing phone itself as a dynamic actor once a common world exists.
+     * This gives the WORLD view a live second-phone marker and trail without needing
+     * a new transport primitive; the same metric POI packet already carries XYZ.
+     */
+    private fun shareLocalDevicePose(camera: Camera) {
+        if (!coordinator.quality().bothReady) return
+        val now = System.currentTimeMillis()
+        if (now - lastDevicePoseShareMs < DEVICE_POSE_SHARE_MS) return
+        lastDevicePoseShareMs = now
+        val owner = usernameProvider()
+        coordinator.sendPoi(deviceTrackId(owner), camera.pose.translation.copyOf(), "$AUTO_DEVICE_PREFIX$owner")
+    }
+
+    private fun deviceTrackId(owner: String): Long =
+        DEVICE_ID_NAMESPACE xor owner.hashCode().toLong().shl(32) xor owner.length.toLong()
+
     private fun maybeDetectVehicles(session: Session, frame: Frame, camera: Camera) {
         if (!coordinator.quality().bothReady || vehicleDetector.isBusy()) return
         val now = System.currentTimeMillis()
@@ -394,7 +419,6 @@ class ArRenderer(
         if (accepted) lastVehicleSubmitMs = now
     }
 
-    /** Associate repeated detector observations with persistent room track IDs. */
     private fun applyVehicleDetections() {
         val detections = pendingVehicleDetections.getAndSet(null) ?: return
         val now = System.currentTimeMillis()
@@ -426,6 +450,8 @@ class ArRenderer(
                 label = vehicle.label,
                 confidence = vehicle.confidence,
                 nowMs = now,
+                alpha = VEHICLE_ALPHA,
+                beta = VEHICLE_BETA,
             )
 
             synchronized(targetLock) { localVehicles[id] = track }
@@ -444,6 +470,8 @@ class ArRenderer(
         label: String,
         confidence: Float,
         nowMs: Long,
+        alpha: Float,
+        beta: Float,
     ): DynamicTarget {
         if (prior == null || measurement.size < 3) {
             return DynamicTarget(
@@ -459,8 +487,8 @@ class ArRenderer(
         val dt = ((nowMs - prior.lastUpdateMs).coerceIn(40L, 1500L) / 1000f)
         val predicted = FloatArray(3) { i -> prior.point[i] + prior.velocity[i] * dt }
         val residual = FloatArray(3) { i -> measurement.getOrElse(i) { predicted[i] } - predicted[i] }
-        val filtered = FloatArray(3) { i -> predicted[i] + VEHICLE_ALPHA * residual[i] }
-        val velocity = FloatArray(3) { i -> prior.velocity[i] + (VEHICLE_BETA / dt) * residual[i] }
+        val filtered = FloatArray(3) { i -> predicted[i] + alpha * residual[i] }
+        val velocity = FloatArray(3) { i -> prior.velocity[i] + (beta / dt) * residual[i] }
         return DynamicTarget(
             point = filtered,
             velocity = velocity,
@@ -480,10 +508,9 @@ class ArRenderer(
     private fun expireVehicleTracks() {
         val now = System.currentTimeMillis()
         synchronized(targetLock) {
-            val localExpired = localVehicles.filterValues { now - it.lastSeenMs > LOCAL_VEHICLE_TTL_MS }.keys.toList()
-            localExpired.forEach { localVehicles.remove(it) }
-            val remoteExpired = remoteVehicles.filterValues { now - it.lastSeenMs > REMOTE_VEHICLE_TTL_MS }.keys.toList()
-            remoteExpired.forEach { remoteVehicles.remove(it) }
+            localVehicles.filterValues { now - it.lastSeenMs > LOCAL_VEHICLE_TTL_MS }.keys.toList().forEach { localVehicles.remove(it) }
+            remoteVehicles.filterValues { now - it.lastSeenMs > REMOTE_VEHICLE_TTL_MS }.keys.toList().forEach { remoteVehicles.remove(it) }
+            remoteDevices.filterValues { now - it.lastSeenMs > REMOTE_DEVICE_TTL_MS }.keys.toList().forEach { remoteDevices.remove(it) }
         }
     }
 
@@ -513,65 +540,34 @@ class ArRenderer(
         val remoteSnapshot: List<Pair<Long, RemoteTarget>>
         val localVehicleSnapshot: List<Pair<Long, DynamicTarget>>
         val remoteVehicleSnapshot: List<Pair<Long, DynamicTarget>>
+        val remoteDeviceSnapshot: List<Pair<Long, DynamicTarget>>
         synchronized(targetLock) {
             localSnapshot = localTargets.entries.map { it.key to it.value }
             remoteSnapshot = remoteTargets.entries.map { it.key to it.value }
             localVehicleSnapshot = localVehicles.entries.map { it.key to it.value }
             remoteVehicleSnapshot = remoteVehicles.entries.map { it.key to it.value }
+            remoteDeviceSnapshot = remoteDevices.entries.map { it.key to it.value }
         }
 
         val projected = ArrayList<TargetOverlayView.Target>(
-            localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size,
+            localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size + remoteDeviceSnapshot.size,
         )
         for ((id, target) in localSnapshot) {
-            projectAnchor(
-                camera = camera,
-                anchor = target.anchor,
-                id = id,
-                label = "YOU • ${shortTargetId(id)}",
-                confidence = coordinator.quality().confidence,
-                isLocal = true,
-                view = view,
-                projection = projection,
-            )?.let { projected += it }
+            projectAnchor(camera, target.anchor, id, "YOU • ${shortTargetId(id)}", coordinator.quality().confidence, true, view, projection)?.let { projected += it }
         }
         for ((id, target) in remoteSnapshot) {
             val owner = target.owner.ifBlank { "PEER" }
-            projectAnchor(
-                camera = camera,
-                anchor = target.anchor,
-                id = id,
-                label = "$owner • ${shortTargetId(id)}",
-                confidence = target.confidence,
-                isLocal = false,
-                view = view,
-                projection = projection,
-            )?.let { projected += it }
+            projectAnchor(camera, target.anchor, id, "$owner • ${shortTargetId(id)}", target.confidence, false, view, projection)?.let { projected += it }
         }
         val now = System.currentTimeMillis()
         for ((id, target) in localVehicleSnapshot) {
-            projectPoint(
-                camera = camera,
-                point = predictPoint(target, now),
-                id = id,
-                label = "${target.label} • YOU",
-                confidence = target.confidence,
-                isLocal = true,
-                view = view,
-                projection = projection,
-            )?.let { projected += it }
+            projectPoint(camera, predictPoint(target, now), id, "${target.label} • YOU", target.confidence, true, view, projection)?.let { projected += it }
         }
         for ((id, target) in remoteVehicleSnapshot) {
-            projectPoint(
-                camera = camera,
-                point = predictPoint(target, now),
-                id = id,
-                label = "${target.label} • ${target.owner.ifBlank { "PEER" }}",
-                confidence = target.confidence,
-                isLocal = false,
-                view = view,
-                projection = projection,
-            )?.let { projected += it }
+            projectPoint(camera, predictPoint(target, now), id, "${target.label} • ${target.owner.ifBlank { "PEER" }}", target.confidence, false, view, projection)?.let { projected += it }
+        }
+        for ((id, target) in remoteDeviceSnapshot) {
+            projectPoint(camera, predictPoint(target, now), id, "PHONE • ${target.owner.ifBlank { "PEER" }}", target.confidence, false, view, projection)?.let { projected += it }
         }
 
         overlay.setTargets(projected)
@@ -653,6 +649,7 @@ class ArRenderer(
             remoteTargets.clear()
             localVehicles.clear()
             remoteVehicles.clear()
+            remoteDevices.clear()
         }
         locals.forEach { anchor -> runCatching { anchor.detach() } }
         remotes.forEach { anchor -> runCatching { anchor.detach() } }
@@ -688,6 +685,13 @@ class ArRenderer(
         private const val SYNC_HINT_INTERVAL_MS = 6500L
 
         private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
+        private const val AUTO_DEVICE_PREFIX = "AUTO:DEVICE:"
+        private const val DEVICE_ID_NAMESPACE = 0x4445564943450000L
+        private const val DEVICE_POSE_SHARE_MS = 180L
+        private const val REMOTE_DEVICE_TTL_MS = 1_400L
+        private const val DEVICE_ALPHA = 0.72f
+        private const val DEVICE_BETA = 0.24f
+
         private const val VEHICLE_DETECT_INTERVAL_MS = 350L
         private const val VEHICLE_METRIC_BUDGET = 6500
         private const val VEHICLE_ASSOCIATION_M = 3.5f
