@@ -96,6 +96,7 @@ object AlignmentQualityPoller {
             val coordinator = activeCoordinator?.get()
             if (activity == null || coordinator == null || activity.isFinishing) return
             runCatching { AlignmentDiagnostics.observe(coordinator.quality()) }
+            runCatching { SpatialMapAccumulator.ingest(WorldVizBus.snapshot(maxPointsPerSide = 1800)) }
             main.postDelayed(this, 250L)
         }
     }
