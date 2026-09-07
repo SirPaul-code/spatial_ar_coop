@@ -1036,15 +1036,39 @@ class MainActivity : Activity(),
                 peerConnectedOnce -> {
                     syncPill.text = "ALIGNING"
                     syncPill.background = rounded(0xcf493b18.toInt(), 18f)
-                    detailPill.text = when {
-                        quality.inliers >= 7 -> "Hold on the same detailed area for a moment"
-                        quality.keyframesLocal < 2 || quality.keyframesRemote < 2 -> "Point both cameras at the same detailed area"
-                        else -> "Move both phones slowly while keeping some shared detail in view"
-                    }
+                    detailPill.text = alignmentDiagnosticText(quality)
                 }
                 else -> renderArReadiness()
             }
         }
+    }
+
+    private fun alignmentDiagnosticText(quality: AlignmentCoordinator.Quality): String {
+        fun gate(ok: Boolean) = if (ok) "✓" else "×"
+        fun oneDecimal(value: Double): String = if (value.isFinite()) "%.1f".format(value) else "—"
+
+        val inliersOk = quality.inliers >= 7 && quality.correspondences >= 7
+        val reprojectionOk = quality.medianReprojectionPx.isFinite() && quality.medianReprojectionPx <= 5.0
+        val coverageOk = quality.imageCoverage >= 0.045
+        val confidenceOk = quality.confidence >= 0.10f
+        val gravityOk = !quality.gravityTiltDeg.isFinite() || quality.gravityTiltDeg <= 16.0
+        val singleStrong = quality.inliers >= 14 && quality.correspondences >= 14 &&
+            quality.medianReprojectionPx.isFinite() && quality.medianReprojectionPx <= 3.4 &&
+            quality.imageCoverage >= 0.085 && quality.confidence >= 0.19f &&
+            (!quality.gravityTiltDeg.isFinite() || quality.gravityTiltDeg <= 8.0)
+        val consensusNeeded = when {
+            singleStrong -> 1
+            quality.inliers >= 9 && quality.confidence >= 0.13f -> 2
+            else -> 3
+        }
+
+        val reprojection = oneDecimal(quality.medianReprojectionPx)
+        val coverage = "%.1f".format(quality.imageCoverage * 100.0)
+        val confidence = "%.2f".format(quality.confidence)
+        val gravity = if (quality.gravityTiltDeg.isFinite()) oneDecimal(quality.gravityTiltDeg) else "—"
+
+        return "I${quality.inliers}/${quality.correspondences}${gate(inliersOk)} R${reprojection}${gate(reprojectionOk)} C${coverage}%${gate(coverageOk)}\n" +
+            "Q${confidence}${gate(confidenceOk)} S${quality.stableCount}/$consensusNeeded KF${quality.keyframesLocal}/${quality.keyframesRemote} G${gravity}°${gate(gravityOk)}"
     }
 
     override fun onRemotePoi(id: Long, pointLocal: FloatArray?, owner: String, confidence: Float) {
