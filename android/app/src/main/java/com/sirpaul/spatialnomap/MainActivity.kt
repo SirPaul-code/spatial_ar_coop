@@ -624,7 +624,7 @@ class MainActivity : Activity(),
     private fun buildArConfig(s: Session, enableDepth: Boolean) = Config(s).apply {
         planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
         updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-        focusMode = Config.FocusMode.FIXED
+        focusMode = Config.FocusMode.AUTO
         depthMode = if (enableDepth) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
     }
 
@@ -1047,18 +1047,18 @@ class MainActivity : Activity(),
         fun gate(ok: Boolean) = if (ok) "✓" else "×"
         fun oneDecimal(value: Double): String = if (value.isFinite()) "%.1f".format(value) else "—"
 
-        val inliersOk = quality.inliers >= 7 && quality.correspondences >= 7
-        val reprojectionOk = quality.medianReprojectionPx.isFinite() && quality.medianReprojectionPx <= 5.0
-        val coverageOk = quality.imageCoverage >= 0.045
+        val inliersOk = quality.inliers >= 8 && quality.correspondences >= 8
+        val reprojectionOk = quality.medianReprojectionPx.isFinite() && quality.medianReprojectionPx <= 4.0
+        val coverageOk = quality.imageCoverage >= 0.05
         val confidenceOk = quality.confidence >= 0.10f
-        val gravityOk = !quality.gravityTiltDeg.isFinite() || quality.gravityTiltDeg <= 16.0
-        val singleStrong = quality.inliers >= 14 && quality.correspondences >= 14 &&
-            quality.medianReprojectionPx.isFinite() && quality.medianReprojectionPx <= 3.4 &&
-            quality.imageCoverage >= 0.085 && quality.confidence >= 0.19f &&
-            (!quality.gravityTiltDeg.isFinite() || quality.gravityTiltDeg <= 8.0)
+        val gravityOk = !quality.gravityTiltDeg.isFinite() || quality.gravityTiltDeg <= 12.0
+        val singleStrong = quality.inliers >= 12 && quality.correspondences >= 12 &&
+            quality.medianReprojectionPx.isFinite() && quality.medianReprojectionPx <= 3.0 &&
+            quality.imageCoverage >= 0.07 && quality.confidence >= 0.16f &&
+            (!quality.gravityTiltDeg.isFinite() || quality.gravityTiltDeg <= 7.0)
         val consensusNeeded = when {
             singleStrong -> 1
-            quality.inliers >= 9 && quality.confidence >= 0.13f -> 2
+            quality.inliers >= 10 && quality.confidence >= 0.14f -> 2
             else -> 3
         }
 
@@ -1137,10 +1137,10 @@ class MainActivity : Activity(),
                         3600L,
                     )
                 }
-                text.startsWith("No reliable metric depth") -> {
+                text.startsWith("No reliable metric depth") || text.startsWith("No corroborated metric surface") -> {
                     showBanner("Move slightly", "Keep the surface in view for a moment, then tap again.", 3600L)
                 }
-                text == "POI sent" -> showBanner("POI shared", "Visible on the connected phone", 2200L)
+                text == "POI sent" -> showBanner("POI shared", "Pinned locally and visible on the connected phone", 2200L)
             }
         }
     }
