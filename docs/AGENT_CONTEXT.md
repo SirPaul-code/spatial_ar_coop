@@ -1,134 +1,146 @@
 # Spatial Sync — Continuation Context
 
-**Purpose:** this is the durable engineering handoff for a new agent after chat/context loss. Read `AGENTS.md` first, then this file. Current code is the source of truth if anything here becomes stale.
+**Purpose:** durable engineering handoff for any agent inheriting this project after chat/context loss. Read `AGENTS.md` first, then this file. The current code is always the source of truth if this document becomes stale.
 
 ## 1. Product goal
 
-Build a high-accuracy, infrastructure-free shared AR world for nearby Android phones. The expected experience is: phones join a room, establish the same physical coordinate frame quickly, and then any target/object placed or observed by one phone appears at the same real-world position on all peers.
+Build a high-accuracy, infrastructure-free shared AR world for nearby Android phones. Phones join a room, establish one physical coordinate frame quickly, and then any manual target or automatically detected real-world object observed by one phone appears at the same physical location on its peers.
 
-Priorities are **accuracy, stability, and reliability first**. The user explicitly accepts high bandwidth, CPU/GPU use, large APKs, and dense data transfer if that improves spatial quality.
+Priority order is deliberately unusual:
 
-Near-term product behavior:
+1. spatial correctness,
+2. stability,
+3. fast/reliable acquisition,
+4. observability/debuggability,
+5. presentation quality,
+6. only then bandwidth/CPU/battery/APK size.
 
-- fast two-phone room alignment,
-- multiple manual targets at once,
-- owner can see its own target gizmo too,
-- remote/off-screen target direction arrows,
-- automatic vehicle recognition and sharing,
-- later person recognition/tracking,
-- later true N-phone rooms and shared perception.
+The user explicitly accepts very high local compute and P2P bandwidth if it improves spatial quality.
 
 ## 2. Non-negotiable architecture
 
 - No Google Cloud Anchors.
-- No required cloud/backend/VPS for basic operation.
+- No required cloud/backend/VPS for the base shared-world path.
 - No pre-scanned map requirement.
-- ARCore `Anchor` is only a local anchor.
-- Direct phone-to-phone transport is Wi-Fi Aware/NAN -> encrypted NDP -> IPv6 TCP.
-- Once room alignment is accepted, the canonical transform should remain stable; do not casually reintroduce continuous transform refinement that drags already-placed POIs.
-- Manual targets are additive.
-- Moving objects are dynamic tracks, not static anchors.
-- Product text must remain English.
+- ARCore `Anchor` objects are local anchors only; an Anchor ID is never a cross-device coordinate system.
+- Nearby transport is Wi-Fi Aware/NAN -> encrypted NDP -> IPv6 TCP.
+- Manual POIs are additive; adding one must not remove an older one.
+- Cars/persons are dynamic world-space tracks, not permanent ARCore anchors.
+- Once a room transform is verified, do not continuously move it in a way that drags already-placed POIs.
+- All product UI text remains English.
+- When a hardware test fails, instrument the exact gate; do not blindly loosen thresholds.
+- Do not claim a release is ready until CI and `latest-dev` are both verified against the final branch HEAD.
 
 ## 3. Current checkpoint
 
 Working branch: `fresh/no-map-runtime-poc`.
 
-Functional code baseline before these docs:
+Runtime code baseline immediately before this context refresh:
 
-`fc2b8efc3358cda0e53a8de53c4e1c9fbd9b9c92`
+`9f34448e33ae110b2644de3550a0d7bc171b49e4`
 
-`fix: adopt verified peer bootstrap without double solve`
+`fix: restore Android YuvImage import`
 
-At that point CI/release passed. These documentation commits make HEAD newer without changing runtime behavior, so inspect current HEAD and `latest-dev` rather than treating the SHA above as current HEAD.
+That commit includes the full 0.7 spatial-world runtime batch. Documentation commits after it make branch HEAD newer without changing runtime behavior, so always inspect current HEAD and current `latest-dev`.
 
-### Important physical-test status
+### Physical-test history that matters
 
-The build before `fc2b8ef` (`6ced903...`) could remain in `ALIGNING` indefinitely on both physical phones. The root cause found afterward was real: the receiver still effectively required its own local lock before accepting the peer transform:
+Earlier builds could sit in `ALIGNING` for minutes despite both phones reaching local ARCore `TRACKING` almost immediately. Several real architecture bugs were found rather than treating this as a scene-quality problem:
 
-```kotlin
-val existing = lockedTransform ?: return
-```
+1. two independently-originated AR worlds were compared too directly by raw transform components;
+2. scene-space agreement over real 3D points replaced raw translation equality;
+3. direct 3D<->3D shared visual alignment and an essential-matrix + metric-scale path were added;
+4. the receiver still required its own `lockedTransform` before accepting the peer transform, recreating a hidden double-solve deadlock;
+5. `fc2b8ef...` fixed that receiver bootstrap;
+6. 0.7 now goes further: host-first canonical solve, synchronized acquisition bursts, replay/telemetry, and cached visual relocalization.
 
-That meant both phones still had to independently complete the full solve even though the intended model was “first strong shared-world solve bootstraps the other phone”. `fc2b8ef` adds the missing receiver bootstrap path.
+If a good shared textured scene still remains `ALIGNING` for more than roughly 10–15 seconds, treat it as a concrete diagnosable bug. Pull the recorded session rather than telling the user to wander around for minutes.
 
-At handoff time the exact `fc2b8ef` behavior still needed final real-device validation. If it remains `ALIGNING` >10–15 seconds in an obviously shared textured scene, treat it as a concrete bug to instrument rather than telling the user to wander around for minutes.
+## 4. Core world model
 
-## 4. Core data flow
+Every device begins with its own unrelated ARCore origin.
 
 ```text
-Phone A ARCore world
-  -> CPU camera image + intrinsics + AR pose
-  -> raw/full depth + point cloud
-  -> metric support [u,v,worldX,worldY,worldZ]
-  -> CapturedFrame
-  -> Wi-Fi Aware peer link
-  -> Phone B
-  -> SIFT + relative-pose solver ladder
-  -> metric/range/gravity validation
-  -> localFromRemote SE(3)
-  -> canonical room frame
-  -> static POIs become local ARCore anchors
-  -> dynamic detections remain moving world-space tracks
+local ARCore world A                     local ARCore world B
+       |                                        |
+ camera RGB + intrinsics + pose          camera RGB + intrinsics + pose
+ raw/full depth + point cloud            raw/full depth + point cloud
+       |                                        |
+ metric [u,v,worldX,worldY,worldZ]       metric [u,v,worldX,worldY,worldZ]
+       |________________ P2P frames ___________|
+                         |
+                  visual solver ladder
+                         |
+                 localFromRemote SE(3)
+                         |
+                 canonical shared frame
+                         |
+         +---------------+----------------+
+         |                                |
+ static manual POIs                dynamic object tracks
+ local ARCore Anchors              direct world-space XYZ
 ```
 
-Every phone starts with an unrelated ARCore world origin.
+The host is the preferred canonical authority. The client may become a recovery solver if the host cannot solve quickly.
 
-## 5. Capture and keyframes
+## 5. Capture quality and synchronized acquisition
 
-`FrameCapture.kt` currently favors registration quality:
+### FrameCapture
 
-- grayscale CPU image,
-- max width up to 1280 while acquiring,
+`FrameCapture.kt` currently sends quality-first registration frames:
+
+- grayscale CPU camera image,
+- up to 1280 px width while acquiring,
 - JPEG quality 90,
 - scaled camera intrinsics,
-- current ARCore camera pose,
+- ARCore camera pose,
 - up to 8000 metric supports,
-- sensor snapshot.
+- sensor snapshot,
+- V6 acquisition `burstId` + `burstSequence`.
 
-`RuntimePerformanceGovernor.kt` cool-device acquisition is roughly:
+### RuntimePerformanceGovernor
 
-- FULL: 250 ms / 1280 px,
-- WARM: 350 ms / 1152,
-- HOT: 500 ms / 960,
-- CRITICAL: 800 ms / 800.
+Cool-device capture is intentionally heavy:
 
-After lock it backs off.
+- FULL: ~250 ms cadence; 1280 px before lock, 1152 after lock,
+- WARM: ~350 ms,
+- HOT: ~500 ms,
+- CRITICAL: ~800 ms.
 
-`AlignmentCoordinator.kt` current keyframe behavior:
+Locked mode intentionally remains relatively high-rate because the live 3D world/actor view and accumulated map need temporal density too.
 
-- window 18 per side,
-- new if translation >=0.055 m or rotation >=3.5 deg,
-- temporal admission at ~0.9 s,
-- minimum motion quality ~0.44,
-- a materially better-depth or calmer frame may replace the last one.
+### AcquisitionBurstController
 
-Frame pairs are ranked using relative recency, relative-age affinity, metric support, and motion quality. Cross-device monotonic clocks are not assumed equal.
+After a direct TCP socket is established, both sides exchange `Hello`. They derive a stable burst ID from the sorted `username|deviceModel` pair and run a 12-frame burst at ~250 ms intervals.
 
-Current solve interval is ~240 ms with up to 8 pair attempts.
+Important behavior:
+
+- outgoing Hello resets connection-local burst/locked state on reconnect;
+- remote Hello starts the burst;
+- one frame per burst sequence is preserved even if the phones are nearly stationary;
+- frame pairing strongly prefers equal or adjacent sequence numbers;
+- retries reuse the same stable pair burst ID if lock did not happen.
+
+No synchronized monotonic clocks are assumed.
 
 ## 6. Alignment solver ladder
 
-### 6.1 SIFT
+`AlignmentEngine.kt` starts with high-feature SIFT matching and then tries complementary geometry paths. Do not remove fallback paths just because a newer fast path exists.
 
-`AlignmentEngine.kt` begins with heavy SIFT matching. Current configuration intentionally uses many features (~4200) and bidirectional BFMatcher/L2 ratio matching with mutual matches plus bounded recovery matches.
+### 6.1 EssentialSharedPoseSolver
 
-### 6.2 Essential shared-pose fast path
+Use when visual overlap is strong but metric depth is sparse at exact SIFT features:
 
-`EssentialSharedPoseSolver.kt` exists because visual overlap can be excellent even when ARCore depth is sparse exactly at SIFT keypoints.
-
-Flow:
-
-1. 2D<->2D SIFT correspondences,
+1. 2D<->2D correspondences,
 2. normalized camera coordinates,
 3. essential matrix + recoverPose,
 4. relative rotation + translation direction,
 5. a few metric pairs recover translation scale in metres,
-6. metric residual check,
-7. gravity check,
-8. epipolar/coverage/confidence check.
+6. metric residual validation,
+7. gravity validation,
+8. epipolar/coverage/confidence validation.
 
-Current important gates are approximately:
+Approximate gates:
 
 - >=12 visual matches,
 - >=10 visual inliers,
@@ -140,283 +152,283 @@ Current important gates are approximately:
 - gravity <=12 deg,
 - confidence >=0.10.
 
-### 6.3 Direct 3D<->3D shared visual anchor
+### 6.2 SharedVisualAnchorSolver
 
-`SharedVisualAnchorSolver.kt` robustly fits the rigid transform when both phones have metric XYZ for the same visual features.
+When both phones have metric XYZ for corresponding visual features, solve a direct rigid 3D<->3D fit. This is the local/infrastructure-free equivalent of establishing a shared physical anchor.
 
-Approximate current gates:
+Approximate gates include >=6 input pairs, robust RANSAC/Horn fit, >=5 final inliers, residual/coverage/support checks, then reprojection/gravity/confidence validation.
 
-- >=6 input pairs,
-- 3-point RANSAC/Horn fit,
-- >=5 final inliers and >=55% ratio,
-- residual inlier <=0.18 m,
-- median <=0.12 m,
-- p90 <=0.24 m,
-- support diameter >=0.12 m.
+### 6.3 PnP fallback
 
-`AlignmentEngine.sharedVisualAnchorResult()` then validates reprojection, coverage, gravity, and confidence.
+Dense metric PnP remains for device/scene variability:
 
-### 6.4 PnP fallback
-
-Dense metric PnP remains because real devices/scenes vary:
-
-- remote metric 3D world points,
-- local matched 2D keypoints,
+- remote 3D world supports,
+- local matched 2D observations,
 - solvePnPRansac EPNP,
 - VVS/LM refinement,
-- cheirality,
-- spatial support diameter,
-- reprojection,
-- independent local metric-depth residual check,
+- cheirality/spatial diameter/reprojection,
+- independent local metric residual validation,
 - gravity validation.
 
-Do not remove fallback paths just because a newer fast path exists.
+## 7. Coordinator and host-first canonical solve
 
-## 7. Coordinator acceptance
+`AlignmentCoordinator.kt` is the authority for two-phone live registration.
 
-Current baseline lock gates:
+Current base lock gates are approximately:
 
 - inliers >=8,
 - correspondences >=8,
-- median reprojection/epipolar <=4.0 px,
-- image coverage >=0.05,
+- reprojection/epipolar <=4 px,
+- coverage >=0.05,
 - effective confidence >=0.10,
 - gravity <=12 deg,
-- fresh RTT/BLE range compatibility when present,
+- fresh RTT/BLE range compatibility when available,
 - metric consistency when enough pairs exist.
 
 Strong one-frame lock is approximately:
 
-- >=12 inliers/correspondences,
-- <=3.0 px,
+- >=12 inliers,
+- <=3 px,
 - coverage >=0.07,
 - confidence >=0.16,
 - gravity <=7 deg,
-- valid range/metric checks.
+- range/metric gates pass.
 
-Otherwise candidates cluster. Current cluster tolerance is about 0.24 m / 4.5 deg. A robust candidate (~10 inliers, confidence >=0.14) needs 2-consensus; otherwise 3.
+Otherwise candidate consensus is used.
 
-## 8. Canonical handshake and the latest critical fix
+### Host-first behavior
 
-The intended model is one canonical room mapping, with the host as canonical authority.
+The host is the preferred canonical solver. The joiner spends the first `CLIENT_HOST_SOLVE_GRACE_MS = 7000` ms capturing and streaming rather than competing on a second full solve.
 
-Before `fc2b8ef`, peer verification still required `lockedTransform` on the receiving phone. That recreated a double-solve deadlock.
-
-Current receiver bootstrap allows a phone with no local lock to adopt a strong peer-issued mapping after independent cheap sanity checks:
-
-- rigid transform,
-- gravity <=12 deg,
-- physical RTT/BLE range compatible if fresh,
-- peer confidence >=0.14,
-- >=10 transform inliers,
-- peer reprojection <=3.5 px.
-
-The receiver then adopts the inverse peer transform and sends `PEER_ACK`. If both phones already independently solved, the stricter scene-space agreement path remains.
-
-This means one good shared-world solve should now be sufficient to bootstrap the pair.
-
-## 9. TRACKING vs ALIGNING
-
-This must stay conceptually clear:
-
-- `TRACKING` means the individual phone has stable local ARCore VIO.
-- `ALIGNING` means the two phones do not yet share a verified room coordinate system.
-
-Fast local tracking does not prove inter-phone alignment works.
-
-## 10. Alignment failure history
-
-Several previous approaches were wrong in specific ways:
-
-1. Raw SE(3) translation components from two independently-originated AR worlds were compared too tightly. That could reject physically equivalent mappings.
-2. Scene-space agreement over real 3D points replaced raw-matrix translation comparison.
-3. Shared 3D<->3D visual alignment was added.
-4. Essential-matrix + metric-scale alignment was added for sparse depth.
-5. The receiver was still blocked on its own `lockedTransform`, so both phones still had to solve. `fc2b8ef` fixes this.
-
-Do not regress to “both phones must always finish equivalent independent full solves before entering LOCKED”.
-
-## 11. Highest-value next feature: alignment observability
-
-The current largest engineering weakness is that `ALIGNING` is still too opaque.
-
-Add structured per-solve telemetry and a compact dev HUD. At minimum expose:
+Flow:
 
 ```text
-peer connected
-local/remote keyframes
-chosen frame pair
-SIFT keypoints A/B
-ratio matches / mutual matches
-essential attempted + inliers
-epipolar median
-metric scale pairs / scale / residual
-3D3D attempted + pairs/inliers/median/p90
-PnP attempted + corr/inliers/reprojection
-coverage
-gravity
-predicted phone distance
-RTT/BLE distance + delta
-confidence
-candidate cluster count / required
-peer transform received
-bootstrap accepted/rejected + exact reason
-ACK sent/received
-final lock source
-```
-
-Prefer both:
-
-- a live developer overlay,
-- an NDJSON/ring-buffer session log that can be exported after a failed hardware test.
-
-This should happen even if the current build works, because the next difficult scene otherwise returns us to blind threshold tuning.
-
-## 12. Strong next alignment improvement: explicit synchronized burst
-
-Current frame pairing is heuristic. A cleaner startup would be:
-
-```text
-CONNECTED
- -> both ARCore TRACKING
- -> PREPARE_ALIGNMENT(epoch)
- -> CAPTURE_BURST(sequence)
- -> both capture 1.5–3 s high-quality registration burst
- -> network sequence / estimated clock offset pairs near-simultaneous frames
- -> host solves one mapping
- -> peer validates/adopts
- -> ACK
+DIRECT
+ -> both local ARCore TRACKING
+ -> synchronized capture burst
+ -> HOST solves hostFromClient
+ -> host broadcasts strong canonical transform
+ -> CLIENT checks rigid + gravity + fresh physical range + visual evidence
+ -> client adopts inverse canonical mapping
+ -> PEER_ACK
  -> LOCKED
 ```
 
-A tiny ping/pong clock-offset estimate or explicit capture sequence is better than relying only on relative keyframe age. This is likely the best next architecture change if lock time is still inconsistent.
+If the host still has no usable transform after the grace period, the client automatically enables `CLIENT_RECOVERY` solve. This prevents a weak host camera/depth path from deadlocking the room.
 
-## 13. Manual multi-target system
+Strong peer bootstrap currently expects roughly confidence >=0.14, >=10 inliers and <=3.5 px peer reprojection plus receiver rigid/gravity/range sanity.
 
-`ArRenderer.kt` now keeps additive maps:
+If both devices independently solve before adoption, stricter scene-space agreement remains available.
+
+## 8. Persistent visual relocalization
+
+Files:
+
+- `SharedLandmarkCache.kt`
+- `RelocalizationEngine.kt`
+
+After a verified room exists, the app persists a strong old local frame, old remote frame, and old verified `oldLocalFromOldRemote` transform locally.
+
+After a later ARCore world reset/reconnect, the host can reconstruct the shared frame without any Cloud Anchor:
+
+```text
+A = newLocalFromOldLocal
+B = newRemoteFromOldRemote
+oldT = oldLocalFromOldRemote
+newT = A * oldT * inverse(B)
+```
+
+Both A and B are obtained through the same visual/metric `AlignmentEngine` validation. The resulting transform still passes rigid, gravity and physical-range checks. Failure is safe: the normal fresh host solve continues.
+
+Current host relocalization window is roughly 0.9..9 s after connect with retries around 2.2 s.
+
+The persisted checkpoint is local infrastructure only; it is not a Google Cloud Anchor and is not a pre-scanned remote map.
+
+## 9. Alignment flight recorder / observability
+
+This is now implemented and should be used before threshold tuning.
+
+Files:
+
+- `AlignmentSessionRecorder.kt`
+- `AlignmentDiagnostics.kt`
+- `RecordedAlignmentReplay.kt`
+
+Each direct connection creates a rolling external-files session directory under `alignment_sessions`. Keep roughly the newest 6 sessions.
+
+Session files:
+
+- `events.ndjson` — wire/registration timeline,
+- `quality.ndjson` — exact coordinator quality/gate snapshots at ~4 Hz,
+- `frames.spv6` — replayable local+remote registration frames,
+- `shared-world.voxels` — accumulated metric world map,
+- `README.txt` — format reminder.
+
+The quality blocker taxonomy includes:
+
+- `LOCKED`
+- `VISUAL_INLIERS`
+- `CORRESPONDENCES`
+- `NO_REPROJECTION`
+- `REPROJECTION`
+- `IMAGE_COVERAGE`
+- `CONFIDENCE`
+- `GRAVITY`
+- `METRIC_INLIERS`
+- `METRIC_RESIDUAL`
+- `WAITING_PEER_READY`
+- `PEER_TRANSFORM_VERIFY`
+- `CONFIRMING`
+- `CONSENSUS`
+
+`RecordedAlignmentReplay` decodes `frames.spv6` and prefers same-burst/same-sequence local/remote pairs. The intended next debugging pattern is: reproduce once on hardware -> pull session -> replay/inspect offline -> patch exact failure.
+
+## 10. Manual targets
+
+`ArRenderer.kt` holds additive maps:
 
 - `localTargets[id]`
 - `remoteTargets[id]`
 
-Each manual target gets its own ARCore Anchor and unique ID. Adding another target must not detach old ones.
+Every manual tap gets its own local ARCore Anchor and unique target ID. The owner sees its own gizmo. Remote static POIs are anchored locally once; repeat metadata packets must not continually re-anchor them.
 
-Remote static POIs are anchored locally once. Repeated packets should update metadata rather than continually replacing the anchor.
+`TargetOverlayView.kt` renders multiple on-screen markers plus off-screen directional guidance.
 
-`CLEAR` clears all target/track state on both devices.
+`CLEAR` means clear all manual/dynamic target state on both connected phones.
 
-`TargetOverlayView.kt` supports multiple markers plus off-screen guidance.
+## 11. Tap precision
 
-## 14. Tap precision
+Manual placement combines:
 
-Manual taps are not a naive hit test anymore. `ArRenderer.handleTap()` combines:
-
-- screen->image coordinate transform,
+- screen -> image coordinate conversion,
 - metric depth/world lookup,
 - ARCore DepthPoint/Plane/Point hit candidates,
 - metric-vs-hit disagreement rejection,
 - direct metric anchor fallback.
 
-Current rough tolerances:
+Approximate tolerances remain ~0.18 m minimum depth disagreement / ~6% relative tolerance, with ~30 m max manual target distance.
 
-- minimum depth agreement ~0.18 m,
-- relative tolerance ~6%,
-- max target distance ~30 m.
+The rule is fail closed: rejecting an uncertain tap is better than placing a confident-looking marker on the wrong physical surface.
 
-This exists because an earlier build could initially place a target correctly and later reveal it was attached to the wrong surface/world position.
+## 12. Vehicle recognition and dynamic tracking
 
-## 15. Vehicle recognition and sharing
+`VehicleDetector.kt` uses MediaPipe Tasks Vision + EfficientDet-Lite0 COCO fully on-device at runtime. Current recognized classes are `car`, `truck`, `bus`.
 
-`VehicleDetector.kt` uses MediaPipe Tasks Vision + EfficientDet-Lite0 COCO fully on-device at runtime.
+The model is downloaded at build time and packaged in the APK; runtime object inference does not require cloud access.
 
-Current classes: `car`, `truck`, `bus`.
-
-Confidence threshold ~0.38.
-
-The model is downloaded at build time and bundled as `efficientdet_lite0_uint8.tflite`; runtime does not depend on cloud inference.
-
-The detector converts the 2D vehicle box into a real AR world point by selecting metric supports from the central box region and robustly filtering them by range.
-
-`ArRenderer.kt` maintains dynamic maps:
-
-- `localVehicles[id]`
-- `remoteVehicles[id]`
-
-Vehicles are **not** ARCore Anchors.
-
-Current rough tracker values:
-
-- detection every ~450 ms,
-- metric budget 5000,
-- nearest-track association <=3 m,
-- smoothing alpha 0.38,
-- local TTL 2.2 s,
-- remote TTL 3.0 s.
-
-For now the POI wire packet is reused with owner prefix `AUTO:CAR:<username>`. The coordinator recognizes that prefix and does not persist/replay it as a static pending POI.
-
-Future vehicle work should add velocity, temporal filtering, better data association, same-car dedup across observers, confidence fusion, and optional 3D bounding volume.
-
-## 16. Generic shared target direction
-
-Move away from owner-prefix hacks toward a real data model:
+Pipeline:
 
 ```text
-SharedTarget
-  id
-  kind = MANUAL | VEHICLE | PERSON | ...
-  sourceDevice
-  positionWorld
-  velocityWorld?
-  confidence
-  createdAt
-  observedAt
-  staticOrDynamic
-  trackingState
-  semanticLabel
+camera frame
+ -> EfficientDet 2D box
+ -> metric supports inside box
+ -> robust depth/range filtering
+ -> world XYZ
+ -> MotionTrackFilter constant-velocity alpha-beta smoothing
+ -> room dynamic track ID
+ -> V6 dynamic-target packet
+ -> peer world transform
+ -> moving gizmo + trail
 ```
 
-Manual targets persist as anchors; vehicles/persons are short-lived dynamic tracks.
+`MotionTrackFilter.kt` estimates position and velocity and can briefly predict through detector gaps. `MotionTrackFilterTest.kt` covers forward prediction/reset behavior.
 
-This will simplify N-phone fan-out.
+The renderer still performs room-level ID association. Vehicles remain direct world-space dynamic targets, never static ARCore Anchors.
 
-## 17. Networking
+## 13. Wire protocol V6
 
-`WifiAwarePeerTransport.kt` is currently effectively a two-phone topology.
+`PeerProtocol.kt` is **VERSION 6**. Older docs saying V4/V5 are stale.
 
-Current service: `spatialnomap.v6`.
+Important V6 behavior:
 
-Current PSK form: `Spatial-<ROOM>-V6`.
+- 16 MiB max payload,
+- up to 8000 metric supports/frame,
+- frame `burstId` + `burstSequence`,
+- dedicated `T_DYNAMIC_TARGET` wire type for current automatic car updates,
+- Hello / Frame / Poi / Clear / Range / Quality+transform / ResetAlignment remain,
+- the same wire traffic feeds WorldViz, flight recording and persistent landmark caching.
 
-Transport has recovery for Aware resume/session termination, stale PeerHandles, repeated data-path failures, and RTT backoff.
+V6 intentionally breaks compatibility with older APKs. Always update both phones together.
 
-Client performs Wi-Fi RTT when supported and sends range to host. BLE is optional fallback. RTT must remain optional.
+The current Wi-Fi Aware discovery namespace/PSK naming may still contain historical `v6` strings independently of the binary packet version; inspect code rather than assuming those strings represent protocol generation.
 
-## 18. Wire protocol
+## 14. 3D shared-world / Bird's Eye demo view
 
-`PeerProtocol.kt` is currently **VERSION 5**. Older docs may say V4 and are stale.
+This is the major 0.7 presentation feature.
 
-V5 supports up to:
+Files:
 
-- 16 MiB payload,
-- 8000 frame metric points.
+- `WorldViz.kt`
+- `SpatialMapAccumulator.kt`
+- `BirdEyeWorldView.kt`
 
-Messages include Hello, Frame, Poi, ClearPoi, Range, Quality/alignment transform, ResetAlignment.
+`WorldVizBus` mirrors the exact live wire state and uses the real currently observed `localFromPeer` transform. It does not invent a demo-only coordinate system.
 
-Both phones should run the same current APK; do not mix protocol versions during testing.
+`SpatialMapAccumulator` fuses metric geometry from both phones into a bounded ~7.5 cm voxel cloud (up to ~16k voxels) after the shared frame is locked. It persists the current accumulated map into the flight-recorder session.
 
-## 19. Sensors and priors
+The `WORLD` button opens a fullscreen screen-recordable visualization showing:
 
-`SpatialSensorFusion.kt` collects orientation, gyro, pressure, and location.
+- accumulated live 3D environment point map,
+- latest local point cloud,
+- latest transformed peer point cloud,
+- both phone poses/actors,
+- static POIs,
+- dynamic vehicle tracks,
+- ~18 s actor/vehicle motion trails,
+- auto-orbit animation,
+- drag-to-orbit,
+- pinch-to-zoom,
+- alignment state/blocker/inliers/coverage/metric residual,
+- synchronized acquisition burst progress.
 
-`FusionMath.kt` provides heading/GNSS/co-location/range priors.
+This visualization is built from the real data already produced by the app. It is not a generated image, Cloud Anchor, SLAM cloud service, or pre-baked map.
 
-These are validation/bootstrapping aids. They are not authoritative shared-world geometry. The coordinator disables heading inside the core vision solve and evaluates heading afterward.
+See `docs/SPATIAL_WORLD_DEMO.md` for the demonstration sequence.
 
-## 20. Build and release
+## 15. Canonical multi-peer room state and current physical boundary
+
+`SharedRoomState.kt` now defines the transport-independent canonical room model:
+
+- arbitrary peer map,
+- `canonicalFromPeer` per peer,
+- canonical peer pose,
+- target types `MANUAL`, `VEHICLE`, `PERSON`, `GENERIC`,
+- canonical position/velocity/confidence,
+- TTL/pruning for dynamic actors.
+
+This is the intended N-phone star model:
+
+```text
+              HOST CANONICAL WORLD
+            /         |          \
+        peer A      peer B      peer C
+```
+
+**Important:** the current live `WifiAwarePeerTransport` still owns one active `currentPeer` / one active TCP socket per app instance and `AlignmentCoordinator` is still one-peer. The data/state model is N-peer ready, but physical N-phone fan-out is not yet enabled in the shipping runtime. Do not present 3+ simultaneously connected phones as already working until the transport/coordinator are refactored into per-peer sessions.
+
+This limitation does not affect the current two-phone demo.
+
+## 16. Networking
+
+`WifiAwarePeerTransport.kt` handles the current direct link:
+
+- Wi-Fi Aware/NAN discovery,
+- encrypted NDP,
+- IPv6 TCP,
+- recovery across app resume/stale handles/data-path failures,
+- frame backpressure (newest useful frame),
+- optional Wi-Fi RTT ranging,
+- BLE fallback range.
+
+RTT is a validation aid, not an authoritative spatial solve, and must remain optional.
+
+The transport still uses historical service namespace `spatialnomap.v6` and a `Spatial-<ROOM>-V6` PSK form.
+
+## 17. Runtime dependencies / build
 
 Android module: `:app`.
 
-Current main dependencies/settings:
+Current main stack:
 
 - compileSdk 36,
 - targetSdk 36,
@@ -425,149 +437,89 @@ Current main dependencies/settings:
 - ARCore 1.56.0,
 - OpenCV 4.12.0,
 - MediaPipe Tasks Vision 0.10.35,
-- JUnit 4.13.2,
-- version family `0.6.0-vehicles.*`.
+- JUnit 4.13.2.
 
-Stable dev signing is committed for this POC so CI and sideload updates share an identity. It is not a production Play signing key.
+Version family is now `0.7.0-spatial-world.*`.
 
-CI runs tests, debug/release lint, debug/release APK builds, signature verification, artifact upload, then republishes `latest-dev`.
+Stable POC signing material is committed so CI/local sideload builds keep the same app identity. Never treat that as production Play signing material.
 
-Normal hardware testing uses `SpatialSync-latest-release.apk`. Vehicle builds are ~200 MB due to MediaPipe/model packaging.
+CI runs unit tests, debug/release lint, debug/release APK builds, signing verification, artifact upload and then republishes `latest-dev`.
 
-## 21. Physical acceptance test
+Use `SpatialSync-latest-release.apk` for normal hardware testing. Vehicle builds are large (~200 MB) because MediaPipe/model assets are bundled.
+
+## 18. Physical acceptance test
 
 ### Alignment
 
-- install the same current release APK on both phones,
-- each phone should reach local AR tracking quickly,
-- CREATE/JOIN,
-- both cameras see a shared textured matte region,
-- modest 10–20 cm lateral movement is useful but minutes of wandering are not acceptable,
-- measure direct-connect -> LOCKED time.
-
-If the current architecture is healthy, good scenes should converge in seconds.
+1. Install the exact same V6 release APK on both phones.
+2. Let both reach local ARCore `TRACKING`.
+3. CREATE/JOIN the same room.
+4. For the first ~3 seconds, point both cameras at the same textured matte region and make a small lateral motion.
+5. Expect host-first acquisition and `LOCKED` in seconds in a good scene.
+6. If it exceeds ~10–15 seconds, capture the newest `alignment_sessions` directory. Do not threshold-tune blind.
 
 ### Manual target stability
 
-After LOCKED:
+After lock:
 
 - tap 3–5 distinct physical surfaces,
-- owner sees own gizmos,
-- peer sees them at the same physical locations,
-- adding targets does not remove older ones,
-- rotate/walk around and verify no visible drift,
+- owner must see own gizmos,
+- peer must see them at the same physical locations,
+- adding targets must not remove older ones,
+- rotate/walk around and verify target stability,
 - test off-screen arrows,
-- clear and verify both clear.
+- CLEAR and verify both sides clear.
 
 ### Vehicle demo
 
-After LOCKED:
+- point one phone at a car without tapping,
+- verify automatic `CAR` track appears locally and remotely,
+- turn the peer away and verify directional guidance,
+- move observer/car enough to demonstrate smooth dynamic updates/trail,
+- disappearance should expire rather than leave a permanent static car marker.
 
-- point one phone at a real car,
-- no tap is needed,
-- local phone should show `CAR • YOU`,
-- peer should receive the car position,
-- turn peer away and verify direction guidance,
-- move observer/vehicle and verify dynamic updates,
-- stale car must disappear after TTL.
+### WORLD view
 
-## 22. Missing test infrastructure
+- press `WORLD`,
+- walk the phones to build the accumulated 3D map,
+- show local+remote actor motion and trails,
+- add POIs and a car so all target classes appear in the same view,
+- use auto orbit for recording, then drag/pinch to demonstrate interactive 3D inspection.
 
-The biggest testing gap is a real-device registration record/replay corpus.
+## 19. Failure-debug workflow
 
-Add a developer mode that records paired `CapturedFrame` data and session outcome, then replay it offline through the solver ladder. Keep regression scenes that are known-good and known-bad and track:
+If hardware behavior is bad:
 
-- chosen solver,
-- lock time,
-- matches/inliers,
-- residuals,
-- false positive transforms,
-- bootstrap outcome.
+1. reproduce once;
+2. locate newest app external-files `alignment_sessions/session-*` directory;
+3. inspect `quality.ndjson` blocker progression;
+4. inspect `events.ndjson` for transform/ACK/range timing;
+5. replay `frames.spv6` through `RecordedAlignmentReplay` / `AlignmentEngine`;
+6. only then alter a solver/gate.
 
-This will drastically shorten the development loop.
+For `ALIGNING` failures, distinguish these classes:
 
-## 23. Recommended roadmap
+- insufficient visual matches,
+- essential geometry failure,
+- no metric scale,
+- direct 3D<->3D residual failure,
+- PnP failure,
+- coverage/confidence/gravity failure,
+- physical range incompatibility,
+- no consensus,
+- peer transform not received,
+- peer bootstrap rejection,
+- ACK/verification failure.
 
-Priority order:
+## 20. High-value next work after 0.7 hardware validation
 
-1. **Validate the peer-bootstrap fix on hardware.**
-2. **Add alignment diagnostics + exportable session logs.**
-3. **Add explicit synchronized high-quality alignment burst / sequence pairing.**
-4. **Move toward a host-driven single-solver canonical-room architecture.**
-5. **Replace `AUTO:CAR:` with an explicit generic target/track protocol (likely protocol V6).**
-6. **Improve vehicle temporal tracking and multi-observer dedup.**
-7. **Implement true N-phone room fan-out.**
-8. **Add person tracking using the same dynamic shared-track layer.**
-9. **Add relocalization / shared landmark map for tracking loss and fast future joins.**
+Do these only after the current V6 build has real-device evidence:
 
-## 24. N-phone target architecture
+1. turn the current recorded physical sessions into deterministic CI regression fixtures;
+2. improve same-car multi-observer dedup/fusion and send explicit velocity in the dynamic-target payload;
+3. add PERSON semantic tracking using the same dynamic-track architecture;
+4. refactor `WifiAwarePeerTransport` into a host multi-session transport and instantiate one alignment session per joiner to make the already-existing `SharedRoomState` truly N-phone;
+5. add map/landmark quality selection so relocalization stores several high-value landmarks instead of one latest pair;
+6. add quantitative acceptance metrics: median/p95 lock time, target cross-device error, relocalization success rate, long-run anchor drift.
 
-Preferred future model:
-
-```text
-Host canonical frame
-  +-- peer A transform -> canonical
-  +-- peer B transform -> canonical
-  +-- peer C transform -> canonical
-
-Each phone emits observations:
-  device, localTrackId, class, localPosition, velocity?, confidence, timestamp
-
-Room layer transforms + associates them into:
-  RoomTrack(globalId, class, canonicalPose, velocity, contributors, confidence)
-
-RoomTrack is broadcast to all peers.
-```
-
-This allows A and C to see the same car while B sees only the shared room track, without creating duplicate unrelated markers.
-
-## 25. Drift strategy
-
-The user previously saw a target initially correct and later displaced. Current mitigation is stable canonical transform + local ARCore Anchors for static targets.
-
-Future drift handling should not blindly mutate the canonical transform underneath anchors. Prefer drift detection, confidence downgrade, robust multi-frame correction consensus, and explicit relocalization/correction states.
-
-## 26. Core file map
-
-- `MainActivity.kt` — lifecycle, permissions, room UI, AR session setup, status/HUD.
-- `ArRenderer.kt` — frame loop, taps, anchors, target projection, capture scheduling, vehicle integration.
-- `TargetOverlayView.kt` — multi-target gizmos and touch ownership.
-- `FrameCapture.kt` — registration packet.
-- `MetricSupportSampler.kt` — raw/full depth + PointCloud -> metric supports.
-- `AlignmentCoordinator.kt` — keyframes, solve scheduling, acceptance, canonical handshake, POI transform.
-- `AlignmentEngine.kt` — SIFT + solver ladder.
-- `EssentialSharedPoseSolver.kt` — 2D essential pose + metric scale.
-- `SharedVisualAnchorSolver.kt` — robust 3D<->3D alignment.
-- `FusionMath.kt` — priors/validation math.
-- `SpatialSensorFusion.kt` — sensors.
-- `WifiAwarePeerTransport.kt` — discovery/NDP/TCP/RTT/recovery.
-- `PeerProtocol.kt` — binary protocol, currently V5.
-- `VehicleDetector.kt` — on-device detector + metric 3D association.
-- `RuntimePerformanceGovernor.kt` — thermal capture budget.
-
-Docs in `docs/` are useful historically but may lag the implementation. Current code wins.
-
-## 27. Implementation discipline
-
-When an alignment test fails, identify which category it belongs to:
-
-```text
-NO PEER LINK
-NO FRAMES
-NO SIFT MATCHES
-ESSENTIAL FAIL
-NO METRIC SCALE
-3D3D FAIL
-PNP FAIL
-LOCAL GATE FAIL
-RANGE/GRAVITY FAIL
-CANDIDATE CONSENSUS FAIL
-PEER BOOTSTRAP FAIL
-ACK FAIL
-LOCKED BUT TARGET WRONG
-LOCKED BUT DRIFT
-```
-
-Do not collapse all of these into one generic `ALIGNING` diagnosis.
-
-When the user authorizes a repo change, implement it autonomously, commit it, let CI run, and verify the actual release before saying it is ready.
+Do not trade away the now-established fail-closed spatial correctness just to make the UI say `LOCKED` sooner.
