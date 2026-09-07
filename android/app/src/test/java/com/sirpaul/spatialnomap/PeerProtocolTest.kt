@@ -101,6 +101,25 @@ class PeerProtocolTest {
     }
 
     @Test
+    fun denseFrameRoundTripPreservesEightThousandMetricSupports() {
+        val jpeg = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 7, 8, 9, 0xff.toByte(), 0xd9.toByte())
+        val points = List(8000) { i ->
+            floatArrayOf(i % 1280f, i % 720f, i * 0.001f, -i * 0.0005f, 1f + i * 0.0002f)
+        }
+        val frame = CapturedFrame(
+            timestampNs = 77L,
+            pose = PosePacket(floatArrayOf(0f, 0f, 0f), floatArrayOf(0f, 0f, 0f, 1f)),
+            intrinsics = IntrinsicsPacket(900f, 900f, 640f, 360f, 1280, 720),
+            jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
+            metricPoints = points,
+        )
+        val result = (roundTrip(WireMessage.Frame(frame)) as WireMessage.Frame).frame
+        assertEquals(8000, result.metricPoints.size)
+        assertEquals(points.first().toList(), result.metricPoints.first().toList())
+        assertEquals(points.last().toList(), result.metricPoints.last().toList())
+    }
+
+    @Test
     fun poiRoundTripPreservesMetricPoint() {
         val result = roundTrip(
             WireMessage.Poi(42L, "A", floatArrayOf(1.25f, -2.5f, 9.75f), 123456L),
