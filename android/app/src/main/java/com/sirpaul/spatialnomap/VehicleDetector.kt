@@ -229,9 +229,8 @@ class VehicleDetector(context: Context) {
             out[1] += s.p[1]
             out[2] += s.p[2]
         }
-        out[0] /= inliers.size
-        out[1] /= inliers.size
-        out[2] /= inliers.size
+        val divisor = inliers.size.toFloat()
+        repeat(3) { i -> out[i] = out[i] / divisor }
         return out
     }
 
