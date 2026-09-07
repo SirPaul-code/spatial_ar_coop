@@ -50,9 +50,10 @@ sealed class WireMessage {
 
 object PeerProtocol {
     private const val MAGIC = 0x53505632
-    // V5 intentionally breaks compatibility with older APKs: registration frames
-    // may now carry up to 8k metric supports. Both phones must run the same build.
-    private const val VERSION = 5
+    // V6 intentionally breaks compatibility with older APKs. Registration frames
+    // now carry a deterministic acquisition-burst id/sequence so both phones can
+    // record and correlate the short high-rate shared-scene acquisition phase.
+    private const val VERSION = 6
     private const val MAX_PAYLOAD = 16 * 1024 * 1024
     private const val MAX_FRAME_POINTS = 8000
     private const val T_HELLO = 1
@@ -62,6 +63,10 @@ object PeerProtocol {
     private const val T_RANGE = 5
     private const val T_QUALITY = 6
     private const val T_RESET_ALIGNMENT = 7
+    // Dynamic targets are wire-typed in V6 even though the current renderer still
+    // consumes them through the existing Poi object for source compatibility.
+    private const val T_DYNAMIC_TARGET = 8
+    private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
 
     fun write(output: OutputStream, message: WireMessage) {
         val payload = ByteArrayOutputStream()
@@ -107,7 +112,7 @@ object PeerProtocol {
         val type = when (message) {
             is WireMessage.Hello -> T_HELLO
             is WireMessage.Frame -> T_FRAME
-            is WireMessage.Poi -> T_POI
+            is WireMessage.Poi -> if (message.owner.startsWith(AUTO_CAR_PREFIX)) T_DYNAMIC_TARGET else T_POI
             WireMessage.ClearPoi -> T_CLEAR
             is WireMessage.Range -> T_RANGE
             is WireMessage.Quality -> T_QUALITY
@@ -121,6 +126,9 @@ object PeerProtocol {
         out.writeInt(bytes.size)
         out.write(bytes)
         out.flush()
+
+        WorldVizBus.observe(WorldVizBus.Direction.OUT, message)
+        AlignmentSessionRecorder.observe(WorldVizBus.Direction.OUT, message)
     }
 
     fun read(input: InputStream): WireMessage? {
@@ -139,11 +147,11 @@ object PeerProtocol {
         val payload = ByteArray(size)
         source.readFully(payload)
 
-        DataInputStream(ByteArrayInputStream(payload)).use { data ->
-            return when (type) {
+        val message = DataInputStream(ByteArrayInputStream(payload)).use { data ->
+            when (type) {
                 T_HELLO -> WireMessage.Hello(data.readUTF(), data.readUTF())
                 T_FRAME -> WireMessage.Frame(readFrame(data))
-                T_POI -> WireMessage.Poi(
+                T_POI, T_DYNAMIC_TARGET -> WireMessage.Poi(
                     data.readLong(),
                     data.readUTF(),
                     floatArrayOf(data.readFloat(), data.readFloat(), data.readFloat()),
@@ -174,10 +182,15 @@ object PeerProtocol {
                 else -> throw IllegalArgumentException("unknown wire type $type")
             }
         }
+        WorldVizBus.observe(WorldVizBus.Direction.IN, message)
+        AlignmentSessionRecorder.observe(WorldVizBus.Direction.IN, message)
+        return message
     }
 
     private fun writeFrame(out: DataOutputStream, frame: CapturedFrame) {
         out.writeLong(frame.timestampNs)
+        out.writeLong(frame.burstId)
+        out.writeInt(frame.burstSequence)
         repeat(3) { out.writeFloat(frame.pose.t.getOrElse(it) { 0f }) }
         repeat(4) { out.writeFloat(frame.pose.q.getOrElse(it) { if (it == 3) 1f else 0f }) }
 
@@ -202,6 +215,8 @@ object PeerProtocol {
 
     private fun readFrame(input: DataInputStream): CapturedFrame {
         val timestampNs = input.readLong()
+        val burstId = input.readLong()
+        val burstSequence = input.readInt()
         val t = FloatArray(3) { input.readFloat() }
         val q = FloatArray(4) { input.readFloat() }
         val intrinsics = IntrinsicsPacket(
@@ -230,6 +245,8 @@ object PeerProtocol {
             jpegBase64 = Base64.getEncoder().encodeToString(jpeg),
             metricPoints = points,
             sensors = readSensors(input),
+            burstId = burstId,
+            burstSequence = burstSequence,
         )
     }
 
