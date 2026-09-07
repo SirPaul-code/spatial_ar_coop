@@ -21,6 +21,11 @@ import kotlin.math.sqrt
  * recovery solver so a vendor-specific weak host camera/depth path cannot deadlock
  * the room.
  *
+ * Before a fresh solve, the host may also relocalize against a persistent local
+ * landmark checkpoint. Both the host's current local world and the current peer world
+ * are matched back to their previously verified keyframes; the old room transform is
+ * then transported into the new ARCore origins. This remains entirely local/P2P.
+ *
  * A strong transform solved by either phone may bootstrap the peer after rigid,
  * gravity and physical-range sanity checks. If both phones happen to solve
  * independently, scene-space agreement remains the stricter path.
@@ -117,9 +122,13 @@ class AlignmentCoordinator(
     @Volatile private var lastLockReprojectionPx = Float.NaN
     @Volatile private var lastLockSource = "VISION"
     @Volatile private var lastAgreement = SceneAgreement(Double.NaN, Double.NaN, Double.NaN, 0)
+    @Volatile private var cachedRelocalizationCheckpoint: RelocalizationEngine.Checkpoint? = null
+    @Volatile private var lastRelocalizationAttemptMs = 0L
 
     fun onConnected() {
         connectedAtMs = System.currentTimeMillis()
+        cachedRelocalizationCheckpoint = if (transport.isHostRole) SharedLandmarkCache.load() else null
+        lastRelocalizationAttemptMs = 0L
         resetAlignment(clearFrames = true, clearPoi = false)
     }
 
@@ -145,6 +154,7 @@ class AlignmentCoordinator(
         updateFusionSeed()
         tryVerifyPeerTransform()
         maybeResendLockedTransform()
+        maybeRelocalize()
         maybeSolve()
     }
 
@@ -153,6 +163,7 @@ class AlignmentCoordinator(
         updateFusionSeed()
         tryVerifyPeerTransform()
         maybeResendLockedTransform()
+        maybeRelocalize()
         maybeSolve()
     }
 
@@ -258,10 +269,6 @@ class AlignmentCoordinator(
         val temporallyNew = elapsedNs >= KEYFRAME_MAX_INTERVAL_NS
         val motionUsable = motionQuality >= MIN_KEYFRAME_MOTION_QUALITY
 
-        // During the short acquisition burst keep one frame for every sequence even
-        // when the phones are nearly stationary. Pair identity is more useful here
-        // than aggressive local keyframe pruning; blur is still naturally punished
-        // later by SIFT/inlier scoring.
         if (newBurstSequence || (motionUsable && (spatiallyNew || temporallyNew))) {
             window.addLast(frame)
         } else if (motionUsable && (materiallyBetterDepth || calmer)) {
@@ -298,15 +305,88 @@ class AlignmentCoordinator(
         return Pair(translation, rotationDeg)
     }
 
+    private fun maybeRelocalize() {
+        if (!transport.connected || !transport.isHostRole || lockedTransform != null) return
+        val checkpoint = cachedRelocalizationCheckpoint ?: return
+        val now = System.currentTimeMillis()
+        val sinceConnect = now - connectedAtMs
+        if (sinceConnect < RELOCALIZATION_START_DELAY_MS || sinceConnect > RELOCALIZATION_WINDOW_MS) return
+        if (now - lastRelocalizationAttemptMs < RELOCALIZATION_RETRY_MS) return
+
+        val local: CapturedFrame
+        val remote: CapturedFrame
+        synchronized(frameLock) {
+            local = localFrames.peekLast() ?: return
+            remote = remoteFrames.peekLast() ?: return
+        }
+        if (!solving.compareAndSet(false, true)) return
+        lastRelocalizationAttemptMs = now
+        val serial = solveSerial.incrementAndGet()
+
+        solveExecutor.execute {
+            try {
+                val result = runCatching {
+                    RelocalizationEngine.relocalize(checkpoint, local, remote)
+                }.getOrNull()
+                if (result != null && serial == solveSerial.get()) acceptRelocalization(result)
+            } finally {
+                solving.set(false)
+                if (serial == solveSerial.get() && lockedTransform == null) maybeSolve()
+            }
+        }
+    }
+
+    @Synchronized private fun acceptRelocalization(result: RelocalizationEngine.Result) {
+        if (lockedTransform != null) return
+        val transform = result.newLocalFromNewRemote
+        if (!isRigidTransform(transform) || !candidateRangeCompatible(transform)) return
+        val gravity = FusionMath.gravityTiltDeg(transform)
+        if (gravity.isFinite() && gravity > MAX_VISUAL_GRAVITY_TILT_DEG) return
+
+        val localRecovery = result.localRecovery
+        val remoteRecovery = result.remoteRecovery
+        lockedTransform = transform.copyOf()
+        localConfidence = result.confidence
+        stableCount = 1
+        lastLockInliers = min(localRecovery.inliers, remoteRecovery.inliers)
+        lastLockReprojectionPx = max(
+            localRecovery.medianReprojectionPx,
+            remoteRecovery.medianReprojectionPx,
+        ).toFloat()
+        lastLockSource = "HOST_RELOCALIZED"
+
+        latestQuality = Quality(
+            confidence = localConfidence,
+            inliers = lastLockInliers,
+            correspondences = min(localRecovery.correspondences, remoteRecovery.correspondences),
+            medianReprojectionPx = lastLockReprojectionPx.toDouble(),
+            imageCoverage = min(localRecovery.imageCoverage, remoteRecovery.imageCoverage),
+            stableCount = stableCount,
+            localReady = true,
+            peerReady = peerReady,
+            peerTransformVerified = false,
+            rangeM = latestRangeM,
+            rangeSource = latestRangeSource,
+            gravityTiltDeg = gravity,
+            fusionSource = lastLockSource,
+            keyframesLocal = synchronized(frameLock) { localFrames.size },
+            keyframesRemote = synchronized(frameLock) { remoteFrames.size },
+            metricPairs = min(localRecovery.metricPairs, remoteRecovery.metricPairs),
+            metricInliers = min(localRecovery.metricInliers, remoteRecovery.metricInliers),
+            medianMetricResidualM = max(
+                localRecovery.medianMetricResidualM.takeIf { it.isFinite() } ?: 0.0,
+                remoteRecovery.medianMetricResidualM.takeIf { it.isFinite() } ?: 0.0,
+            ),
+        )
+        transport.sendQuality(localConfidence, stableCount, true)
+        broadcastLockedTransform(force = true)
+        emitQuality()
+    }
+
     private fun maybeSolve() {
         if (!transport.connected || lockedTransform != null) return
 
         val now = System.currentTimeMillis()
-        // Host-first canonical acquisition: the joiner spends its first seconds
-        // capturing/streaming high-quality frames instead of competing with the host
-        // on an independent solve. If the host produces a transform it is adopted by
-        // tryVerifyPeerTransform(). Only after the grace period does the client solve
-        // locally as a recovery path.
         if (!transport.isHostRole && pendingPeerTransform == null &&
             now - connectedAtMs < CLIENT_HOST_SOLVE_GRACE_MS
         ) return
@@ -539,12 +619,6 @@ class AlignmentCoordinator(
         return confidence.coerceIn(0.0, 1.0).toFloat()
     }
 
-    /**
-     * A receiver with no local lock may adopt a strong peer-issued transform. The
-     * peer only broadcasts after its own visual/metric/range gates and consensus
-     * have passed. The receiver independently checks rigidity, gravity and current
-     * physical range before adoption.
-     */
     @Synchronized private fun tryVerifyPeerTransform() {
         val message = pendingPeerTransform ?: return
         val senderFromPeer = message.senderFromPeer ?: return
@@ -914,6 +988,7 @@ class AlignmentCoordinator(
         lastLockReprojectionPx = Float.NaN
         lastLockSource = "VISION"
         lastAgreement = SceneAgreement(Double.NaN, Double.NaN, Double.NaN, 0)
+        lastRelocalizationAttemptMs = 0L
         latestQuality = Quality(rangeM = latestRangeM, rangeSource = latestRangeSource)
         if (clearPoi) {
             pendingPoi = null
@@ -1006,6 +1081,10 @@ class AlignmentCoordinator(
         private const val RANGE_GATE_FRESH_MS = 8_000L
         private const val CLIENT_HOST_SOLVE_GRACE_MS = 7_000L
         private const val TRANSFORM_RETRY_MS = 650L
+
+        private const val RELOCALIZATION_START_DELAY_MS = 900L
+        private const val RELOCALIZATION_RETRY_MS = 2_200L
+        private const val RELOCALIZATION_WINDOW_MS = 9_000L
 
         private const val MAX_VISUAL_GRAVITY_TILT_DEG = 12.0
         private const val PEER_MAX_GRAVITY_TILT_DEG = 12.0
