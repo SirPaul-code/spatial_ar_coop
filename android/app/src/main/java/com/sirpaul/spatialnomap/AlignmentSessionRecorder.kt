@@ -12,14 +12,13 @@ import java.util.Locale
 /**
  * Rolling on-device flight recorder for physical alignment debugging.
  *
- * Every wire event is written to events.ndjson. Registration frames are written to
- * a compact binary stream with image, pose, intrinsics, metric geometry, burst tags
- * and sensor data. The last few sessions are retained under app external-files so a
- * failed physical test can be pulled and replayed instead of debugging by guesswork.
+ * Every direct connection gets its own session directory. Wire events are written
+ * to events.ndjson and registration frames to a compact binary frames.spv6 stream
+ * with image, pose, intrinsics, metric geometry, burst tags and sensor data.
  */
 object AlignmentSessionRecorder {
-    private const val KEEP_SESSIONS = 4
-    private const val MAX_RECORDED_FRAMES = 160
+    private const val KEEP_SESSIONS = 6
+    private const val MAX_RECORDED_FRAMES = 200
     private const val FRAME_MAGIC = 0x53524636 // SRF6
 
     private var root: File? = null
@@ -30,6 +29,7 @@ object AlignmentSessionRecorder {
     private var frameCount = 0
     private var localIdentity = ""
     private var peerIdentity = ""
+    private var connectionSerial = 0
 
     @Synchronized fun init(context: Context) {
         val base = context.getExternalFilesDir("alignment_sessions")
@@ -40,6 +40,15 @@ object AlignmentSessionRecorder {
     }
 
     @Synchronized fun observe(direction: WorldVizBus.Direction, message: WireMessage) {
+        if (message is WireMessage.Hello && direction == WorldVizBus.Direction.OUT) {
+            localIdentity = message.username
+            // A new outgoing Hello is emitted exactly when a new direct TCP socket
+            // attaches. Rotate after any prior traffic so each hardware test is a
+            // self-contained replayable directory.
+            if (sessionDir != null && (frameCount > 0 || System.currentTimeMillis() - startedAtMs > 1_500L)) {
+                endCurrentSession()
+            }
+        }
         ensureSession(direction, message)
         val dir = sessionDir ?: return
         val now = System.currentTimeMillis()
@@ -59,7 +68,9 @@ object AlignmentSessionRecorder {
                     append(",\"burst\":").append(message.frame.burstId)
                     append(",\"seq\":").append(message.frame.burstSequence)
                     append(",\"metric\":").append(message.frame.metricPoints.size)
-                    append(",\"jpegBytes\":").append(runCatching { Base64.decode(message.frame.jpegBase64, Base64.DEFAULT).size }.getOrDefault(0))
+                    append(",\"jpegBytes\":").append(
+                        runCatching { Base64.decode(message.frame.jpegBase64, Base64.DEFAULT).size }.getOrDefault(0),
+                    )
                 }
                 is WireMessage.Poi -> {
                     append(",\"id\":").append(message.id)
@@ -100,9 +111,7 @@ object AlignmentSessionRecorder {
     @Synchronized fun latestSessionPath(): String? = sessionDir?.absolutePath
 
     @Synchronized fun close() {
-        runCatching { frameOut?.flush() }
-        runCatching { frameOut?.close() }
-        frameOut = null
+        endCurrentSession()
     }
 
     private fun ensureSession(direction: WorldVizBus.Direction, message: WireMessage) {
@@ -113,22 +122,38 @@ object AlignmentSessionRecorder {
         if (message !is WireMessage.Hello && localIdentity.isBlank() && peerIdentity.isBlank()) return
         val base = root ?: return
         startedAtMs = System.currentTimeMillis()
+        connectionSerial += 1
         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(java.util.Date(startedAtMs))
-        val dir = File(base, "session-$stamp")
+        val dir = File(base, "session-$stamp-${connectionSerial.toString().padStart(2, '0')}")
         dir.mkdirs()
         sessionDir = dir
         eventsFile = File(dir, "events.ndjson")
         frameCount = 0
-        frameOut = DataOutputStream(BufferedOutputStream(FileOutputStream(File(dir, "frames.spv6"), true), 256 * 1024))
+        frameOut = DataOutputStream(
+            BufferedOutputStream(FileOutputStream(File(dir, "frames.spv6"), true), 256 * 1024),
+        )
         runCatching {
             File(dir, "README.txt").writeText(
                 "Spatial Sync alignment flight recorder\n" +
-                    "events.ndjson = wire/solver-visible timeline\n" +
-                    "frames.spv6 = binary registration frames (local+remote)\n" +
+                    "events.ndjson = wire/registration timeline\n" +
+                    "quality.ndjson = exact alignment gate snapshots\n" +
+                    "frames.spv6 = replayable registration frames (local+remote)\n" +
+                    "shared-world.voxels = accumulated metric shared map\n" +
                     "Protocol generation = 6\n",
             )
         }
         prune()
+    }
+
+    private fun endCurrentSession() {
+        runCatching { frameOut?.flush() }
+        runCatching { frameOut?.close() }
+        frameOut = null
+        sessionDir = null
+        eventsFile = null
+        frameCount = 0
+        startedAtMs = 0L
+        peerIdentity = ""
     }
 
     private fun writeFrame(direction: WorldVizBus.Direction, frame: CapturedFrame) {
@@ -142,8 +167,12 @@ object AlignmentSessionRecorder {
             repeat(3) { out.writeFloat(frame.pose.t.getOrElse(it) { 0f }) }
             repeat(4) { out.writeFloat(frame.pose.q.getOrElse(it) { if (it == 3) 1f else 0f }) }
             with(frame.intrinsics) {
-                out.writeFloat(fx); out.writeFloat(fy); out.writeFloat(cx); out.writeFloat(cy)
-                out.writeInt(width); out.writeInt(height)
+                out.writeFloat(fx)
+                out.writeFloat(fy)
+                out.writeFloat(cx)
+                out.writeFloat(cy)
+                out.writeInt(width)
+                out.writeInt(height)
             }
             val jpeg = Base64.decode(frame.jpegBase64, Base64.DEFAULT)
             out.writeInt(jpeg.size)
@@ -152,10 +181,16 @@ object AlignmentSessionRecorder {
             frame.metricPoints.forEach { p -> repeat(5) { out.writeFloat(p.getOrElse(it) { 0f }) } }
             val s = frame.sensors
             out.writeLong(s.elapsedRealtimeNs)
-            out.writeFloat(s.headingDeg); out.writeFloat(s.pitchDeg); out.writeFloat(s.rollDeg)
+            out.writeFloat(s.headingDeg)
+            out.writeFloat(s.pitchDeg)
+            out.writeFloat(s.rollDeg)
             out.writeFloat(s.orientationQuality)
-            out.writeDouble(s.latitudeDeg); out.writeDouble(s.longitudeDeg); out.writeDouble(s.altitudeM)
-            out.writeFloat(s.horizontalAccuracyM); out.writeFloat(s.verticalAccuracyM); out.writeFloat(s.pressureHpa)
+            out.writeDouble(s.latitudeDeg)
+            out.writeDouble(s.longitudeDeg)
+            out.writeDouble(s.altitudeM)
+            out.writeFloat(s.horizontalAccuracyM)
+            out.writeFloat(s.verticalAccuracyM)
+            out.writeFloat(s.pressureHpa)
             repeat(3) { out.writeFloat(s.gyroRadS.getOrElse(it) { Float.NaN }) }
             frameCount += 1
             if (frameCount % 4 == 0) out.flush()
