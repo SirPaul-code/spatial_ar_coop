@@ -199,7 +199,17 @@ class AlignmentCoordinator(
         emitQuality()
     }
 
+    /**
+     * Manual POIs are persistent and may be replayed after a transient state update.
+     * AUTO:CAR packets are live observations: transform and forward each packet once,
+     * but never store it as pending state. Otherwise periodic RTT/quality emissions
+     * would keep replaying the last car forever after it had left the camera view.
+     */
     fun onRemotePoi(message: WireMessage.Poi) {
+        if (isDynamicVehicleOwner(message.owner)) {
+            publishDynamicPoi(message)
+            return
+        }
         pendingPoi = message
         activePoi = true
         publishPendingPoiIfPossible()
@@ -215,7 +225,7 @@ class AlignmentCoordinator(
     fun sendPoi(id: Long, pointLocalWorld: FloatArray, owner: String): Boolean {
         if (!canPlacePoi()) return false
         transport.sendPoi(id, owner, pointLocalWorld)
-        activePoi = true
+        if (!isDynamicVehicleOwner(owner)) activePoi = true
         return true
     }
 
@@ -817,6 +827,18 @@ class AlignmentCoordinator(
         return candidates[bestIndex].transform.copyOf()
     }
 
+    private fun publishDynamicPoi(message: WireMessage.Poi) {
+        val transform = lockedTransform ?: return
+        if (!peerTransformVerified) return
+        val p = AlignmentEngine.transformPoint(transform, message.pointWorld)
+        listener.onRemotePoi(
+            message.id,
+            floatArrayOf(p[0].toFloat(), p[1].toFloat(), p[2].toFloat()),
+            message.owner,
+            localConfidence,
+        )
+    }
+
     private fun publishPendingPoiIfPossible() {
         val poi = pendingPoi ?: return
         val transform = lockedTransform ?: return
@@ -829,6 +851,8 @@ class AlignmentCoordinator(
             localConfidence,
         )
     }
+
+    private fun isDynamicVehicleOwner(owner: String): Boolean = owner.startsWith(AUTO_CAR_PREFIX)
 
     @Synchronized private fun resetAlignment(clearFrames: Boolean, clearPoi: Boolean) {
         solveSerial.incrementAndGet()
@@ -928,6 +952,8 @@ class AlignmentCoordinator(
     }
 
     companion object {
+        private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
+
         private const val KEYFRAME_WINDOW = 18
         private const val KEYFRAME_TRANSLATION_M = 0.055
         private const val KEYFRAME_ROTATION_DEG = 3.5
