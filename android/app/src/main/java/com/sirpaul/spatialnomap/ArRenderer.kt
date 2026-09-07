@@ -1,5 +1,6 @@
 package com.sirpaul.spatialnomap
 
+import android.content.Context
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
@@ -27,6 +28,7 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 class ArRenderer(
+    context: Context,
     private val coordinator: AlignmentCoordinator,
     private val overlay: TargetOverlayView,
     private val usernameProvider: () -> String,
@@ -52,6 +54,14 @@ class ArRenderer(
         val confidence: Float,
     )
 
+    private data class DynamicTarget(
+        val point: FloatArray,
+        val owner: String,
+        val label: String,
+        val confidence: Float,
+        val lastSeenMs: Long,
+    )
+
     @Volatile var session: Session? = null
     @Volatile var sessionResumed: Boolean = false
 
@@ -62,14 +72,23 @@ class ArRenderer(
     private val trackingGate = TrackingStabilityGate(acquireMs = 300L, lossMs = 1000L)
     private val targetLock = Any()
 
-    /**
-     * Targets are intentionally additive. A new tap must never detach an older
-     * anchor: every manual ping gets its own ARCore anchor and remains pinned until
-     * the user explicitly clears the room. The same representation can later be
-     * fed by person/car detections without changing the rendering path.
-     */
+    private val vehicleDetector = VehicleDetector(context)
+    private val pendingVehicleDetections = AtomicReference<List<VehicleDetector.Vehicle>?>(null)
+    private val pendingVehicleError = AtomicReference<String?>(null)
+
+    /** Manual targets are persistent ARCore anchors until CLEAR. */
     private val localTargets = LinkedHashMap<Long, LocalTarget>()
     private val remoteTargets = LinkedHashMap<Long, RemoteTarget>()
+
+    /**
+     * Vehicle targets are deliberately NOT ARCore Anchors. A car can move, so its
+     * world position is updated from every detector/depth observation and projected
+     * directly. The same POI wire packet is reused with an AUTO:CAR owner prefix;
+     * this keeps today's APK wire-compatible with the current peer transport while
+     * preserving static-anchor behavior for manual taps.
+     */
+    private val localVehicles = LinkedHashMap<Long, DynamicTarget>()
+    private val remoteVehicles = LinkedHashMap<Long, DynamicTarget>()
 
     private var width = 1
     private var height = 1
@@ -78,6 +97,8 @@ class ArRenderer(
     private var lastFrameError = ""
     private var lastFrameErrorAtMs = 0L
     private var lastSyncHintAtMs = 0L
+    private var lastVehicleSubmitMs = 0L
+    private var lastVehicleError = ""
 
     init {
         overlay.onSceneTap = { x, y -> queueTap(x, y) }
@@ -87,11 +108,7 @@ class ArRenderer(
         pendingTap.set(floatArrayOf(x, y))
     }
 
-    /**
-     * Network/UI threads only enqueue mutations. ARCore anchor creation happens on
-     * the render thread, which keeps target lifetime deterministic and avoids races
-     * while a camera frame is being projected.
-     */
+    /** Network/UI threads only enqueue mutations; render thread owns ARCore state. */
     fun setRemoteTarget(id: Long, pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
         remoteTargetRequests.add(
             RemoteTargetRequest(
@@ -111,10 +128,13 @@ class ArRenderer(
         remoteTargetRequests.clear()
         clearTargetsRequested.set(true)
         pendingTap.set(null)
+        pendingVehicleDetections.set(null)
         overlay.setTargets(emptyList())
     }
 
-    fun targetCount(): Int = synchronized(targetLock) { localTargets.size + remoteTargets.size }
+    fun targetCount(): Int = synchronized(targetLock) {
+        localTargets.size + remoteTargets.size + localVehicles.size + remoteVehicles.size
+    }
 
     fun detachSession() {
         sessionResumed = false
@@ -122,12 +142,18 @@ class ArRenderer(
         textureBoundSession = null
         pendingTap.set(null)
         remoteTargetRequests.clear()
+        pendingVehicleDetections.set(null)
         clearTargetsRequested.set(false)
-        detachAnchors()
+        detachAnchorsAndTracks()
         lastCaptureNs = 0L
         lastFrameError = ""
         lastSyncHintAtMs = 0L
+        lastVehicleSubmitMs = 0L
         trackingGate.reset()
+    }
+
+    fun close() {
+        vehicleDetector.close()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -163,7 +189,7 @@ class ArRenderer(
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
-            if (clearTargetsRequested.getAndSet(false)) detachAnchors()
+            if (clearTargetsRequested.getAndSet(false)) detachAnchorsAndTracks()
             applyRemoteTargetRequests(s, tracking)
 
             when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
@@ -175,6 +201,10 @@ class ArRenderer(
 
             handleTap(s, frame, camera)
             captureIfDue(frame, camera)
+            maybeDetectVehicles(s, frame, camera)
+            applyVehicleDetections()
+            expireVehicleTracks()
+            publishVehicleErrorIfNeeded()
             publishSyncGuidanceIfNeeded()
             projectTargets(camera)
         } catch (t: Throwable) {
@@ -251,9 +281,11 @@ class ArRenderer(
             return
         }
 
-        var id = SystemClock.elapsedRealtimeNanos()
+        var id = newTargetId()
         synchronized(targetLock) {
-            while (localTargets.containsKey(id) || remoteTargets.containsKey(id)) id += 1L
+            while (localTargets.containsKey(id) || remoteTargets.containsKey(id) ||
+                localVehicles.containsKey(id) || remoteVehicles.containsKey(id)
+            ) id += 1L
         }
         val owner = usernameProvider()
         val point = newAnchor.pose.translation
@@ -270,15 +302,34 @@ class ArRenderer(
     }
 
     /**
-     * Every remote POI id owns one ARCore anchor. Repeated packets for the same id
-     * update metadata but never re-anchor the physical point, so later networking or
-     * alignment messages cannot drag an existing target across the scene.
+     * Manual remote POIs become fixed ARCore anchors. AUTO:CAR packets instead
+     * update a direct world-space track because moving objects must never be frozen
+     * into ARCore's static map.
      */
     private fun applyRemoteTargetRequests(session: Session, tracking: Boolean) {
         if (!tracking) return
 
         while (true) {
             val request = remoteTargetRequests.poll() ?: break
+            val dynamicCar = request.owner.startsWith(AUTO_CAR_PREFIX)
+            if (dynamicCar) {
+                val cleanOwner = request.owner.removePrefix(AUTO_CAR_PREFIX).ifBlank { "Peer" }
+                synchronized(targetLock) {
+                    if (request.point == null) {
+                        remoteVehicles.remove(request.id)
+                    } else {
+                        remoteVehicles[request.id] = DynamicTarget(
+                            point = request.point.copyOf(3),
+                            owner = cleanOwner,
+                            label = "CAR",
+                            confidence = request.confidence,
+                            lastSeenMs = System.currentTimeMillis(),
+                        )
+                    }
+                }
+                continue
+            }
+
             if (request.point == null) {
                 val removed = synchronized(targetLock) { remoteTargets.remove(request.id) }
                 runCatching { removed?.anchor?.detach() }
@@ -301,8 +352,6 @@ class ArRenderer(
             }.getOrNull() ?: continue
 
             synchronized(targetLock) {
-                // Another request for the same id cannot normally race because this
-                // function is render-thread-only, but keep the invariant explicit.
                 val prior = remoteTargets.putIfAbsent(
                     request.id,
                     RemoteTarget(anchor, request.owner, request.confidence),
@@ -328,9 +377,98 @@ class ArRenderer(
     }
 
     /**
+     * Vehicle inference runs only after the shared world is verified. The RGB image
+     * and the metric supports come from the same ARCore frame, so every accepted 2D
+     * car box can be turned into a real 3D point before it is sent to the peer.
+     */
+    private fun maybeDetectVehicles(session: Session, frame: Frame, camera: Camera) {
+        if (!coordinator.quality().bothReady || vehicleDetector.isBusy()) return
+        val now = System.currentTimeMillis()
+        if (now - lastVehicleSubmitMs < VEHICLE_DETECT_INTERVAL_MS) return
+
+        val metric = MetricSupportSampler.sample(frame, camera, VEHICLE_METRIC_BUDGET)
+        if (metric.size < 16) return
+        val image = runCatching { frame.acquireCameraImage() }.getOrNull() ?: return
+        val accepted = vehicleDetector.submit(
+            image = image,
+            displayRotation = rotationProvider(),
+            cameraId = runCatching { session.cameraConfig.cameraId }.getOrNull(),
+            cameraWorld = camera.pose.translation.copyOf(),
+            metricPoints = metric,
+            onResult = { pendingVehicleDetections.set(it) },
+            onError = { pendingVehicleError.set(it) },
+        )
+        if (accepted) lastVehicleSubmitMs = now
+    }
+
+    /** Associate repeated detector observations with persistent room track IDs. */
+    private fun applyVehicleDetections() {
+        val detections = pendingVehicleDetections.getAndSet(null) ?: return
+        val now = System.currentTimeMillis()
+        val owner = usernameProvider()
+        val matched = HashSet<Long>()
+
+        for (vehicle in detections) {
+            var bestId: Long? = null
+            var bestDistance = Float.POSITIVE_INFINITY
+            synchronized(targetLock) {
+                for ((id, existing) in localVehicles) {
+                    if (id in matched) continue
+                    val distance = pointDistance(existing.point, vehicle.pointWorld)
+                    if (distance < bestDistance && distance <= VEHICLE_ASSOCIATION_M) {
+                        bestDistance = distance
+                        bestId = id
+                    }
+                }
+            }
+
+            val isNew = bestId == null
+            val id = bestId ?: newTargetId()
+            val existing = synchronized(targetLock) { localVehicles[id] }
+            val point = if (existing == null) {
+                vehicle.pointWorld.copyOf(3)
+            } else {
+                smoothPoint(existing.point, vehicle.pointWorld, VEHICLE_SMOOTH_ALPHA)
+            }
+
+            synchronized(targetLock) {
+                localVehicles[id] = DynamicTarget(
+                    point = point,
+                    owner = owner,
+                    label = vehicle.label,
+                    confidence = vehicle.confidence,
+                    lastSeenMs = now,
+                )
+            }
+            matched += id
+
+            // Reuse the existing metric POI packet as a small high-rate dynamic
+            // position update. AUTO:CAR tells the receiver not to create an anchor.
+            coordinator.sendPoi(id, point, "$AUTO_CAR_PREFIX$owner")
+            if (isNew) status("Vehicle detected • sharing automatically")
+        }
+    }
+
+    private fun expireVehicleTracks() {
+        val now = System.currentTimeMillis()
+        synchronized(targetLock) {
+            val localExpired = localVehicles.filterValues { now - it.lastSeenMs > LOCAL_VEHICLE_TTL_MS }.keys.toList()
+            localExpired.forEach { localVehicles.remove(it) }
+            val remoteExpired = remoteVehicles.filterValues { now - it.lastSeenMs > REMOTE_VEHICLE_TTL_MS }.keys.toList()
+            remoteExpired.forEach { remoteVehicles.remove(it) }
+        }
+    }
+
+    private fun publishVehicleErrorIfNeeded() {
+        val error = pendingVehicleError.getAndSet(null) ?: return
+        if (error == lastVehicleError) return
+        lastVehicleError = error
+        status("Vehicle detection unavailable: $error")
+    }
+
+    /**
      * While alignment is still being acquired, periodically surface one concise
-     * instruction through the existing English UI banner. This does not alter any
-     * solver threshold; it only tells the operator how to generate useful parallax.
+     * instruction through the existing English UI banner.
      */
     private fun publishSyncGuidanceIfNeeded() {
         if (coordinator.quality().bothReady) return
@@ -348,12 +486,18 @@ class ArRenderer(
 
         val localSnapshot: List<Pair<Long, LocalTarget>>
         val remoteSnapshot: List<Pair<Long, RemoteTarget>>
+        val localVehicleSnapshot: List<Pair<Long, DynamicTarget>>
+        val remoteVehicleSnapshot: List<Pair<Long, DynamicTarget>>
         synchronized(targetLock) {
             localSnapshot = localTargets.entries.map { it.key to it.value }
             remoteSnapshot = remoteTargets.entries.map { it.key to it.value }
+            localVehicleSnapshot = localVehicles.entries.map { it.key to it.value }
+            remoteVehicleSnapshot = remoteVehicles.entries.map { it.key to it.value }
         }
 
-        val projected = ArrayList<TargetOverlayView.Target>(localSnapshot.size + remoteSnapshot.size)
+        val projected = ArrayList<TargetOverlayView.Target>(
+            localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size,
+        )
         for ((id, target) in localSnapshot) {
             projectAnchor(
                 camera = camera,
@@ -379,6 +523,30 @@ class ArRenderer(
                 projection = projection,
             )?.let { projected += it }
         }
+        for ((id, target) in localVehicleSnapshot) {
+            projectPoint(
+                camera = camera,
+                point = target.point,
+                id = id,
+                label = "${target.label} • YOU",
+                confidence = target.confidence,
+                isLocal = true,
+                view = view,
+                projection = projection,
+            )?.let { projected += it }
+        }
+        for ((id, target) in remoteVehicleSnapshot) {
+            projectPoint(
+                camera = camera,
+                point = target.point,
+                id = id,
+                label = "${target.label} • ${target.owner.ifBlank { "PEER" }}",
+                confidence = target.confidence,
+                isLocal = false,
+                view = view,
+                projection = projection,
+            )?.let { projected += it }
+        }
 
         overlay.setTargets(projected)
     }
@@ -394,8 +562,21 @@ class ArRenderer(
         projection: FloatArray,
     ): TargetOverlayView.Target? {
         if (anchor.trackingState != TrackingState.TRACKING) return null
+        return projectPoint(camera, anchor.pose.translation, id, label, confidence, isLocal, view, projection)
+    }
 
-        val p = anchor.pose.translation
+    private fun projectPoint(
+        camera: Camera,
+        point: FloatArray,
+        id: Long,
+        label: String,
+        confidence: Float,
+        isLocal: Boolean,
+        view: FloatArray,
+        projection: FloatArray,
+    ): TargetOverlayView.Target? {
+        if (point.size < 3 || !point.take(3).all { it.isFinite() }) return null
+        val p = point
         val world = floatArrayOf(p[0], p[1], p[2], 1f)
         val cameraV = FloatArray(4)
         val clip = FloatArray(4)
@@ -430,10 +611,16 @@ class ArRenderer(
         )
     }
 
+    private fun newTargetId(): Long =
+        SystemClock.elapsedRealtimeNanos() xor (usernameProvider().hashCode().toLong() shl 32)
+
+    private fun smoothPoint(old: FloatArray, fresh: FloatArray, alpha: Float): FloatArray =
+        FloatArray(3) { i -> old.getOrElse(i) { 0f } * (1f - alpha) + fresh.getOrElse(i) { 0f } * alpha }
+
     private fun shortTargetId(id: Long): String =
         java.lang.Long.toHexString(id).takeLast(3).uppercase(Locale.US).padStart(3, '0')
 
-    private fun detachAnchors() {
+    private fun detachAnchorsAndTracks() {
         val locals: List<Anchor>
         val remotes: List<Anchor>
         synchronized(targetLock) {
@@ -441,6 +628,8 @@ class ArRenderer(
             remotes = remoteTargets.values.map { it.anchor }
             localTargets.clear()
             remoteTargets.clear()
+            localVehicles.clear()
+            remoteVehicles.clear()
         }
         locals.forEach { anchor -> runCatching { anchor.detach() } }
         remotes.forEach { anchor -> runCatching { anchor.detach() } }
@@ -474,5 +663,13 @@ class ArRenderer(
         private const val TAP_DEPTH_TOLERANCE_RATIO = 0.06f
         private const val MAX_POI_DISTANCE_M = 30f
         private const val SYNC_HINT_INTERVAL_MS = 9000L
+
+        private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
+        private const val VEHICLE_DETECT_INTERVAL_MS = 450L
+        private const val VEHICLE_METRIC_BUDGET = 5000
+        private const val VEHICLE_ASSOCIATION_M = 3.0f
+        private const val VEHICLE_SMOOTH_ALPHA = 0.38f
+        private const val LOCAL_VEHICLE_TTL_MS = 2_200L
+        private const val REMOTE_VEHICLE_TTL_MS = 3_000L
     }
 }
