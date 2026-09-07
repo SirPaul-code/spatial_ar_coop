@@ -56,10 +56,12 @@ class ArRenderer(
 
     private data class DynamicTarget(
         val point: FloatArray,
+        val velocity: FloatArray,
         val owner: String,
         val label: String,
         val confidence: Float,
         val lastSeenMs: Long,
+        val lastUpdateMs: Long,
     )
 
     @Volatile var session: Session? = null
@@ -73,6 +75,7 @@ class ArRenderer(
     private val targetLock = Any()
 
     private val vehicleDetector = VehicleDetector(context)
+    private val flightRecorder = AlignmentFlightRecorder(context)
     private val pendingVehicleDetections = AtomicReference<List<VehicleDetector.Vehicle>?>(null)
     private val pendingVehicleError = AtomicReference<String?>(null)
 
@@ -80,13 +83,7 @@ class ArRenderer(
     private val localTargets = LinkedHashMap<Long, LocalTarget>()
     private val remoteTargets = LinkedHashMap<Long, RemoteTarget>()
 
-    /**
-     * Vehicle targets are deliberately NOT ARCore Anchors. A car can move, so its
-     * world position is updated from every detector/depth observation and projected
-     * directly. The same POI wire packet is reused with an AUTO:CAR owner prefix;
-     * this keeps today's APK wire-compatible with the current peer transport while
-     * preserving static-anchor behavior for manual taps.
-     */
+    /** Moving objects are dynamic tracks, never permanent ARCore anchors. */
     private val localVehicles = LinkedHashMap<Long, DynamicTarget>()
     private val remoteVehicles = LinkedHashMap<Long, DynamicTarget>()
 
@@ -102,6 +99,7 @@ class ArRenderer(
 
     init {
         overlay.onSceneTap = { x, y -> queueTap(x, y) }
+        flightRecorder.event("renderer_created", mapOf("recorder_dir" to flightRecorder.directoryPath()))
     }
 
     fun queueTap(x: Float, y: Float) {
@@ -130,6 +128,7 @@ class ArRenderer(
         pendingTap.set(null)
         pendingVehicleDetections.set(null)
         overlay.setTargets(emptyList())
+        flightRecorder.event("targets_cleared")
     }
 
     fun targetCount(): Int = synchronized(targetLock) {
@@ -150,10 +149,12 @@ class ArRenderer(
         lastSyncHintAtMs = 0L
         lastVehicleSubmitMs = 0L
         trackingGate.reset()
+        flightRecorder.event("ar_session_detached")
     }
 
     fun close() {
         vehicleDetector.close()
+        flightRecorder.close()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -193,12 +194,19 @@ class ArRenderer(
             applyRemoteTargetRequests(s, tracking)
 
             when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
-                true -> status("AR tracking")
-                false -> status("AR PAUSED / ${camera.trackingFailureReason}")
+                true -> {
+                    status("AR tracking")
+                    flightRecorder.event("ar_tracking")
+                }
+                false -> {
+                    status("AR PAUSED / ${camera.trackingFailureReason}")
+                    flightRecorder.event("ar_paused", mapOf("reason" to camera.trackingFailureReason.toString()))
+                }
                 null -> Unit
             }
             if (!tracking) return
 
+            flightRecorder.quality(coordinator.quality())
             handleTap(s, frame, camera)
             captureIfDue(frame, camera)
             maybeDetectVehicles(s, frame, camera)
@@ -215,19 +223,17 @@ class ArRenderer(
                 lastFrameError = error
                 lastFrameErrorAtMs = now
                 status("AR frame error: $error")
+                flightRecorder.event("ar_frame_error", mapOf("error" to error))
             }
         }
     }
 
-    /**
-     * A tap is accepted only when ARCore hit testing and metric depth agree, when
-     * both are available. This prevents a valid screen tap from silently landing on
-     * a different plane several metres behind the intended surface.
-     */
+    /** A tap is accepted only when ARCore hit testing and metric depth agree. */
     private fun handleTap(session: Session, frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
             status("SYNCING — keep both cameras on the same detailed area and move slowly side-to-side")
+            flightRecorder.event("tap_blocked_not_locked")
             return
         }
 
@@ -278,6 +284,7 @@ class ArRenderer(
 
         if (newAnchor == null) {
             status("No corroborated metric surface at the tap. Move slightly and tap again.")
+            flightRecorder.event("tap_rejected_no_metric_surface")
             return
         }
 
@@ -291,9 +298,8 @@ class ArRenderer(
         val point = newAnchor.pose.translation
 
         if (coordinator.sendPoi(id, point, owner)) {
-            synchronized(targetLock) {
-                localTargets[id] = LocalTarget(newAnchor, owner)
-            }
+            synchronized(targetLock) { localTargets[id] = LocalTarget(newAnchor, owner) }
+            flightRecorder.target(id, owner, point, false)
             status("POI sent")
         } else {
             runCatching { newAnchor.detach() }
@@ -301,11 +307,6 @@ class ArRenderer(
         }
     }
 
-    /**
-     * Manual remote POIs become fixed ARCore anchors. AUTO:CAR packets instead
-     * update a direct world-space track because moving objects must never be frozen
-     * into ARCore's static map.
-     */
     private fun applyRemoteTargetRequests(session: Session, tracking: Boolean) {
         if (!tracking) return
 
@@ -318,13 +319,17 @@ class ArRenderer(
                     if (request.point == null) {
                         remoteVehicles.remove(request.id)
                     } else {
-                        remoteVehicles[request.id] = DynamicTarget(
-                            point = request.point.copyOf(3),
+                        val now = System.currentTimeMillis()
+                        val prior = remoteVehicles[request.id]
+                        remoteVehicles[request.id] = filterDynamicTarget(
+                            prior = prior,
+                            measurement = request.point,
                             owner = cleanOwner,
                             label = "CAR",
                             confidence = request.confidence,
-                            lastSeenMs = System.currentTimeMillis(),
+                            nowMs = now,
                         )
+                        flightRecorder.vehicle(request.id, "CAR", request.confidence, request.point, true)
                     }
                 }
                 continue
@@ -339,25 +344,17 @@ class ArRenderer(
             val existing = synchronized(targetLock) { remoteTargets[request.id] }
             if (existing != null) {
                 synchronized(targetLock) {
-                    remoteTargets[request.id] = existing.copy(
-                        owner = request.owner,
-                        confidence = request.confidence,
-                    )
+                    remoteTargets[request.id] = existing.copy(owner = request.owner, confidence = request.confidence)
                 }
                 continue
             }
 
-            val anchor = runCatching {
-                session.createAnchor(Pose.makeTranslation(request.point))
-            }.getOrNull() ?: continue
-
+            val anchor = runCatching { session.createAnchor(Pose.makeTranslation(request.point)) }.getOrNull() ?: continue
             synchronized(targetLock) {
-                val prior = remoteTargets.putIfAbsent(
-                    request.id,
-                    RemoteTarget(anchor, request.owner, request.confidence),
-                )
+                val prior = remoteTargets.putIfAbsent(request.id, RemoteTarget(anchor, request.owner, request.confidence))
                 if (prior != null) runCatching { anchor.detach() }
             }
+            flightRecorder.target(request.id, request.owner, request.point, true)
         }
     }
 
@@ -372,15 +369,11 @@ class ArRenderer(
             maxWidth = budget.maxWidth,
             sensors = sensorSnapshotProvider(),
         ) ?: return
+        flightRecorder.frame(packet, locked)
         coordinator.onLocalFrame(packet)
         lastCaptureNs = now
     }
 
-    /**
-     * Vehicle inference runs only after the shared world is verified. The RGB image
-     * and the metric supports come from the same ARCore frame, so every accepted 2D
-     * car box can be turned into a real 3D point before it is sent to the peer.
-     */
     private fun maybeDetectVehicles(session: Session, frame: Frame, camera: Camera) {
         if (!coordinator.quality().bothReady || vehicleDetector.isBusy()) return
         val now = System.currentTimeMillis()
@@ -414,7 +407,8 @@ class ArRenderer(
             synchronized(targetLock) {
                 for ((id, existing) in localVehicles) {
                     if (id in matched) continue
-                    val distance = pointDistance(existing.point, vehicle.pointWorld)
+                    val predicted = predictPoint(existing, now)
+                    val distance = pointDistance(predicted, vehicle.pointWorld)
                     if (distance < bestDistance && distance <= VEHICLE_ASSOCIATION_M) {
                         bestDistance = distance
                         bestId = id
@@ -425,28 +419,62 @@ class ArRenderer(
             val isNew = bestId == null
             val id = bestId ?: newTargetId()
             val existing = synchronized(targetLock) { localVehicles[id] }
-            val point = if (existing == null) {
-                vehicle.pointWorld.copyOf(3)
-            } else {
-                smoothPoint(existing.point, vehicle.pointWorld, VEHICLE_SMOOTH_ALPHA)
-            }
+            val track = filterDynamicTarget(
+                prior = existing,
+                measurement = vehicle.pointWorld,
+                owner = owner,
+                label = vehicle.label,
+                confidence = vehicle.confidence,
+                nowMs = now,
+            )
 
-            synchronized(targetLock) {
-                localVehicles[id] = DynamicTarget(
-                    point = point,
-                    owner = owner,
-                    label = vehicle.label,
-                    confidence = vehicle.confidence,
-                    lastSeenMs = now,
-                )
-            }
+            synchronized(targetLock) { localVehicles[id] = track }
             matched += id
-
-            // Reuse the existing metric POI packet as a small high-rate dynamic
-            // position update. AUTO:CAR tells the receiver not to create an anchor.
-            coordinator.sendPoi(id, point, "$AUTO_CAR_PREFIX$owner")
+            coordinator.sendPoi(id, track.point, "$AUTO_CAR_PREFIX$owner")
+            flightRecorder.vehicle(id, vehicle.label, vehicle.confidence, track.point, false)
             if (isNew) status("Vehicle detected • sharing automatically")
         }
+    }
+
+    /** Alpha-beta filter gives demo-smooth motion without hiding real acceleration. */
+    private fun filterDynamicTarget(
+        prior: DynamicTarget?,
+        measurement: FloatArray,
+        owner: String,
+        label: String,
+        confidence: Float,
+        nowMs: Long,
+    ): DynamicTarget {
+        if (prior == null || measurement.size < 3) {
+            return DynamicTarget(
+                point = measurement.copyOf(3),
+                velocity = FloatArray(3),
+                owner = owner,
+                label = label,
+                confidence = confidence,
+                lastSeenMs = nowMs,
+                lastUpdateMs = nowMs,
+            )
+        }
+        val dt = ((nowMs - prior.lastUpdateMs).coerceIn(40L, 1500L) / 1000f)
+        val predicted = FloatArray(3) { i -> prior.point[i] + prior.velocity[i] * dt }
+        val residual = FloatArray(3) { i -> measurement.getOrElse(i) { predicted[i] } - predicted[i] }
+        val filtered = FloatArray(3) { i -> predicted[i] + VEHICLE_ALPHA * residual[i] }
+        val velocity = FloatArray(3) { i -> prior.velocity[i] + (VEHICLE_BETA / dt) * residual[i] }
+        return DynamicTarget(
+            point = filtered,
+            velocity = velocity,
+            owner = owner,
+            label = label,
+            confidence = confidence,
+            lastSeenMs = nowMs,
+            lastUpdateMs = nowMs,
+        )
+    }
+
+    private fun predictPoint(target: DynamicTarget, nowMs: Long): FloatArray {
+        val dt = ((nowMs - target.lastUpdateMs).coerceIn(0L, MAX_COAST_PREDICTION_MS) / 1000f)
+        return FloatArray(3) { i -> target.point[i] + target.velocity[i] * dt }
     }
 
     private fun expireVehicleTracks() {
@@ -464,12 +492,9 @@ class ArRenderer(
         if (error == lastVehicleError) return
         lastVehicleError = error
         status("Vehicle detection unavailable: $error")
+        flightRecorder.event("vehicle_detector_error", mapOf("error" to error))
     }
 
-    /**
-     * While alignment is still being acquired, periodically surface one concise
-     * instruction through the existing English UI banner.
-     */
     private fun publishSyncGuidanceIfNeeded() {
         if (coordinator.quality().bothReady) return
         val now = System.currentTimeMillis()
@@ -523,10 +548,11 @@ class ArRenderer(
                 projection = projection,
             )?.let { projected += it }
         }
+        val now = System.currentTimeMillis()
         for ((id, target) in localVehicleSnapshot) {
             projectPoint(
                 camera = camera,
-                point = target.point,
+                point = predictPoint(target, now),
                 id = id,
                 label = "${target.label} • YOU",
                 confidence = target.confidence,
@@ -538,7 +564,7 @@ class ArRenderer(
         for ((id, target) in remoteVehicleSnapshot) {
             projectPoint(
                 camera = camera,
-                point = target.point,
+                point = predictPoint(target, now),
                 id = id,
                 label = "${target.label} • ${target.owner.ifBlank { "PEER" }}",
                 confidence = target.confidence,
@@ -614,9 +640,6 @@ class ArRenderer(
     private fun newTargetId(): Long =
         SystemClock.elapsedRealtimeNanos() xor (usernameProvider().hashCode().toLong() shl 32)
 
-    private fun smoothPoint(old: FloatArray, fresh: FloatArray, alpha: Float): FloatArray =
-        FloatArray(3) { i -> old.getOrElse(i) { 0f } * (1f - alpha) + fresh.getOrElse(i) { 0f } * alpha }
-
     private fun shortTargetId(id: Long): String =
         java.lang.Long.toHexString(id).takeLast(3).uppercase(Locale.US).padStart(3, '0')
 
@@ -662,14 +685,16 @@ class ArRenderer(
         private const val TAP_DEPTH_MIN_TOLERANCE_M = 0.18f
         private const val TAP_DEPTH_TOLERANCE_RATIO = 0.06f
         private const val MAX_POI_DISTANCE_M = 30f
-        private const val SYNC_HINT_INTERVAL_MS = 9000L
+        private const val SYNC_HINT_INTERVAL_MS = 6500L
 
         private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
-        private const val VEHICLE_DETECT_INTERVAL_MS = 450L
-        private const val VEHICLE_METRIC_BUDGET = 5000
-        private const val VEHICLE_ASSOCIATION_M = 3.0f
-        private const val VEHICLE_SMOOTH_ALPHA = 0.38f
-        private const val LOCAL_VEHICLE_TTL_MS = 2_200L
-        private const val REMOTE_VEHICLE_TTL_MS = 3_000L
+        private const val VEHICLE_DETECT_INTERVAL_MS = 350L
+        private const val VEHICLE_METRIC_BUDGET = 6500
+        private const val VEHICLE_ASSOCIATION_M = 3.5f
+        private const val VEHICLE_ALPHA = 0.52f
+        private const val VEHICLE_BETA = 0.16f
+        private const val MAX_COAST_PREDICTION_MS = 900L
+        private const val LOCAL_VEHICLE_TTL_MS = 2_800L
+        private const val REMOTE_VEHICLE_TTL_MS = 3_800L
     }
 }
