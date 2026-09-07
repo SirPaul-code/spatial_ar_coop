@@ -15,54 +15,66 @@ import kotlin.math.sqrt
 
 class TargetOverlayView(context: Context) : View(context) {
     data class Target(
+        val id: Long,
         val screenX: Float,
         val screenY: Float,
         val inFront: Boolean,
         val bearingRad: Float,
         val distanceM: Float,
-        val owner: String,
+        val label: String,
         val confidence: Float,
+        val isLocal: Boolean,
     )
 
     private val density = resources.displayMetrics.density
     private fun d(value: Float) = value * density
 
-    private val accent = 0xff55f0bd.toInt()
+    private val localAccent = 0xff55f0bd.toInt()
+    private val peerAccent = 0xff64a9ff.toInt()
     private val panel = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xe2161d22.toInt() }
-    private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = d(2.4f)
-        color = accent
-    }
     private val thin = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = d(1f)
         color = 0x99ffffff.toInt()
     }
-    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = accent }
-    private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val localRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = d(2.4f)
+        color = localAccent
+    }
+    private val peerRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = d(2.4f)
+        color = peerAccent
+    }
+    private val localFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = localAccent }
+    private val peerFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = peerAccent }
+    private val localGlow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = d(7f)
         color = 0x2855f0bd
     }
+    private val peerGlow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = d(7f)
+        color = 0x2864a9ff
+    }
     private val title = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xffffffff.toInt()
-        textSize = d(14f)
+        textSize = d(13f)
         isFakeBoldText = true
     }
     private val meta = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xffc6d0d6.toInt()
-        textSize = d(11.5f)
+        textSize = d(10.8f)
     }
     private val arrow = Path()
 
-    @Volatile private var target: Target? = null
+    @Volatile private var targets: List<Target> = emptyList()
 
     /**
      * Scene tap callback. The overlay intentionally owns camera-surface gestures:
      * it sits above GLSurfaceView and therefore receives a complete DOWN/UP stream.
-     * The previous GLSurfaceView listener returned false on ACTION_DOWN, so Android
-     * was free to drop the rest of the gesture and ACTION_UP never reached POI code.
      */
     var onSceneTap: ((Float, Float) -> Unit)? = null
 
@@ -119,68 +131,113 @@ class TargetOverlayView(context: Context) : View(context) {
         return true
     }
 
-    fun setTarget(target: Target?) {
-        this.target = target
+    fun setTargets(targets: Collection<Target>) {
+        this.targets = targets.toList()
         postInvalidateOnAnimation()
+    }
+
+    /** Compatibility helper for any older call sites. */
+    fun setTarget(target: Target?) {
+        setTargets(if (target == null) emptyList() else listOf(target))
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val t = target ?: return
-        if (width <= 0 || height <= 0) return
+        val snapshot = targets
+        if (snapshot.isEmpty() || width <= 0 || height <= 0) return
+
         val margin = d(42f)
-        val visible = t.inFront &&
-            t.screenX.isFinite() && t.screenY.isFinite() &&
-            t.screenX in margin..(width - margin) &&
-            t.screenY in margin..(height - margin)
-        if (visible) drawMarker(canvas, t) else drawEdgeArrow(canvas, t, margin)
+        val visible = ArrayList<Target>(snapshot.size)
+        val offscreen = ArrayList<Target>(snapshot.size)
+        for (target in snapshot) {
+            val isVisible = target.inFront &&
+                target.screenX.isFinite() && target.screenY.isFinite() &&
+                target.screenX in margin..(width - margin) &&
+                target.screenY in margin..(height - margin)
+            if (isVisible) visible += target else offscreen += target
+        }
+
+        // Draw farther targets first so a nearby physical point remains legible when
+        // several markers overlap in screen space. Label only the nearest few; all
+        // targets still retain their crosshair.
+        val labeledIds = visible
+            .sortedBy { sortableDistance(it.distanceM) }
+            .take(MAX_VISIBLE_LABELS)
+            .mapTo(HashSet()) { it.id }
+
+        visible
+            .sortedByDescending { sortableDistance(it.distanceM) }
+            .forEach { drawMarker(canvas, it, it.id in labeledIds) }
+
+        val nearestOffscreen = offscreen
+            .sortedBy { sortableDistance(it.distanceM) }
+            .take(MAX_EDGE_TARGETS)
+        nearestOffscreen.forEachIndexed { index, target ->
+            drawEdgeArrow(canvas, target, margin, index)
+        }
+
+        if (offscreen.size > MAX_EDGE_TARGETS) {
+            drawOverflowBadge(canvas, offscreen.size - MAX_EDGE_TARGETS)
+        }
     }
 
-    private fun drawMarker(canvas: Canvas, t: Target) {
-        val x = t.screenX
-        val y = t.screenY
-        val radius = d(16f)
+    private fun sortableDistance(distance: Float): Float =
+        if (distance.isFinite()) distance else Float.MAX_VALUE
+
+    private fun drawMarker(canvas: Canvas, target: Target, showLabel: Boolean) {
+        val x = target.screenX
+        val y = target.screenY
+        val radius = d(13.5f)
+        val ring = if (target.isLocal) localRing else peerRing
+        val fill = if (target.isLocal) localFill else peerFill
+        val glow = if (target.isLocal) localGlow else peerGlow
+
         canvas.drawCircle(x, y, radius + d(4f), glow)
         canvas.drawCircle(x, y, radius, ring)
-        canvas.drawCircle(x, y, d(2.8f), fill)
-        canvas.drawLine(x - d(24f), y, x - d(13f), y, thin)
-        canvas.drawLine(x + d(13f), y, x + d(24f), y, thin)
-        canvas.drawLine(x, y - d(24f), x, y - d(13f), thin)
-        canvas.drawLine(x, y + d(13f), x, y + d(24f), thin)
+        canvas.drawCircle(x, y, d(2.6f), fill)
+        canvas.drawLine(x - d(21f), y, x - d(11f), y, thin)
+        canvas.drawLine(x + d(11f), y, x + d(21f), y, thin)
+        canvas.drawLine(x, y - d(21f), x, y - d(11f), thin)
+        canvas.drawLine(x, y + d(11f), x, y + d(21f), thin)
 
-        val label = if (t.owner.isBlank()) "POI" else t.owner
-        val distance = if (t.distanceM.isFinite()) "%.1f m".format(t.distanceM) else ""
-        val confidence = when {
-            t.confidence >= 0.62f -> "HIGH"
-            t.confidence >= 0.38f -> "GOOD"
-            else -> "LOCKED"
+        if (!showLabel) return
+
+        val label = target.label.ifBlank { "TARGET" }
+        val distance = if (target.distanceM.isFinite()) "%.1f m".format(target.distanceM) else ""
+        val state = if (target.isLocal) {
+            "LOCAL"
+        } else {
+            when {
+                target.confidence >= 0.62f -> "HIGH"
+                target.confidence >= 0.38f -> "GOOD"
+                else -> "LOCKED"
+            }
         }
-        val metaText = listOf(distance, confidence).filter { it.isNotBlank() }.joinToString("  •  ")
-        val boxW = max(title.measureText(label), meta.measureText(metaText)) + d(24f)
-        val boxH = d(48f)
-        var left = x + d(27f)
-        if (left + boxW > width - d(8f)) left = x - d(27f) - boxW
+        val metaText = listOf(distance, state).filter { it.isNotBlank() }.joinToString("  •  ")
+        val boxW = max(title.measureText(label), meta.measureText(metaText)) + d(22f)
+        val boxH = d(45f)
+        var left = x + d(23f)
+        if (left + boxW > width - d(8f)) left = x - d(23f) - boxW
         left = left.coerceIn(d(8f), width - boxW - d(8f))
         val top = (y - boxH / 2f).coerceIn(d(8f), height - boxH - d(8f))
-        canvas.drawRoundRect(RectF(left, top, left + boxW, top + boxH), d(12f), d(12f), panel)
-        canvas.drawText(label, left + d(12f), top + d(19f), title)
-        if (metaText.isNotBlank()) canvas.drawText(metaText, left + d(12f), top + d(37f), meta)
+        canvas.drawRoundRect(RectF(left, top, left + boxW, top + boxH), d(11f), d(11f), panel)
+        canvas.drawText(label, left + d(11f), top + d(18f), title)
+        if (metaText.isNotBlank()) canvas.drawText(metaText, left + d(11f), top + d(35f), meta)
     }
 
-    private fun drawEdgeArrow(canvas: Canvas, t: Target, margin: Float) {
+    private fun drawEdgeArrow(canvas: Canvas, target: Target, margin: Float, slotIndex: Int) {
         val cx = width * 0.5f
         val cy = height * 0.5f
         var dx: Float
         var dy: Float
 
-        if (t.inFront && t.screenX.isFinite() && t.screenY.isFinite()) {
-            dx = t.screenX - cx
-            dy = t.screenY - cy
+        if (target.inFront && target.screenX.isFinite() && target.screenY.isFinite()) {
+            dx = target.screenX - cx
+            dy = target.screenY - cy
         } else {
-            // For a point behind the camera the most useful instruction is which
-            // horizontal direction to turn. A vertical "down" arrow for a directly
-            // rearward point is visually ambiguous in portrait mode.
-            dx = if (t.bearingRad >= 0f) 1f else -1f
+            // For a point behind the camera the useful instruction is which
+            // horizontal direction to turn, rather than an ambiguous down arrow.
+            dx = if (target.bearingRad >= 0f) 1f else -1f
             dy = 0f
         }
 
@@ -192,43 +249,75 @@ class TargetOverlayView(context: Context) : View(context) {
         val sx = if (abs(dx) < 1e-4f) Float.POSITIVE_INFINITY else halfW / abs(dx)
         val sy = if (abs(dy) < 1e-4f) Float.POSITIVE_INFINITY else halfH / abs(dy)
         val scale = min(sx, sy)
-        val x = cx + dx * scale
-        val y = cy + dy * scale
 
-        val tipX = x + dx * d(6f)
-        val tipY = y + dy * d(6f)
-        val baseX = x - dx * d(17f)
-        val baseY = y - dy * d(17f)
         val px = -dy
         val py = dx
+        val slotOffsetDp = when (slotIndex) {
+            0 -> 0f
+            1 -> 15f
+            2 -> -15f
+            3 -> 30f
+            4 -> -30f
+            else -> 45f
+        }
+        var x = cx + dx * scale + px * d(slotOffsetDp)
+        var y = cy + dy * scale + py * d(slotOffsetDp)
+        x = x.coerceIn(margin, width - margin)
+        y = y.coerceIn(margin, height - margin)
+
+        val ring = if (target.isLocal) localRing else peerRing
+        val fill = if (target.isLocal) localFill else peerFill
+        val glow = if (target.isLocal) localGlow else peerGlow
+
+        val tipX = x + dx * d(5f)
+        val tipY = y + dy * d(5f)
+        val baseX = x - dx * d(14f)
+        val baseY = y - dy * d(14f)
         arrow.reset()
         arrow.moveTo(tipX, tipY)
-        arrow.lineTo(baseX + px * d(10f), baseY + py * d(10f))
-        arrow.lineTo(baseX - px * d(10f), baseY - py * d(10f))
+        arrow.lineTo(baseX + px * d(8f), baseY + py * d(8f))
+        arrow.lineTo(baseX - px * d(8f), baseY - py * d(8f))
         arrow.close()
 
-        canvas.drawCircle(x, y, d(23f), glow)
-        canvas.drawCircle(x, y, d(20f), ring)
+        canvas.drawCircle(x, y, d(20f), glow)
+        canvas.drawCircle(x, y, d(17f), ring)
         canvas.drawPath(arrow, fill)
 
-        val distance = if (t.distanceM.isFinite()) "%.1f m".format(t.distanceM) else "POI"
-        val label = if (t.owner.isBlank()) distance else "${t.owner}  •  $distance"
-        val boxW = meta.measureText(label) + d(20f)
-        val boxH = d(32f)
+        val distance = if (target.distanceM.isFinite()) "%.1f m".format(target.distanceM) else "TARGET"
+        val label = if (target.label.isBlank()) distance else "${target.label}  •  $distance"
+        val boxW = meta.measureText(label) + d(18f)
+        val boxH = d(29f)
         val labelLeft = (x - boxW / 2f).coerceIn(d(8f), width - boxW - d(8f))
         val labelTop = (
-            if (y < height * 0.25f) y + d(30f) else y - d(48f)
+            if (y < height * 0.25f) y + d(27f) else y - d(43f)
         ).coerceIn(d(8f), height - boxH - d(8f))
         canvas.drawRoundRect(
             RectF(labelLeft, labelTop, labelLeft + boxW, labelTop + boxH),
+            d(9f),
+            d(9f),
+            panel,
+        )
+        canvas.drawText(label, labelLeft + d(9f), labelTop + d(19f), meta)
+    }
+
+    private fun drawOverflowBadge(canvas: Canvas, hiddenCount: Int) {
+        val text = "+$hiddenCount more off-screen"
+        val boxW = meta.measureText(text) + d(22f)
+        val boxH = d(30f)
+        val left = (width - boxW) * 0.5f
+        val top = (height - d(88f) - boxH).coerceAtLeast(d(8f))
+        canvas.drawRoundRect(
+            RectF(left, top, left + boxW, top + boxH),
             d(10f),
             d(10f),
             panel,
         )
-        canvas.drawText(label, labelLeft + d(10f), labelTop + d(21f), meta)
+        canvas.drawText(text, left + d(11f), top + d(20f), meta)
     }
 
     companion object {
         private const val MAX_TAP_DURATION_MS = 650L
+        private const val MAX_VISIBLE_LABELS = 10
+        private const val MAX_EDGE_TARGETS = 6
     }
 }
