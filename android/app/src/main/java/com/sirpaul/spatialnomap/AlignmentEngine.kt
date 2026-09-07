@@ -55,9 +55,47 @@ object AlignmentEngine {
     )
 
     fun solve(remote: CapturedFrame, local: CapturedFrame): Result? {
-        if (remote.metricPoints.size < 24) return null
         val matchSet = siftMatches(remote, local) ?: return null
         if (matchSet.matches.size < MIN_MATCHES_FOR_PNP) return null
+
+        // Fast path that does NOT require dense depth at every SIFT feature. The
+        // essential matrix obtains relative rotation + translation direction from
+        // all visual matches; only a couple of metric correspondences are needed to
+        // recover translation scale. This is much easier to acquire than PnP when
+        // both phones already track well but their depth support is sparse.
+        if (matchSet.matches.size >= 12) {
+            val observations = matchSet.matches.map { match ->
+                val remotePoint = matchSet.keyRemote[match.queryIdx].pt
+                val localPoint = matchSet.keyLocal[match.trainIdx].pt
+                EssentialSharedPoseSolver.Observation(
+                    remoteX = remotePoint.x,
+                    remoteY = remotePoint.y,
+                    localX = localPoint.x,
+                    localY = localPoint.y,
+                )
+            }
+            val essential = EssentialSharedPoseSolver.solve(remote, local, observations)
+            if (essential != null) {
+                return Result(
+                    transformLocalFromRemote = essential.transformLocalFromRemote,
+                    inliers = essential.visualInliers,
+                    correspondences = essential.visualCorrespondences,
+                    matches = matchSet.matches.size,
+                    medianReprojectionPx = essential.medianEpipolarPx,
+                    imageCoverage = essential.imageCoverage,
+                    predictedDeviceDistanceM = essential.predictedDeviceDistanceM,
+                    confidence = essential.confidence,
+                    gravityTiltDeg = essential.gravityTiltDeg,
+                    metricPairs = essential.metricPairs,
+                    metricInliers = essential.metricInliers,
+                    medianMetricResidualM = essential.medianMetricResidualM,
+                )
+            }
+        }
+
+        // Dense metric PnP remains the precision fallback when the essential path
+        // cannot recover a reliable metric scale.
+        if (remote.metricPoints.size < 24) return null
 
         val usedRemoteMetric = HashSet<Int>()
         val usedLocalMetric = HashSet<Int>()
