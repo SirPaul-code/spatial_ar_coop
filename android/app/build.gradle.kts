@@ -1,3 +1,4 @@
+import java.net.URI
 import java.util.Base64
 
 plugins {
@@ -24,9 +25,32 @@ val generatedVersionCode = if (ciRunNumber != null) {
     500_000
 }
 val generatedVersionName = if (ciRunNumber != null) {
-    "0.5.0-fusion.${ciRunNumber}.${ciRunAttempt}"
+    "0.6.0-vehicles.${ciRunNumber}.${ciRunAttempt}"
 } else {
-    "0.5.0-fusion.local"
+    "0.6.0-vehicles.local"
+}
+
+// EfficientDet-Lite0 is downloaded at build time and then packaged as a normal
+// local Android asset. Runtime inference is fully on-device; the app does not need
+// internet access for vehicle detection. Keeping the model out of git avoids a
+// multi-megabyte binary blob while still producing a self-contained APK.
+val generatedMlAssetsDir = layout.buildDirectory.dir("generated/ml-assets").get().asFile
+val vehicleModelFile = generatedMlAssetsDir.resolve("efficientdet_lite0_uint8.tflite")
+val downloadVehicleModel = tasks.register("downloadVehicleModel") {
+    outputs.file(vehicleModelFile)
+    doLast {
+        if (!vehicleModelFile.isFile || vehicleModelFile.length() < 1_000_000L) {
+            vehicleModelFile.parentFile.mkdirs()
+            val tmp = vehicleModelFile.resolveSibling("${vehicleModelFile.name}.tmp")
+            URI("https://storage.googleapis.com/mediapipe-tasks/object_detector/efficientdet_lite0_uint8.tflite")
+                .toURL()
+                .openStream()
+                .use { input -> tmp.outputStream().use { output -> input.copyTo(output) } }
+            require(tmp.length() >= 1_000_000L) { "Downloaded vehicle model is unexpectedly small" }
+            if (vehicleModelFile.exists()) vehicleModelFile.delete()
+            require(tmp.renameTo(vehicleModelFile)) { "Could not install downloaded vehicle model" }
+        }
+    }
 }
 
 android {
@@ -61,6 +85,8 @@ android {
         }
     }
 
+    sourceSets.getByName("main").assets.srcDir(generatedMlAssetsDir)
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -72,9 +98,12 @@ android {
     }
 }
 
+tasks.named("preBuild").configure { dependsOn(downloadVehicleModel) }
+
 dependencies {
     implementation("com.google.ar:core:1.56.0")
     implementation("org.opencv:opencv:4.12.0")
+    implementation("com.google.mediapipe:tasks-vision:0.10.35")
 
     testImplementation("junit:junit:4.13.2")
 }
