@@ -25,9 +25,9 @@ val generatedVersionCode = if (ciRunNumber != null) {
     500_000
 }
 val generatedVersionName = if (ciRunNumber != null) {
-    "0.6.0-vehicles.${ciRunNumber}.${ciRunAttempt}"
+    "0.7.0-spatial-world.${ciRunNumber}.${ciRunAttempt}"
 } else {
-    "0.6.0-vehicles.local"
+    "0.7.0-spatial-world.local"
 }
 
 // EfficientDet-Lite0 is downloaded at build time and then packaged as a normal
