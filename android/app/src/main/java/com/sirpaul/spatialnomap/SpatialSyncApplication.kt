@@ -8,6 +8,7 @@ class SpatialSyncApplication : Application() {
         sensorFusion = SpatialSensorFusion(this).also { it.start() }
         performanceGovernor = RuntimePerformanceGovernor(this)
         AlignmentSessionRecorder.init(this)
+        AlignmentQualityPoller.register(this)
         BirdEyeWorldController.register(this)
     }
 
