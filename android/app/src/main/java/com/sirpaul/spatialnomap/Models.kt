@@ -49,4 +49,7 @@ data class CapturedFrame(
     val jpegBase64: String,
     val metricPoints: List<FloatArray>, // [u, v, worldX, worldY, worldZ]
     val sensors: SensorSnapshot = SensorSnapshot(),
+    // Non-zero only during a peer-synchronised acquisition burst.
+    val burstId: Long = 0L,
+    val burstSequence: Int = -1,
 )
