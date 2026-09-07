@@ -7,6 +7,8 @@ class SpatialSyncApplication : Application() {
         super.onCreate()
         sensorFusion = SpatialSensorFusion(this).also { it.start() }
         performanceGovernor = RuntimePerformanceGovernor(this)
+        AlignmentSessionRecorder.init(this)
+        BirdEyeWorldController.register(this)
     }
 
     companion object {
@@ -19,7 +21,7 @@ class SpatialSyncApplication : Application() {
         fun captureBudget(locked: Boolean): RuntimePerformanceGovernor.CaptureBudget =
             performanceGovernor?.captureBudget(locked)
                 ?: RuntimePerformanceGovernor.CaptureBudget(
-                    intervalNs = if (locked) 750_000_000L else 250_000_000L,
+                    intervalNs = 250_000_000L,
                     maxWidth = if (locked) 1152 else 1280,
                     tier = RuntimePerformanceGovernor.Tier.FULL,
                 )
