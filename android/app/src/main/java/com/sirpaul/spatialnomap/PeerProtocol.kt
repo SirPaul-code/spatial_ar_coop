@@ -129,6 +129,7 @@ object PeerProtocol {
 
         WorldVizBus.observe(WorldVizBus.Direction.OUT, message)
         AlignmentSessionRecorder.observe(WorldVizBus.Direction.OUT, message)
+        SharedLandmarkCache.observe(WorldVizBus.Direction.OUT, message)
     }
 
     fun read(input: InputStream): WireMessage? {
@@ -184,6 +185,7 @@ object PeerProtocol {
         }
         WorldVizBus.observe(WorldVizBus.Direction.IN, message)
         AlignmentSessionRecorder.observe(WorldVizBus.Direction.IN, message)
+        SharedLandmarkCache.observe(WorldVizBus.Direction.IN, message)
         return message
     }
 
