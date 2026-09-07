@@ -16,8 +16,10 @@ import org.opencv.features2d.BFMatcher
 import org.opencv.features2d.SIFT
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
+import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import kotlin.math.abs
+import kotlin.math.acos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
@@ -33,9 +35,15 @@ import kotlin.math.sqrt
  * to repair ARCore-anchor/VIO drift without moving a marker onto a visually similar
  * but geometrically incompatible surface.
  *
- * This is deliberately fail-closed: an unverified target simply keeps its existing
- * ARCore anchor. A bad visual/depth correction is much worse than temporarily not
- * correcting drift.
+ * A target also grows an on-device multi-view landmark atlas. Once one trusted view
+ * re-observes the target, a sufficiently different camera baseline/viewing angle is
+ * retained as another reference. Later verification can therefore match the same
+ * physical target from the side, above, below or after walking around it instead of
+ * depending forever on the single image captured at tap time.
+ *
+ * Learning is fail-closed: only an already verified visual+metric observation may
+ * become a new reference. Unverified images are never admitted into the atlas, which
+ * prevents descriptor drift from gradually teaching the target the wrong surface.
  */
 data class SurfaceTargetReference(
     val frame: CapturedFrame,
@@ -47,17 +55,21 @@ object SurfaceTargetRegistry {
 
     @Synchronized fun putRemote(id: Long, reference: SurfaceTargetReference) {
         remote[id] = reference
-        while (remote.size > MAX_REMOTE_REFERENCES) remote.remove(remote.keys.first())
+        while (remote.size > MAX_REMOTE_REFERENCES) {
+            val first = remote.keys.firstOrNull() ?: break
+            remote.remove(first)?.let { SurfaceTargetResolver.forgetReference(it) }
+        }
     }
 
     @Synchronized fun remote(id: Long): SurfaceTargetReference? = remote[id]
 
     @Synchronized fun remove(id: Long) {
-        remote.remove(id)
+        remote.remove(id)?.let { SurfaceTargetResolver.forgetReference(it) }
     }
 
     @Synchronized fun clear() {
         remote.clear()
+        SurfaceTargetResolver.clearLearnedReferences()
     }
 
     private const val MAX_REMOTE_REFERENCES = 64
@@ -80,6 +92,34 @@ object SurfaceTargetResolver {
         val current: Array<org.opencv.core.KeyPoint>,
     )
 
+    private data class ReferenceKey(
+        val timestampNs: Long,
+        val uQ: Int,
+        val vQ: Int,
+    )
+
+    private data class ViewSample(
+        val reference: SurfaceTargetReference,
+        val cameraWorld: FloatArray?,
+        val viewDir: DoubleArray?,
+        val rangeM: Double,
+    )
+
+    private data class ViewBank(
+        val root: ReferenceKey,
+        val samples: ArrayDeque<ViewSample> = ArrayDeque(),
+        var lastUsedMs: Long = System.currentTimeMillis(),
+    )
+
+    private val atlasLock = Any()
+    private val atlas = LinkedHashMap<ReferenceKey, ViewBank>()
+    private val aliases = LinkedHashMap<ReferenceKey, ReferenceKey>()
+
+    /**
+     * Resolve against several geometrically diverse views of the same target. The
+     * current/reference images are still handled one pair at a time so a bad view
+     * cannot contaminate another view's RANSAC consensus.
+     */
     fun resolve(
         reference: SurfaceTargetReference,
         current: CapturedFrame,
@@ -88,6 +128,34 @@ object SurfaceTargetResolver {
         if (reference.pixel.size < 2 || expectedWorld.size < 3) return null
         if (current.metricPoints.size < MIN_CURRENT_METRIC_SUPPORTS) return null
 
+        val candidates = candidateReferences(reference)
+        var best: Result? = null
+        var bestScore = Double.NEGATIVE_INFINITY
+        for (candidate in candidates) {
+            val result = resolveSingle(candidate, current, expectedWorld) ?: continue
+            val score = result.confidence * 4.0 +
+                min(result.visualInliers, 24) / 12.0 +
+                min(result.depthSupports, 12) / 12.0 -
+                result.medianReprojectionPx / 4.0
+            if (score > bestScore) {
+                best = result
+                bestScore = score
+            }
+            if (result.confidence >= VERY_STRONG_REFERENCE_CONFIDENCE &&
+                result.visualInliers >= VERY_STRONG_REFERENCE_INLIERS &&
+                result.medianReprojectionPx <= VERY_STRONG_REPROJECTION_PX
+            ) break
+        }
+
+        best?.let { learnCurrentView(reference, current, it) }
+        return best
+    }
+
+    private fun resolveSingle(
+        reference: SurfaceTargetReference,
+        current: CapturedFrame,
+        expectedWorld: FloatArray,
+    ): Result? {
         val sourceImage = decodeGray(reference.frame) ?: return null
         val currentImage = decodeGray(current) ?: run {
             sourceImage.release()
@@ -189,6 +257,140 @@ object SurfaceTargetResolver {
             correctionM = correction,
             confidence = confidence,
         )
+    }
+
+    /**
+     * Promote a current observation only after an existing trusted view has already
+     * matched it and metric depth agrees. This creates a bounded viewpoint atlas.
+     */
+    private fun learnCurrentView(
+        sourceReference: SurfaceTargetReference,
+        current: CapturedFrame,
+        result: Result,
+    ) {
+        if (result.confidence < LEARN_MIN_CONFIDENCE ||
+            result.visualInliers < LEARN_MIN_INLIERS ||
+            result.medianReprojectionPx > LEARN_MAX_REPROJECTION_PX ||
+            result.depthSupports < LEARN_MIN_DEPTH_SUPPORTS
+        ) return
+
+        val currentReference = SurfaceTargetReference(current, result.matchedPixel.copyOf())
+        val currentKey = referenceKey(currentReference)
+        val camera = current.pose.t
+        if (camera.size < 3 || !camera.take(3).all { it.isFinite() }) return
+        val target = result.pointWorld
+        val vx = camera[0].toDouble() - target[0]
+        val vy = camera[1].toDouble() - target[1]
+        val vz = camera[2].toDouble() - target[2]
+        val range = sqrt(vx * vx + vy * vy + vz * vz)
+        if (!range.isFinite() || range < 0.10) return
+        val dir = doubleArrayOf(vx / range, vy / range, vz / range)
+
+        synchronized(atlasLock) {
+            val sourceKey = referenceKey(sourceReference)
+            val root = aliases[sourceKey] ?: sourceKey
+            val bank = atlas.getOrPut(root) {
+                ViewBank(root).also {
+                    it.samples.addLast(ViewSample(sourceReference, null, null, Double.NaN))
+                    aliases[sourceKey] = root
+                }
+            }
+            bank.lastUsedMs = System.currentTimeMillis()
+            if (aliases[currentKey] == root || bank.samples.any { referenceKey(it.reference) == currentKey }) return
+
+            val tooSimilar = bank.samples.any { sample ->
+                val priorCamera = sample.cameraWorld ?: return@any false
+                val priorDir = sample.viewDir ?: return@any false
+                val baseline = distance(priorCamera, camera)
+                val angle = vectorAngleDeg(priorDir, dir)
+                val rangeDeltaRatio = if (sample.rangeM.isFinite() && sample.rangeM > 0.1) {
+                    abs(sample.rangeM - range) / sample.rangeM
+                } else {
+                    1.0
+                }
+                baseline < LEARN_MIN_BASELINE_M &&
+                    angle < LEARN_MIN_VIEW_ANGLE_DEG &&
+                    rangeDeltaRatio < LEARN_MIN_RANGE_DELTA_RATIO
+            }
+            if (tooSimilar) return
+
+            if (bank.samples.size >= MAX_VIEWS_PER_TARGET) {
+                // Preserve the root/tap reference and evict the oldest learned view.
+                val rootSample = bank.samples.removeFirst()
+                if (bank.samples.isNotEmpty()) {
+                    val removed = bank.samples.removeFirst()
+                    aliases.remove(referenceKey(removed.reference))
+                }
+                bank.samples.addFirst(rootSample)
+            }
+            bank.samples.addLast(
+                ViewSample(
+                    reference = currentReference,
+                    cameraWorld = camera.copyOf(3),
+                    viewDir = dir,
+                    rangeM = range,
+                ),
+            )
+            aliases[currentKey] = root
+            pruneAtlasLocked()
+        }
+    }
+
+    private fun candidateReferences(reference: SurfaceTargetReference): List<SurfaceTargetReference> {
+        synchronized(atlasLock) {
+            val key = referenceKey(reference)
+            val root = aliases[key] ?: key
+            val bank = atlas.getOrPut(root) {
+                ViewBank(root).also {
+                    it.samples.addLast(ViewSample(reference, null, null, Double.NaN))
+                    aliases[key] = root
+                }
+            }
+            bank.lastUsedMs = System.currentTimeMillis()
+
+            val all = bank.samples.toList()
+            val out = ArrayList<SurfaceTargetReference>(MAX_REFERENCE_ATTEMPTS)
+            fun addIfNew(ref: SurfaceTargetReference) {
+                val k = referenceKey(ref)
+                if (out.none { referenceKey(it) == k }) out += ref
+            }
+
+            // The reference currently owned by the AR target is usually the most
+            // recent successful view, so try it first.
+            addIfNew(reference)
+
+            // Then try the newest learned angles; they are most likely to resemble
+            // the user's current side of the target.
+            all.asReversed().take(2).forEach { addIfNew(it.reference) }
+
+            // Always retain the original tap/peer reference as an independent
+            // geometric fallback, even after the target has learned many side views.
+            all.firstOrNull()?.let { addIfNew(it.reference) }
+
+            // Fill any remaining slot with another diverse stored view.
+            for (sample in all) {
+                if (out.size >= MAX_REFERENCE_ATTEMPTS) break
+                addIfNew(sample.reference)
+            }
+            return out.take(MAX_REFERENCE_ATTEMPTS)
+        }
+    }
+
+    @Synchronized fun clearLearnedReferences() {
+        synchronized(atlasLock) {
+            atlas.clear()
+            aliases.clear()
+        }
+    }
+
+    fun forgetReference(reference: SurfaceTargetReference) {
+        synchronized(atlasLock) {
+            val key = referenceKey(reference)
+            val root = aliases[key] ?: key
+            val bank = atlas.remove(root) ?: return
+            bank.samples.forEach { aliases.remove(referenceKey(it.reference)) }
+            aliases.entries.removeIf { it.value == root }
+        }
     }
 
     /** Project a sender-world point into the exact reference frame received over P2P. */
@@ -315,6 +517,35 @@ object SurfaceTargetResolver {
         null
     }
 
+    private fun referenceKey(reference: SurfaceTargetReference): ReferenceKey {
+        val u = reference.pixel.getOrElse(0) { 0f }
+        val v = reference.pixel.getOrElse(1) { 0f }
+        return ReferenceKey(
+            timestampNs = reference.frame.timestampNs,
+            uQ = (u * REFERENCE_KEY_SUBPIXEL_SCALE).toInt(),
+            vQ = (v * REFERENCE_KEY_SUBPIXEL_SCALE).toInt(),
+        )
+    }
+
+    private fun vectorAngleDeg(a: DoubleArray, b: DoubleArray): Double {
+        if (a.size < 3 || b.size < 3) return 180.0
+        val dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).coerceIn(-1.0, 1.0)
+        return Math.toDegrees(acos(dot))
+    }
+
+    private fun pruneAtlasLocked() {
+        if (atlas.size <= MAX_TARGET_BANKS && aliases.size <= MAX_REFERENCE_ALIASES) return
+        val keep = atlas.entries.sortedByDescending { it.value.lastUsedMs }.take(MAX_TARGET_BANKS).map { it.key }.toSet()
+        val removed = atlas.keys.filter { it !in keep }
+        removed.forEach { root ->
+            atlas.remove(root)?.samples?.forEach { aliases.remove(referenceKey(it.reference)) }
+        }
+        if (aliases.size > MAX_REFERENCE_ALIASES) {
+            val validRoots = atlas.keys.toSet()
+            aliases.entries.removeIf { it.value !in validRoots }
+        }
+    }
+
     private fun invertRigid(t: DoubleArray): DoubleArray? {
         if (t.size < 16 || t.take(16).any { !it.isFinite() }) return null
         val out = doubleArrayOf(
@@ -333,9 +564,9 @@ object SurfaceTargetResolver {
     }
 
     private fun distance(a: FloatArray, b: FloatArray): Float {
-        val dx = a[0] - b[0]
-        val dy = a[1] - b[1]
-        val dz = a[2] - b[2]
+        val dx = a.getOrElse(0) { 0f } - b.getOrElse(0) { 0f }
+        val dy = a.getOrElse(1) { 0f } - b.getOrElse(1) { 0f }
+        val dz = a.getOrElse(2) { 0f } - b.getOrElse(2) { 0f }
         return sqrt(dx * dx + dy * dy + dz * dz)
     }
 
@@ -364,4 +595,22 @@ object SurfaceTargetResolver {
 
     private const val MAX_CORRECTION_M = 0.65f
     private const val MIN_RESULT_CONFIDENCE = 0.18f
+
+    private const val MAX_REFERENCE_ATTEMPTS = 4
+    private const val MAX_VIEWS_PER_TARGET = 8
+    private const val MAX_TARGET_BANKS = 24
+    private const val MAX_REFERENCE_ALIASES = 256
+    private const val REFERENCE_KEY_SUBPIXEL_SCALE = 4f
+
+    private const val LEARN_MIN_CONFIDENCE = 0.25f
+    private const val LEARN_MIN_INLIERS = 9
+    private const val LEARN_MAX_REPROJECTION_PX = 2.4f
+    private const val LEARN_MIN_DEPTH_SUPPORTS = 3
+    private const val LEARN_MIN_BASELINE_M = 0.14f
+    private const val LEARN_MIN_VIEW_ANGLE_DEG = 9.0
+    private const val LEARN_MIN_RANGE_DELTA_RATIO = 0.12
+
+    private const val VERY_STRONG_REFERENCE_CONFIDENCE = 0.50f
+    private const val VERY_STRONG_REFERENCE_INLIERS = 14
+    private const val VERY_STRONG_REPROJECTION_PX = 1.4f
 }
