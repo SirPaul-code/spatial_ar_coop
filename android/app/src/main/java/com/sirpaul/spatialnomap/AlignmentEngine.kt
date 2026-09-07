@@ -103,6 +103,46 @@ object AlignmentEngine {
         }
         if (objectPoints.size < 6) return null
 
+        // FAST PATH: when BOTH phones have metric depth for the same visual
+        // features, do not unnecessarily solve a 3D->2D PnP problem first. Those
+        // paired world points directly define a shared physical frame. A robust
+        // 3D->3D rigid fit is the local, infrastructure-free equivalent of a shared
+        // visual anchor and usually converges from the first overlapping view.
+        val pairedRemoteWorld = ArrayList<FloatArray>()
+        val pairedLocalWorld = ArrayList<FloatArray>()
+        val pairedLocalImage = ArrayList<Point>()
+        for (i in objectPoints.indices) {
+            val localMetric = localMetricWorld.getOrNull(i) ?: continue
+            val remoteMetric = objectPoints[i]
+            pairedRemoteWorld += floatArrayOf(
+                remoteMetric.x.toFloat(),
+                remoteMetric.y.toFloat(),
+                remoteMetric.z.toFloat(),
+            )
+            pairedLocalWorld += floatArrayOf(
+                localMetric.x.toFloat(),
+                localMetric.y.toFloat(),
+                localMetric.z.toFloat(),
+            )
+            pairedLocalImage += imagePoints[i]
+        }
+        if (pairedRemoteWorld.size >= MIN_SHARED_ANCHOR_PAIRS) {
+            val direct = SharedVisualAnchorSolver.solve(pairedRemoteWorld, pairedLocalWorld)
+            val directResult = direct?.let {
+                sharedVisualAnchorResult(
+                    fit = it,
+                    remote = remote,
+                    local = local,
+                    remoteWorld = pairedRemoteWorld,
+                    localImage = pairedLocalImage,
+                    totalMatches = matchSet.matches.size,
+                )
+            }
+            if (directResult != null) return directResult
+        }
+
+        // FALLBACK: depth may be sparse on one phone. The original metric PnP path
+        // still works with remote 3D points and local 2D visual observations.
         val obj = MatOfPoint3f(*objectPoints.toTypedArray())
         val img = MatOfPoint2f(*imagePoints.toTypedArray())
         val k = cameraMatrix(local.intrinsics)
@@ -304,6 +344,96 @@ object AlignmentEngine {
             metricPairs = metricPairs,
             metricInliers = metricInliers,
             medianMetricResidualM = medianMetricResidual,
+        )
+    }
+
+    private fun sharedVisualAnchorResult(
+        fit: SharedVisualAnchorSolver.Fit,
+        remote: CapturedFrame,
+        local: CapturedFrame,
+        remoteWorld: List<FloatArray>,
+        localImage: List<Point>,
+        totalMatches: Int,
+    ): Result? {
+        if (fit.inlierIndices.size < MIN_SHARED_ANCHOR_INLIERS) return null
+        val transform = fit.transformLocalFromRemote
+        if (transform.size < 16 || !transform.all { it.isFinite() } || determinant3(transform) !in 0.985..1.015) {
+            return null
+        }
+
+        val cameraFromLocalWorld = invertRigid(poseMatrix(local.pose)) ?: return null
+        val reprojectionErrors = ArrayList<Double>()
+        val coveragePoints = ArrayList<Point>()
+        for (index in fit.inlierIndices) {
+            val remotePoint = remoteWorld.getOrNull(index) ?: continue
+            val imagePoint = localImage.getOrNull(index) ?: continue
+            val localPoint = transformPoint(transform, remotePoint)
+            val cameraPoint = transformPoint(
+                cameraFromLocalWorld,
+                floatArrayOf(localPoint[0].toFloat(), localPoint[1].toFloat(), localPoint[2].toFloat()),
+            )
+            val zCv = -cameraPoint[2]
+            if (!zCv.isFinite() || zCv <= 1e-4) continue
+            val u = local.intrinsics.fx * cameraPoint[0] / zCv + local.intrinsics.cx
+            val v = local.intrinsics.fy * (-cameraPoint[1]) / zCv + local.intrinsics.cy
+            val du = u - imagePoint.x
+            val dv = v - imagePoint.y
+            val error = sqrt(du * du + dv * dv)
+            if (error.isFinite()) {
+                reprojectionErrors += error
+                coveragePoints += imagePoint
+            }
+        }
+        if (reprojectionErrors.size < MIN_SHARED_ANCHOR_INLIERS) return null
+        reprojectionErrors.sort()
+        val medianReprojection = reprojectionErrors[reprojectionErrors.size / 2]
+        val coverage = imageCoverage(coveragePoints, local.intrinsics.width, local.intrinsics.height)
+        if (medianReprojection > SHARED_ANCHOR_MAX_REPROJECTION_PX || coverage < SHARED_ANCHOR_MIN_COVERAGE) {
+            return null
+        }
+
+        val gravityTilt = FusionMath.gravityTiltDeg(transform)
+        if (gravityTilt.isFinite() && gravityTilt > SHARED_ANCHOR_MAX_GRAVITY_TILT_DEG) return null
+
+        val inlierRatio = (fit.inlierIndices.size.toDouble() / remoteWorld.size).coerceIn(0.0, 1.0)
+        val support = min(1.0, fit.inlierIndices.size / 12.0)
+        val coverageFit = min(1.0, coverage / 0.12)
+        val metricFit = exp(-fit.medianResidualM / 0.10)
+        val reprojectionFit = exp(-medianReprojection / 4.5)
+        var confidence = (
+            inlierRatio *
+                (0.45 + 0.55 * support) *
+                (0.45 + 0.55 * coverageFit) *
+                metricFit *
+                reprojectionFit
+            ).coerceIn(0.0, 1.0).toFloat()
+        if (gravityTilt.isFinite()) confidence *= exp(-gravityTilt / 26.0).toFloat()
+        if (confidence < SHARED_ANCHOR_MIN_CONFIDENCE) return null
+
+        val yawPrior = FusionMath.yawPrior(remote, local)
+        val headingResidual = FusionMath.yawResidualDeg(transform, yawPrior)
+        val remoteCameraInLocal = transformPoint(transform, remote.pose.t)
+        val lc = local.pose.t
+        val dx = remoteCameraInLocal[0] - lc.getOrElse(0) { 0f }
+        val dy = remoteCameraInLocal[1] - lc.getOrElse(1) { 0f }
+        val dz = remoteCameraInLocal[2] - lc.getOrElse(2) { 0f }
+        val predictedDistance = sqrt(dx * dx + dy * dy + dz * dz)
+
+        return Result(
+            transformLocalFromRemote = transform,
+            inliers = fit.inlierIndices.size,
+            correspondences = remoteWorld.size,
+            matches = totalMatches,
+            medianReprojectionPx = medianReprojection,
+            imageCoverage = coverage,
+            predictedDeviceDistanceM = predictedDistance,
+            confidence = confidence,
+            headingResidualDeg = headingResidual,
+            sensorPriorConfidence = yawPrior?.confidence ?: 0f,
+            gravityTiltDeg = gravityTilt,
+            metricPairs = remoteWorld.size,
+            metricInliers = fit.inlierIndices.size,
+            medianMetricResidualM = fit.medianResidualM,
         )
     }
 
@@ -540,6 +670,23 @@ object AlignmentEngine {
         return Pair(translation, Math.toDegrees(acos(cosTheta)))
     }
 
+    private fun invertRigid(t: DoubleArray): DoubleArray? {
+        if (t.size < 16 || !t.take(16).all { it.isFinite() }) return null
+        val out = doubleArrayOf(
+            t[0], t[4], t[8], 0.0,
+            t[1], t[5], t[9], 0.0,
+            t[2], t[6], t[10], 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        val tx = t[3]
+        val ty = t[7]
+        val tz = t[11]
+        out[3] = -(out[0] * tx + out[1] * ty + out[2] * tz)
+        out[7] = -(out[4] * tx + out[5] * ty + out[6] * tz)
+        out[11] = -(out[8] * tx + out[9] * ty + out[10] * tz)
+        return out
+    }
+
     private fun determinant3(t: DoubleArray): Double =
         t[0] * (t[5] * t[10] - t[6] * t[9]) -
             t[1] * (t[4] * t[10] - t[6] * t[8]) +
@@ -557,6 +704,12 @@ object AlignmentEngine {
     private const val MAX_STRICT_AUGMENT = 48
     private const val METRIC_ASSOCIATION_RADIUS_PX = 10.0
     private const val LOCAL_METRIC_ASSOCIATION_RADIUS_PX = 10.0
+    private const val MIN_SHARED_ANCHOR_PAIRS = 6
+    private const val MIN_SHARED_ANCHOR_INLIERS = 8
+    private const val SHARED_ANCHOR_MAX_REPROJECTION_PX = 4.0
+    private const val SHARED_ANCHOR_MIN_COVERAGE = 0.05
+    private const val SHARED_ANCHOR_MAX_GRAVITY_TILT_DEG = 12.0
+    private const val SHARED_ANCHOR_MIN_CONFIDENCE = 0.10f
     private const val MIN_WORLD_SUPPORT_DIAMETER_M = 0.10
     private const val MIN_CHEIRALITY_RATIO = 0.92
     private const val MIN_METRIC_PAIRS_FOR_GATE = 5
