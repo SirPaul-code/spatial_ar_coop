@@ -1,0 +1,1 @@
+Hybrid stabilization target: current deterministic Wi-Fi Aware transport plus AlignmentCoordinator/ArRenderer from 1787fd38b8bc50e4b7e79dc4cb259f04bee7a2a4. See REGRESSION_NOTE_2026-09-09.md.
