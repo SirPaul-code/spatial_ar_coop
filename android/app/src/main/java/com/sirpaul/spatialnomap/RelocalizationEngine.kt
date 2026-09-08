@@ -16,6 +16,13 @@ import kotlin.math.abs
  * AlignmentEngine supplies A/B using exactly the same visual+metric validation as
  * normal registration. This makes recorded/cached room landmarks useful after an
  * ARCore world reset without any Cloud Anchor or pre-scanned external map.
+ *
+ * IMPORTANT: cached relocalization is strictly a fallback. A newly connected pair
+ * already runs the synchronized acquisition burst, and those fresh frames are the
+ * lowest-risk/fastest path to a canonical world. Relocalization performs two full
+ * AlignmentEngine solves and shares the coordinator's single solve executor, so a
+ * stale checkpoint must never preempt or serialize the fresh burst. While either
+ * current frame still carries a live acquisition-burst id we yield immediately.
  */
 object RelocalizationEngine {
     data class Checkpoint(
@@ -36,6 +43,13 @@ object RelocalizationEngine {
         currentLocal: CapturedFrame,
         currentRemote: CapturedFrame,
     ): Result? {
+        // Fresh host-canonical acquisition always wins. AcquisitionBurstController
+        // keeps a non-zero burst id for the whole unlocked acquisition/retry cycle,
+        // including the short gap between 12-frame bursts. Returning here is cheap
+        // and prevents a cached two-solve relocalization attempt from monopolising
+        // the exact executor that must produce the first fresh room transform.
+        if (currentLocal.burstId != 0L || currentRemote.burstId != 0L) return null
+
         if (!isRigid(checkpoint.oldLocalFromOldRemote)) return null
 
         // AlignmentEngine.solve(remote, local) returns localFromRemote.
