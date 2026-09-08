@@ -216,13 +216,6 @@ class WifiAwarePeerTransport(
         scheduleFramePump()
     }
 
-    /**
-     * Reference frames that define a physical manual target must never be replaced by
-     * latest-frame backpressure. They share the control FIFO with the following POI,
-     * guaranteeing that the receiver sees the exact texture/depth frame first.
-     */
-    fun sendReferenceFrame(frame: CapturedFrame) = sendControl(WireMessage.Frame(frame))
-
     private fun scheduleFramePump() {
         if (!connected || !framePumpRunning.compareAndSet(false, true)) return
         writer.execute {
@@ -236,12 +229,8 @@ class WifiAwarePeerTransport(
         }
     }
 
-    fun sendPoi(
-        id: Long,
-        owner: String,
-        pointWorld: FloatArray,
-        createdAtMs: Long = System.currentTimeMillis(),
-    ) = sendControl(WireMessage.Poi(id, owner, pointWorld.copyOf(3), createdAtMs))
+    fun sendPoi(id: Long, owner: String, pointWorld: FloatArray) =
+        sendControl(WireMessage.Poi(id, owner, pointWorld.copyOf(3), System.currentTimeMillis()))
 
     fun sendClearPoi() = sendControl(WireMessage.ClearPoi)
 
@@ -516,6 +505,9 @@ class WifiAwarePeerTransport(
             roomPeers[code] = peer
             safeCallback { callbacks.onRoomFound(room) }
 
+            // After Android/vendor NAN teardown the old PeerHandle is invalid. If
+            // the user had already selected a room, rediscovery of that same room
+            // is authoritative enough to rebuild the direct path automatically.
             if (!hostRole && roomCode.isNotBlank() && code == roomCode && !connected) {
                 currentPeer = peer
                 peerUsername = room.username
@@ -557,7 +549,10 @@ class WifiAwarePeerTransport(
                 Log.w(TAG, "JOIN retry failed", t)
             }
 
-            if (!clientConnectStarted.get() && running.get() && !connected) requestClientNetwork(peer)
+            if (!clientConnectStarted.get() && running.get() && !connected) {
+                requestClientNetwork(peer)
+            }
+
             if (running.get() && !connected) {
                 main.postDelayed(this, if (joinAttempt < 8) 700L else 1200L)
             }
@@ -611,8 +606,11 @@ class WifiAwarePeerTransport(
         hostModeStartedAtMs = SystemClock.elapsedRealtime()
 
         try {
-            val specBuilder = if (useAnyPeer) WifiAwareNetworkSpecifier.Builder(publish)
-            else WifiAwareNetworkSpecifier.Builder(publish, peer ?: return)
+            val specBuilder = if (useAnyPeer) {
+                WifiAwareNetworkSpecifier.Builder(publish)
+            } else {
+                WifiAwareNetworkSpecifier.Builder(publish, peer ?: return)
+            }
             val spec = specBuilder
                 .setPskPassphrase(psk(roomCode))
                 .setPort(ss.localPort)
@@ -645,7 +643,9 @@ class WifiAwarePeerTransport(
                         cleanupDataPath()
                         armHostResponder(preferAnyPeer = false, peer = knownPeer)
                         announceNdp(knownPeer)
-                    } else recoverDataPath("Host Wi-Fi Aware data path unavailable", epoch)
+                    } else {
+                        recoverDataPath("Host Wi-Fi Aware data path unavailable", epoch)
+                    }
                 }
             }
 
@@ -659,7 +659,9 @@ class WifiAwarePeerTransport(
                 cleanupDataPath()
                 status("Modern host responder rejected — using peer-specific fallback…")
                 armHostResponder(preferAnyPeer = false, peer = peer)
-            } else recoverDataPath("Host data path failed: ${errorText(t)}", epoch)
+            } else {
+                recoverDataPath("Host data path failed: ${errorText(t)}", epoch)
+            }
         }
     }
 
@@ -675,7 +677,9 @@ class WifiAwarePeerTransport(
             } catch (t: Throwable) {
                 if (isCurrentEpoch(epoch)) {
                     hostAcceptStarted.set(false)
-                    if (running.get() && !connected) main.post { recoverDataPath("Host socket failed: ${errorText(t)}", epoch) }
+                    if (running.get() && !connected) {
+                        main.post { recoverDataPath("Host socket failed: ${errorText(t)}", epoch) }
+                    }
                 }
             }
         }
@@ -699,8 +703,11 @@ class WifiAwarePeerTransport(
         if (!running.get() || connected || hostRole) return
         val now = SystemClock.elapsedRealtime()
         if (clientConnectStarted.get()) {
-            if (networkRequestedAtMs > 0L && now - networkRequestedAtMs > NDP_REQUEST_TIMEOUT_MS) cleanupDataPath()
-            else return
+            if (networkRequestedAtMs > 0L && now - networkRequestedAtMs > NDP_REQUEST_TIMEOUT_MS) {
+                cleanupDataPath()
+            } else {
+                return
+            }
         }
         if (!clientConnectStarted.compareAndSet(false, true)) return
 
@@ -830,7 +837,9 @@ class WifiAwarePeerTransport(
                     else -> safeCallback { callbacks.onWireMessage(message) }
                 }
             }
-            if (running.get() && connected && socket === s && isCurrentEpoch(epoch)) recoverDataPath("Peer socket closed", epoch)
+            if (running.get() && connected && socket === s && isCurrentEpoch(epoch)) {
+                recoverDataPath("Peer socket closed", epoch)
+            }
         } catch (t: Throwable) {
             if (running.get() && connected && socket === s && isCurrentEpoch(epoch)) {
                 Log.e(TAG, "Peer read loop failed", t)
@@ -885,6 +894,9 @@ class WifiAwarePeerTransport(
         if (wasConnected) safeCallback { callbacks.onDisconnected(reason) }
         dataPathRecoveryCount += 1
 
+        // PeerHandles belong to an Aware discovery session. After several failed
+        // NDP rebuilds, stop trusting the old handle and obtain a fresh attach +
+        // discovery session instead of looping forever on vendor framework state.
         if (dataPathRecoveryCount >= MAX_DATAPATH_RECOVERIES_BEFORE_REATTACH) {
             recoverAwareSession("$reason — refreshing nearby session")
             return
@@ -902,10 +914,17 @@ class WifiAwarePeerTransport(
             } else if (peer != null) {
                 requestClientNetwork(peer)
                 scheduleJoinHandshake(0L)
-            } else recoverAwareSession("Nearby peer handle expired")
+            } else {
+                recoverAwareSession("Nearby peer handle expired")
+            }
         }, RECOVERY_DELAY_MS)
     }
 
+    /**
+     * Full discovery-layer recovery. Room identity and host/client role survive;
+     * transient PeerHandles and NDP callbacks do not. On the client, rediscovering
+     * the already-selected room auto-joins it again.
+     */
     @Synchronized private fun recoverAwareSession(reason: String) {
         if (!running.get()) return
         val wasConnected = connected
@@ -957,7 +976,9 @@ class WifiAwarePeerTransport(
                         allowRanging = capabilities().rttAvailable,
                         allowInstant = instantAwareSupported(),
                     )
-                } else subscribe(session, allowInstant = instantAwareSupported())
+                } else {
+                    subscribe(session, allowInstant = instantAwareSupported())
+                }
             }
         }
     }
@@ -998,6 +1019,9 @@ class WifiAwarePeerTransport(
                     val error = "framework code $code"
                     if (error != lastRangingError) {
                         lastRangingError = error
+                        // RTT is optional. Avoid words such as "failed" or
+                        // "unavailable" so the product UI does not present an RF
+                        // ranging limitation as a broken P2P connection.
                         status("RTT optional • $error • visual alignment continues")
                     }
                 }
@@ -1028,16 +1052,23 @@ class WifiAwarePeerTransport(
 
     private fun instantAwareSupported(): Boolean {
         if (Build.VERSION.SDK_INT < 31) return false
-        return runCatching { aware?.characteristics?.isInstantCommunicationModeSupported == true }.getOrDefault(false)
+        return runCatching { aware?.characteristics?.isInstantCommunicationModeSupported == true }
+            .getOrDefault(false)
     }
 
     private fun missingPeerPermissions(): List<String> {
         val missing = ArrayList<String>(3)
         if (Build.VERSION.SDK_INT >= 33 &&
             context.checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED
-        ) missing += "Nearby Wi-Fi devices"
-        if (context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) missing += "Location"
-        if (context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) missing += "Precise location"
+        ) {
+            missing += "Nearby Wi-Fi devices"
+        }
+        if (context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            missing += "Location"
+        }
+        if (context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            missing += "Precise location"
+        }
         return missing
     }
 
