@@ -14,13 +14,18 @@ import java.util.Locale
  * The phones do not need synchronised monotonic clocks: sequence numbers are local
  * relative indices and the coordinator strongly prefers equal/adjacent sequence
  * frames while its existing relative-recency pairing remains a fallback.
+ *
+ * Fresh acquisition is intentionally aggressive: if the first 12-frame burst does
+ * not produce LOCKED, another burst starts after a short quiet gap rather than
+ * leaving the user in ALIGNING for many seconds. The burst id remains stable, while
+ * sequence numbers restart from zero on each retry.
  */
 object AcquisitionBurstController {
     data class Tag(val burstId: Long = 0L, val sequence: Int = -1, val progress: Float = 0f)
 
     private const val BURST_FRAMES = 12
     private const val BURST_INTERVAL_NS = 250_000_000L
-    private const val RETRY_AFTER_NS = 5_000_000_000L
+    private const val RETRY_AFTER_NS = 1_500_000_000L
 
     private var localIdentity = ""
     private var peerIdentity = ""
