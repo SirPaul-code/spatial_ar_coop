@@ -8,25 +8,37 @@ This file is the authoritative delta after the older 0.7 handoff. The code remai
 
 Working branch: `fresh/no-map-runtime-poc`.
 
-Latest runtime commit before this documentation update:
+Latest runtime sequence before this documentation update:
 
-`77402f00f60ac30a4fc6b1fb2114a7d6a88d00ad`
+- `a66ee0fa69fd9393572669ee045cce728ba883f4` — `fix: keep cached relocalization off the fresh lock path`
+- `73bf37c21a9f8281f3a0cfb07cc471433ec3bccd` — `fix: retry fresh acquisition bursts sooner`
+- `453ae33e88cc6433a78a88d8272b5e9726770a83` — `test: keep fresh burst ahead of cached relocalization`
 
-`feat: learn multi-angle target surface views`
+The previous precision/runtime commits remain:
 
-Its parent runtime commit is:
+- `77402f00f60ac30a4fc6b1fb2114a7d6a88d00ad` — `feat: learn multi-angle target surface views`
+- `4ee42ea77f2ea1eb084e12ddbf05fecabe635530` — `fix: continuously verify world and surface-locked POIs`
 
-`4ee42ea77f2ea1eb084e12ddbf05fecabe635530`
-
-`fix: continuously verify world and surface-locked POIs`
-
-GitHub Actions run `34159766840` / run number `438` completed successfully for `77402f00...`; tests, lint, debug/release APKs, signing and publish all passed. `latest-dev` was verified targeting `77402f00...` before this docs-only update.
+The fresh-lock regression fix intentionally changes startup scheduling, not solver thresholds. Preserve it unless hardware evidence proves a better architecture.
 
 ## Latest physical feedback
 
-The user reports that startup shared-world acquisition is now excellent: the two phones typically reach `LOCKED` in only a few seconds. Do not regress this by reintroducing double-solve handshakes or by making client adoption depend on an independent full solve.
+Two distinct pieces of hardware feedback matter:
 
-The remaining observed weakness is target/world precision over time and viewpoint changes: a manual marker can sometimes appear offset from the exact physical texture/surface on one phone, or relative drift can accumulate between the phones. The current architecture now attacks both failure modes separately.
+1. Before the latest precision/surface batch, startup shared-world acquisition had become excellent: the two phones commonly reached `LOCKED` in only a few seconds.
+2. After repeated successful sessions and newer builds, the user observed a regression where both phones again remained in `ALIGNING` for a long time.
+
+The important diagnosis is that a successful previous session creates a persisted `SharedLandmarkCache`. On later starts, `AlignmentCoordinator.maybeRelocalize()` could begin after roughly 900 ms and grab the same single `solving` guard / single-thread solve executor used by the fresh host-canonical acquisition path. `RelocalizationEngine.relocalize()` performs two full `AlignmentEngine.solve()` calls. A stale or expensive cached checkpoint could therefore serialize/starve the synchronized fresh burst even though both local ARCore sessions were already TRACKING.
+
+The fix is fail-safe and scheduling-oriented:
+
+- any current frame carrying a non-zero acquisition `burstId` makes `RelocalizationEngine.relocalize()` yield immediately;
+- fresh synchronized host-canonical acquisition always gets first use of the expensive solver;
+- cached relocalization remains a fallback concept, but it must never compete with the initial fresh burst;
+- acquisition retry quiet time was shortened from 5.0 s to 1.5 s, so a failed first 12-frame burst retries much sooner;
+- a unit test guards the rule that an active fresh burst short-circuits cached relocalization before touching the expensive visual solver.
+
+Do not “fix” this regression by loosening visual/depth gates. The failure was scheduling/resource contention, not evidence that the spatial thresholds were too strict.
 
 ## 1. Continuous post-lock shared-world verification
 
@@ -141,7 +153,7 @@ Do not rebuild these from scratch:
 - range/gravity sanity checks;
 - alignment flight recorder (`events.ndjson`, `quality.ndjson`, `frames.spv6`);
 - recorded replay tooling;
-- cached visual relocalization;
+- cached visual relocalization, now strictly subordinate to fresh acquisition;
 - multi-target static POIs;
 - automatic car recognition/tracking;
 - V6 dynamic-target protocol;
@@ -152,9 +164,19 @@ The live physical transport is still one active peer/socket per app instance eve
 
 ## 6. Immediate validation priority
 
-Use the same V6 release on both phones and preserve the now-good startup lock behavior.
+Use the same V6 release on both phones.
 
-For manual POI testing:
+### Startup regression test
+
+1. Start both apps and let both local ARCore sessions reach `TRACKING`.
+2. CREATE/JOIN the same room while both cameras see the same textured area.
+3. Fresh synchronized acquisition must get priority over any persisted landmark cache.
+4. Expect `LOCKED` in the same few-second regime as the previously good build.
+5. Repeat several disconnect/reconnect cycles specifically because the regression was most plausible after a successful session had already persisted a cache.
+6. If a retry is needed, the next acquisition burst should begin about 1.5 s after the 12-frame burst ends rather than waiting 5 s.
+7. If it still remains `ALIGNING` for >10–15 s, pull `quality.ndjson`, `events.ndjson`, and `frames.spv6` and identify the exact blocker before another algorithm change.
+
+### Manual POI test
 
 1. lock both phones;
 2. place a marker on a distinctive physical texture with usable depth;
