@@ -15,6 +15,8 @@ Read `docs/AGENT_CONTEXT.md` before changing this repository, then read `docs/AG
 - Keep all product UI text in English.
 - Wire protocol is currently V6; both phones must run the same build.
 - Host-first canonical alignment, peer bootstrap, synchronized acquisition bursts, range/gravity sanity, and fail-closed placement are intentional. Do not replace them with blind threshold relaxation.
+- Fresh synchronized acquisition has absolute startup priority over cached relocalization. While current frames carry a non-zero acquisition `burstId`, cached relocalization must yield immediately and must not occupy the shared solve executor.
+- Failed acquisition bursts retry quickly; do not restore the old long 5 s post-burst wait without hardware evidence.
 - Post-lock room refinement is host-authoritative and deliberately strict; per-target surface correction is a separate, more specific correction layer.
 - Physical alignment failures must be diagnosed from `quality.ndjson`, `events.ndjson`, and replayable `frames.spv6` before changing gates.
 - The `WORLD` view must visualize real current shared-world data; do not fake/pre-bake its map or actor positions.
@@ -22,4 +24,12 @@ Read `docs/AGENT_CONTEXT.md` before changing this repository, then read `docs/AG
 - Do not claim CI/release is ready until the final GitHub Action succeeds and `latest-dev` targets the final branch HEAD.
 - After substantial architecture changes, update the continuation context.
 
-Latest runtime commit before the current documentation-only handoff commits: `77402f00f60ac30a4fc6b1fb2114a7d6a88d00ad` (`feat: learn multi-angle target surface views`). Its parent `4ee42ea77f2ea1eb084e12ddbf05fecabe635530` adds strict continuous shared-world verification and per-target visual+metric surface locking. CI run 438 passed and `latest-dev` was verified on `77402f00...` before the docs-only context refresh. Always inspect current branch HEAD and current release because documentation commits make HEAD newer without changing runtime behavior.
+Latest runtime sequence before the current documentation-only handoff commits:
+
+- `a66ee0fa69fd9393572669ee045cce728ba883f4` — cached relocalization yields to fresh acquisition bursts.
+- `73bf37c21a9f8281f3a0cfb07cc471433ec3bccd` — acquisition retry quiet time reduced from 5.0 s to 1.5 s.
+- `453ae33e88cc6433a78a88d8272b5e9726770a83` — regression test protecting fresh-burst priority.
+
+Previous precision runtime remains `77402f00f60ac30a4fc6b1fb2114a7d6a88d00ad` (multi-angle target surface views) on top of `4ee42ea77f2ea1eb084e12ddbf05fecabe635530` (continuous shared-world verification + per-target visual/metric surface locking).
+
+The latest physical regression was startup getting stuck in `ALIGNING` after earlier fast locks. Treat persisted landmark-cache relocalization competing with the single fresh-solve executor as the known regression class; do not loosen spatial gates first. Always inspect current branch HEAD and current release because documentation commits make HEAD newer without changing runtime behavior.
