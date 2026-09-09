@@ -265,6 +265,11 @@ class ArRenderer(
         val metricDistance = metricWorld?.let { pointDistance(cameraWorld, it) }
         val depthTolerance = metricDistance?.let { max(TAP_DEPTH_MIN_TOLERANCE_M, it * TAP_DEPTH_TOLERANCE_RATIO) }
 
+        // A tracked ARCore surface is authoritative for manual placement. CPU depth is
+        // useful corroboration, but a reflective/low-confidence depth sample must never
+        // veto a valid nearby plane/feature hit and push the POI tens of metres down the
+        // same camera ray. This was exactly the failure mode behind visually-correct
+        // local markers reporting ~15-20 m and exploding after the cross-device SE(3).
         var bestHit: HitResult? = null
         var bestScore = Float.POSITIVE_INFINITY
         for (hit in frame.hitTest(tap[0], tap[1])) {
@@ -279,17 +284,21 @@ class ArRenderer(
 
             val hitPoint = hit.hitPose.translation
             val hitDistance = pointDistance(cameraWorld, hitPoint)
-            if (!hitDistance.isFinite() || hitDistance > MAX_POI_DISTANCE_M) continue
+            if (!hitDistance.isFinite() || hitDistance < MIN_POI_DISTANCE_M || hitDistance > MAX_POI_DISTANCE_M) continue
+            if (trackable is DepthPoint && hitDistance > MAX_UNCORROBORATED_DEPTH_DISTANCE_M) continue
 
             val disagreement = metricWorld?.let { pointDistance(it, hitPoint) }
-            if (disagreement != null && depthTolerance != null && disagreement > depthTolerance) continue
-
+            val metricConsistent = disagreement != null && depthTolerance != null && disagreement <= depthTolerance
             val typePenalty = when (trackable) {
-                is DepthPoint -> 0f
-                is Plane -> 0.02f
-                else -> 0.04f
+                is Plane -> 0f
+                is Point -> 0.08f
+                is DepthPoint -> 0.16f
+                else -> 0.25f
             }
-            val score = (disagreement ?: 0f) + typePenalty + hitDistance * 0.0005f
+            // Distance dominates the ordering. Metric agreement is only a small bonus,
+            // never a hard gate; this ensures a 1.2 m tracked wall beats a bogus 15 m
+            // depth sample every time.
+            val score = hitDistance + typePenalty - if (metricConsistent) METRIC_HIT_BONUS_M else 0f
             if (score < bestScore) {
                 bestScore = score
                 bestHit = hit
@@ -297,14 +306,17 @@ class ArRenderer(
         }
 
         var newAnchor = bestHit?.let { runCatching { it.createAnchor() }.getOrNull() }
+        // Depth-only fallback is deliberately near-field. Far depth without a tracked
+        // ARCore surface is not trustworthy enough for a shared manual POI because a
+        // tiny angular registration error becomes metres of remote displacement.
         if (newAnchor == null && metricWorld != null && metricDistance != null &&
-            metricDistance.isFinite() && metricDistance <= MAX_POI_DISTANCE_M
+            metricDistance.isFinite() && metricDistance in MIN_POI_DISTANCE_M..MAX_METRIC_ONLY_POI_DISTANCE_M
         ) {
             newAnchor = runCatching { session.createAnchor(Pose.makeTranslation(metricWorld)) }.getOrNull()
         }
 
         if (newAnchor == null) {
-            status("No corroborated metric surface at the tap. Move slightly and tap again.")
+            status("No reliable tracked surface at the tap. Move slightly and tap again.")
             return
         }
 
@@ -824,7 +836,11 @@ class ArRenderer(
     companion object {
         private const val TAP_DEPTH_MIN_TOLERANCE_M = 0.18f
         private const val TAP_DEPTH_TOLERANCE_RATIO = 0.06f
+        private const val MIN_POI_DISTANCE_M = 0.08f
         private const val MAX_POI_DISTANCE_M = 30f
+        private const val MAX_UNCORROBORATED_DEPTH_DISTANCE_M = 8f
+        private const val MAX_METRIC_ONLY_POI_DISTANCE_M = 8f
+        private const val METRIC_HIT_BONUS_M = 0.12f
         private const val SYNC_HINT_INTERVAL_MS = 9000L
 
         private const val SURFACE_REFERENCE_MAX_WIDTH = 1440

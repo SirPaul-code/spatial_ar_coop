@@ -79,7 +79,7 @@ class MainActivity : Activity(),
     private var activeCameraIndex = -1
     private var activeRoomCode: String? = null
     private var bannerSerial = 0L
-    private var lastRemotePoiBannerId = Long.MIN_VALUE
+    private val announcedRemotePoiIds = LinkedHashSet<Long>()
     private var lastTransportError = ""
     private var lastArError = ""
     private var lastBleStatus = ""
@@ -389,7 +389,7 @@ class MainActivity : Activity(),
             haptic()
             coordinator.clearPoi(true)
             renderer.clearTargets()
-            lastRemotePoiBannerId = Long.MIN_VALUE
+            announcedRemotePoiIds.clear()
             showBanner("POI cleared", "Removed from both devices")
         }
     }
@@ -973,7 +973,7 @@ class MainActivity : Activity(),
             peerConnectedOnce = false
             coordinator.onDisconnected()
             renderer.clearTargets()
-            lastRemotePoiBannerId = Long.MIN_VALUE
+            announcedRemotePoiIds.clear()
             clearButton.visibility = View.GONE
             transportPill.text = activeRoomCode?.let { "OFFLINE • $it" } ?: "OFFLINE"
             transportPill.background = rounded(0xc91b2025.toInt(), 18f)
@@ -1074,8 +1074,8 @@ class MainActivity : Activity(),
     override fun onRemotePoi(id: Long, pointLocal: FloatArray?, owner: String, confidence: Float) {
         runOnUiThread {
             renderer.setRemoteTarget(id, pointLocal, owner, confidence)
-            if (pointLocal != null && id != lastRemotePoiBannerId) {
-                lastRemotePoiBannerId = id
+            val shouldAnnounce = pointLocal != null && announcedRemotePoiIds.add(id)
+            if (shouldAnnounce) {
                 haptic()
                 showBanner("POI added from $owner", "Follow the edge arrow until the marker enters view")
             }
@@ -1084,7 +1084,7 @@ class MainActivity : Activity(),
 
     override fun onPoiCleared() {
         runOnUiThread {
-            lastRemotePoiBannerId = Long.MIN_VALUE
+            announcedRemotePoiIds.clear()
             renderer.clearTargets()
         }
     }
@@ -1137,7 +1137,8 @@ class MainActivity : Activity(),
                         3600L,
                     )
                 }
-                text.startsWith("No reliable metric depth") || text.startsWith("No corroborated metric surface") -> {
+                text.startsWith("No reliable metric depth") || text.startsWith("No corroborated metric surface") ||
+                    text.startsWith("No reliable tracked surface") -> {
                     showBanner("Move slightly", "Keep the surface in view for a moment, then tap again.", 3600L)
                 }
                 text == "POI sent" -> showBanner("POI shared", "Pinned locally and visible on the connected phone", 2200L)
