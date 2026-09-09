@@ -20,7 +20,7 @@ The false-lock hardening immediately below it includes:
 - no `SYNCING` banner when there is no DIRECT peer;
 - WORLD/Bird's Eye no longer exposes remote geometry from an unverified transform proposal.
 
-Important latest bug fix: a spatial `ResetAlignment` is **not** a transport disconnect. `WorldVizBus` previously called `AcquisitionBurstController.reset()` after the coordinator had called `reacquire()`, erasing the peer identities and killing the fresh burst. It now keeps the DIRECT connection state and calls/permits reacquisition instead.
+Important latest bug fix: a spatial `ResetAlignment` is **not** a transport disconnect. `WorldVizBus` previously called `AcquisitionBurstController.reset()` after the coordinator had called `reacquire()`, erasing the peer identities and killing the fresh burst. It now retains the live DIRECT connection's acquisition identity and restarts acquisition instead.
 
 Current priorities:
 
@@ -30,4 +30,4 @@ Current priorities:
 4. revoke contradicted locks instead of continuously moving/refining them;
 5. physically validate A->B and B->A cross-device POI accuracy before restoring surface/multi-angle refinement.
 
-Do not use temporary route/no-op marker files as project context. They are not architecture documentation.
+The next agent must inspect branch HEAD and `latest-dev` because docs-only commits are expected to sit above the runtime-code SHA.
