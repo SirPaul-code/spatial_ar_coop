@@ -2,7 +2,7 @@
 
 Active branch for this product: `showme/local-assist`.
 
-Read `showme/AGENT_CONTEXT.md`, then `showme/README.md` and `showme/PROTOCOL.md` before changing code. `docs/CURRENT_RUNTIME.md` and `docs/AGENT_CONTEXT.md` describe the underlying Spatial Sync baseline, not this application's lifecycle.
+Read `showme/BUILD_STATUS.md` first for the exact tested runtime, deliverable artifact, and unresolved release-publication permission issue. Then read `showme/AGENT_CONTEXT.md`, `showme/README.md` and `showme/PROTOCOL.md` before changing code. `docs/CURRENT_RUNTIME.md` and `docs/AGENT_CONTEXT.md` describe the underlying Spatial Sync baseline, not this application's lifecycle.
 
 ## Protected boundaries
 
