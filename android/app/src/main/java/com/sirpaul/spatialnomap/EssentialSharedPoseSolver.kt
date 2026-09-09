@@ -6,23 +6,18 @@ import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Fast visual shared-world bootstrap.
- *
- * SIFT gives 2D<->2D correspondences even when ARCore metric support is sparse at
- * the exact keypoint. An essential matrix recovers relative camera rotation and
- * translation direction from those visual matches. Only a few matched metric
- * supports are then needed to recover translation scale in metres.
- *
- * This is deliberately complementary to SharedVisualAnchorSolver:
- *  - dense metric support -> direct robust 3D<->3D fit
- *  - sparse metric support -> essential pose + metric scale
- *  - both fail -> existing 3D->2D PnP fallback
+ * Visual fallback for shared-world bootstrap when the direct metric 3D<->3D path
+ * cannot be formed. Essential geometry is deliberately treated as a fallback, not
+ * as permission to lock from a tiny baseline: translation direction becomes poorly
+ * conditioned when two phones are almost colocated, so metric scale needs several
+ * independent depth correspondences and a meaningful camera baseline.
  */
 object EssentialSharedPoseSolver {
     data class Observation(
@@ -88,7 +83,7 @@ object EssentialSharedPoseSolver {
                 Calib3d.RANSAC,
                 0.999,
                 ESSENTIAL_THRESHOLD_NORMALIZED,
-                1400,
+                1600,
                 mask,
             )
             if (essential.empty() || essential.rows() != 3 || essential.cols() != 3) return null
@@ -126,14 +121,22 @@ object EssentialSharedPoseSolver {
             if (scaleInliers.size < MIN_SCALE_PAIRS) return null
             scale = median(scaleInliers.map { it.projectedScale }.sorted())
 
+            val scaleSpread = scaleInliers.map { abs(it.projectedScale - scale) }.sorted()
+            val scaleMad = median(scaleSpread)
+            if (!scaleMad.isFinite() || scaleMad > max(MAX_SCALE_MAD_MIN_M, scale * MAX_SCALE_MAD_RATIO)) return null
+
             val metricResiduals = scaleInliers.map { pair ->
                 metricResidual(pair.remoteCv, pair.localCv, r, tUnit, scale)
             }.filter { it.isFinite() }.sorted()
             if (metricResiduals.size < MIN_SCALE_PAIRS) return null
             val medianMetricResidual = median(metricResiduals)
-            if (medianMetricResidual > MAX_MEDIAN_METRIC_RESIDUAL_M) return null
+            if (!medianMetricResidual.isFinite() || medianMetricResidual > MAX_MEDIAN_METRIC_RESIDUAL_M) return null
             val metricInliers = metricResiduals.count { it <= METRIC_RESIDUAL_INLIER_M }
-            if (metricResiduals.size >= 4 && metricInliers < max(3, (metricResiduals.size * 0.60).toInt())) return null
+            val requiredMetricInliers = max(
+                MIN_METRIC_INLIERS,
+                ceil(metricResiduals.size * MIN_METRIC_INLIER_RATIO).toInt(),
+            )
+            if (metricInliers < requiredMetricInliers) return null
 
             val cvLocalFromRemote = doubleArrayOf(
                 r[0], r[1], r[2], tUnit[0] * scale,
@@ -189,11 +192,9 @@ object EssentialSharedPoseSolver {
             val inlierRatio = inlierIndices.size.toDouble() / observations.size
             val visualSupport = min(1.0, inlierIndices.size / 24.0)
             val coverageFit = min(1.0, coverage / 0.14)
-            val epipolarFit = exp(-medianEpipolarPx / 3.2)
-            val metricFit = exp(-medianMetricResidual / 0.18)
-            val scaleSpread = scaleInliers.map { abs(it.projectedScale - scale) }.sorted()
-            val scaleMad = median(scaleSpread)
-            val scaleFit = exp(-scaleMad / max(0.10, scale * 0.22))
+            val epipolarFit = exp(-medianEpipolarPx / 3.0)
+            val metricFit = exp(-medianMetricResidual / 0.14)
+            val scaleFit = exp(-scaleMad / max(0.08, scale * 0.18))
             var confidence = (
                 inlierRatio *
                     (0.42 + 0.58 * visualSupport) *
@@ -413,7 +414,7 @@ object EssentialSharedPoseSolver {
         val det = t[0] * (t[5] * t[10] - t[6] * t[9]) -
             t[1] * (t[4] * t[10] - t[6] * t[8]) +
             t[2] * (t[4] * t[9] - t[5] * t[8])
-        return det in 0.97..1.03 && abs(t[15] - 1.0) < 1e-4
+        return det in 0.985..1.015 && abs(t[15] - 1.0) < 1e-4
     }
 
     private fun imageCoverage(points: List<Point>, width: Int, height: Int): Double {
@@ -435,20 +436,27 @@ object EssentialSharedPoseSolver {
     private fun median(values: List<Double>): Double =
         if (values.isEmpty()) Double.NaN else values[values.size / 2]
 
-    private const val MIN_VISUAL_MATCHES = 12
-    private const val MIN_VISUAL_INLIERS = 10
-    private const val ESSENTIAL_THRESHOLD_NORMALIZED = 0.0035
-    private const val MAX_MEDIAN_EPIPOLAR_PX = 3.5
-    private const val MIN_IMAGE_COVERAGE = 0.045
-    private const val METRIC_SEARCH_RADIUS_PX = 22.0
-    private const val MIN_SCALE_PAIRS = 2
-    private const val MIN_BASELINE_M = 0.05
-    private const val MAX_BASELINE_M = 12.0
-    private const val MIN_SCALE_TOLERANCE_M = 0.20
-    private const val SCALE_TOLERANCE_RATIO = 0.28
-    private const val MAX_SCALE_PAIR_PERP_M = 0.45
-    private const val METRIC_RESIDUAL_INLIER_M = 0.28
-    private const val MAX_MEDIAN_METRIC_RESIDUAL_M = 0.24
-    private const val MAX_GRAVITY_TILT_DEG = 12.0
-    private const val MIN_CONFIDENCE = 0.10f
+    private const val MIN_VISUAL_MATCHES = 14
+    private const val MIN_VISUAL_INLIERS = 12
+    private const val ESSENTIAL_THRESHOLD_NORMALIZED = 0.0030
+    private const val MAX_MEDIAN_EPIPOLAR_PX = 3.0
+    private const val MIN_IMAGE_COVERAGE = 0.05
+    private const val METRIC_SEARCH_RADIUS_PX = 14.0
+    private const val MIN_SCALE_PAIRS = 6
+    private const val MIN_METRIC_INLIERS = 5
+    private const val MIN_METRIC_INLIER_RATIO = 0.70
+
+    // Essential translation is unreliable at near-zero baseline. Phones closer than
+    // this must use the direct metric 3D<->3D path instead of guessing a direction.
+    private const val MIN_BASELINE_M = 0.20
+    private const val MAX_BASELINE_M = 10.0
+    private const val MIN_SCALE_TOLERANCE_M = 0.10
+    private const val SCALE_TOLERANCE_RATIO = 0.20
+    private const val MAX_SCALE_MAD_MIN_M = 0.08
+    private const val MAX_SCALE_MAD_RATIO = 0.18
+    private const val MAX_SCALE_PAIR_PERP_M = 0.28
+    private const val METRIC_RESIDUAL_INLIER_M = 0.18
+    private const val MAX_MEDIAN_METRIC_RESIDUAL_M = 0.16
+    private const val MAX_GRAVITY_TILT_DEG = 10.0
+    private const val MIN_CONFIDENCE = 0.12f
 }
