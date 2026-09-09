@@ -1,0 +1,92 @@
+name: showme-local-ci
+on:
+  push:
+    branches: ['showme/local-assist']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: showme-local-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Protect existing spatial runtime
+        run: git diff --exit-code a5970e9be7fef9434dbf2e681274dc56c9462fe4 HEAD -- android/ .github/workflows/ci.yml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Browser protocol tests
+        working-directory: showme/web
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+          npx playwright install --with-deps chromium
+          npm run test:browser
+      - name: Browser reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showme-browser-reports
+          path: |
+            showme/web/playwright-report/
+            showme/web/test-results/
+            showme/web/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Android SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Tests, lint and APKs
+        working-directory: showme/android
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x ../../android/gradlew
+          ../../android/gradlew --no-daemon testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease 2>&1 | tee ../../showme-build.log
+      - name: Build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showme-android-reports
+          path: |
+            showme-build.log
+            showme/android/app/build/reports/
+            showme/android/app/build/test-results/
+            showme/android/spatial/build/reports/
+      - name: Verify signatures and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp showme/android/app/build/outputs/apk/release/app-release.apk ShowMe-local-release.apk
+          cp showme/android/app/build/outputs/apk/debug/app-debug.apk ShowMe-local-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs ShowMe-local-release.apk | tee ShowMe-signature.txt
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs ShowMe-local-debug.apk >> ShowMe-signature.txt
+          sha256sum ShowMe-local-release.apk ShowMe-local-debug.apk > ShowMe-SHA256SUMS.txt
+          git archive --format=zip HEAD showme/ > ShowMe-source.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: showme-local-apks
+          path: |
+            ShowMe-local-release.apk
+            ShowMe-local-debug.apk
+            ShowMe-SHA256SUMS.txt
+            ShowMe-signature.txt
+            ShowMe-source.zip
+      - name: Publish separate local preview
+        if: github.ref == 'refs/heads/showme/local-assist'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="showme-local-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          printf 'ShowMe local Wi-Fi/hotspot preview from `%s`.\n\nSeparate app ID: `com.sirpaul.showme`. No change to Spatial Sync latest-dev.\n\nCamera-owner Android app and browser annotations; read `showme/README.md`. Internet sessions/accounts/billing are not deployed. Browser microphone needs HTTPS; LAN HTTP uses listen-only audio when supported. Development sideload certificate, NOT production signing.\n\nAutomated tests/build passed. Physical camera/browser AR acceptance remains pending.\n' "$GITHUB_SHA" > ShowMe-release-notes.md
+          gh release create "$TAG" ShowMe-local-release.apk ShowMe-local-debug.apk ShowMe-SHA256SUMS.txt ShowMe-signature.txt ShowMe-source.zip --target "$GITHUB_SHA" --prerelease --latest=false --title "ShowMe / local preview ${GITHUB_RUN_NUMBER}" --notes-file ShowMe-release-notes.md

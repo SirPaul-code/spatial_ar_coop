@@ -1,0 +1,11 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {containRect,normalizedPoint,shapePoints,resample,decodePacket} from '../protocol.mjs';
+test('contain mapping excludes portrait letterbox',()=>{const rect={left:10,top:20,width:800,height:600};assert.equal(normalizedPoint(20,100,rect,720,1280),null);assert.deepEqual(normalizedPoint(410,320,rect,720,1280),[.5,.5]);});
+test('landscape center round trip',()=>assert.deepEqual(normalizedPoint(300,300,{left:0,top:0,width:600,height:600},1280,720),[.5,.5]));
+test('invalid dimensions rejected',()=>assert.equal(containRect(0,2,10,10),null));
+test('arrow keeps the real endpoint and bounded vertices',()=>{const p=shapePoints('arrow',[[.2,.7],[.8,.3]],720,1280);assert.deepEqual(p[0],[.2,.7]);assert.deepEqual(p[1],[.8,.3]);assert.equal(p.length,5);assert.ok(p.flat().every(n=>n>=0&&n<=1));});
+test('freehand resampling is bounded and preserves endpoints',()=>{const p=Array.from({length:200},(_,i)=>[i/199,.5]);const out=resample(p);assert.equal(out.length,64);assert.deepEqual(out[0],p[0]);assert.deepEqual(out.at(-1),p.at(-1));});
+test('circle is closed',()=>{const points=shapePoints('circle',[[.1,.2],[.9,.8]],720,1280);assert.equal(points.length,25);assert.ok(Math.hypot(points[0][0]-points.at(-1)[0],points[0][1]-points.at(-1)[1])<1e-9);});
+test('pin contains exactly one sample',()=>assert.equal(shapePoints('pin',[[.1,.2],[.3,.4]],720,1280).length,1));
+test('undersized packet rejected',()=>assert.throws(()=>decodePacket(new ArrayBuffer(2))));
+test('metadata length checked before decoding',()=>{const bytes=new ArrayBuffer(20);new DataView(bytes).setUint32(0,99999999);assert.throws(()=>decodePacket(bytes));});
+test('binary image and metadata stay in one envelope',()=>{const meta={type:'frame',frameId:'42',width:720,height:1280,annotations:[]};const h=new TextEncoder().encode(JSON.stringify(meta)),b=new Uint8Array(4+h.length+3);new DataView(b.buffer).setUint32(0,h.length);b.set(h,4);b.set([255,216,255],4+h.length);assert.equal(decodePacket(b.buffer).metadata.frameId,'42');});

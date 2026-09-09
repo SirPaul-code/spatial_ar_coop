@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0b1018"><meta name="referrer" content="no-referrer"><title>ShowMe / Visual guidance</title><link rel="stylesheet" href="/app.css"><script type="module" src="/app.mjs"></script></head>
+<body>
+<svg class="symbols" aria-hidden="true"><defs>
+<symbol id="i-pin" viewBox="0 0 24 24"><circle cx="12" cy="10" r="6"/><circle cx="12" cy="10" r="2"/><path d="M12 16v6"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 19L19 5M7 5h12v12"/></symbol>
+<symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20l1-6L16 3l5 5-11 11-6 1zM13 6l5 5"/></symbol>
+<symbol id="i-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></symbol>
+<symbol id="i-pointer" viewBox="0 0 24 24"><path d="M5 3l14 9-7 2-3 7-4-18z"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><path d="M8 5L3 10l5 5M4 10h11a6 6 0 010 12"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0014 0v-2M12 19v4M8 23h8"/></symbol>
+<symbol id="i-camera" viewBox="0 0 24 24"><path d="M3 7h5l2-3h4l2 3h5v14H3z"/><circle cx="12" cy="14" r="4"/></symbol>
+<symbol id="i-expand" viewBox="0 0 24 24"><path d="M9 3H3v6M15 3h6v6M21 15v6h-6M9 21H3v-6"/></symbol>
+</defs></svg>
+<header class="topbar"><a class="brand" href="#" aria-label="ShowMe"><span class="brand-symbol"><svg><use href="#i-pointer"/></svg></span>ShowMe<span class="brand-caption">VISUAL GUIDANCE</span></a><div class="connection"><span id="connectionDot" class="dot"></span><span id="connectionText">Not connected</span><span class="divider"></span><span id="clock">00:00</span></div></header>
+<main class="workspace">
+<section class="scene-panel" aria-label="Shared camera">
+<div class="scene-header"><div><span class="eyebrow">SHARED VIEW</span><h1>Point the way.</h1></div><span id="liveBadge" class="badge">WAITING</span></div>
+<div id="stage" class="stage"><canvas id="scene" width="720" height="1280" aria-label="Live camera image. Choose a tool and tap or draw to place an AR mark."></canvas>
+<div id="gate" class="gate"><div class="gate-orbit"><svg><use href="#i-pointer"/></svg></div><span class="eyebrow">A LITTLE GUIDANCE. A BIG DIFFERENCE.</span><h2>See what they see.<br>Show them what matters.</h2><p id="joinMessage">No app needed. Your marks will stay attached to the real world as their camera moves.</p><form id="joinForm"><label for="name">Your name</label><input id="name" value="Helper" maxlength="32" autocomplete="given-name"><button class="primary" id="joinButton" type="submit">Join camera session <span aria-hidden="true">↗</span></button></form><p class="fine-print">Local preview · Use the same Wi-Fi or hotspot.<br>The camera owner approves access before sharing.</p></div>
+<div id="sceneNotice" class="scene-notice" hidden><strong id="noticeTitle">Waiting for camera</strong><span id="noticeText">The camera owner may need to move slowly to establish tracking.</span></div>
+<div class="scene-chips"><span id="trackingChip">AR not connected</span><span id="depthChip">Depth —</span><span id="recordBadge" hidden>● RECORDING</span></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</div>
+<div class="toolbox" role="toolbar" aria-label="Annotation tools">
+<div class="toolgroup"><button class="tool selected" data-tool="pin" aria-label="Pin a point" aria-pressed="true"><svg><use href="#i-pin"/></svg><span>Pin</span></button><button class="tool" data-tool="arrow" aria-label="Draw an arrow" aria-pressed="false"><svg><use href="#i-arrow"/></svg><span>Arrow</span></button><button class="tool" data-tool="pen" aria-label="Draw a stroke" aria-pressed="false"><svg><use href="#i-pen"/></svg><span>Draw</span></button><button class="tool" data-tool="circle" aria-label="Circle an area" aria-pressed="false"><svg><use href="#i-circle"/></svg><span>Circle</span></button><button class="tool" data-tool="pointer" aria-label="Temporary pointer" aria-pressed="false"><svg><use href="#i-pointer"/></svg><span>Point</span></button></div>
+<div class="toolgroup secondary-tools"><button id="freeze" class="tool" aria-pressed="false"><svg><use href="#i-pause"/></svg><span>Freeze</span></button><button id="undo" class="tool"><svg><use href="#i-undo"/></svg><span>Undo</span></button></div>
+</div>
+<div class="scene-footer"><span id="hint">Choose a tool. Your camera owner stays in control.</span><button id="fullscreen" class="icon-button" aria-label="Expand camera view"><svg><use href="#i-expand"/></svg></button></div>
+</section>
+<aside class="side-panel">
+<section class="card"><span class="eyebrow">YOUR TOOLKIT</span><h2>Make it unmistakable.</h2><p>Tap to pin. Drag to draw. We hold the exact frame while you mark it.</p><div class="swatches" role="group" aria-label="Annotation color"><button data-color="mint" class="swatch mint selected" aria-label="Mint" aria-pressed="true"></button><button data-color="amber" class="swatch amber" aria-label="Amber" aria-pressed="false"></button><button data-color="coral" class="swatch coral" aria-label="Coral" aria-pressed="false"></button><button data-color="blue" class="swatch blue" aria-label="Blue" aria-pressed="false"></button></div><label for="markLabel">Label <span>optional</span></label><input id="markLabel" maxlength="80" placeholder="e.g. This terminal"><div class="mark-summary"><span id="markCount">0 marks</span><button id="clear" class="text-button">Clear all</button></div><div id="markList" class="mark-list"></div></section>
+<section class="card audio-card"><div class="section-title"><h2>Stay in the conversation.</h2><button id="audio" class="round-button" aria-label="Start audio"><svg><use href="#i-mic"/></svg></button></div><p id="audioHint">The owner can enable their mic. On local HTTP you can listen; talking from the browser requires HTTPS.</p></section>
+<section class="card notes-card"><span class="eyebrow">SESSION NOTES</span><div id="messages" class="messages" aria-live="polite"><p class="empty-note">A quick note can make all the difference.</p></div><form id="chatForm" class="chat-form"><input id="chat" maxlength="300" placeholder="Send a note…" aria-label="Message to camera owner"><button type="submit" class="round-button" aria-label="Send note">↗</button></form></section>
+<section class="export-row"><button id="snapshot" class="small-button"><svg><use href="#i-camera"/></svg>Snapshot</button><button id="record" class="small-button"><span class="record-dot"></span>Record view</button></section>
+<div class="session-footnote">INVITE-ONLY / LOCAL NETWORK<br><span id="sessionVersion">ShowMe 0.1 · No cloud storage</span></div>
+</aside>
+</main><audio id="remoteAudio" autoplay></audio>
+</body></html>

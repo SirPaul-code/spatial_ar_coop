@@ -1,0 +1,1 @@
+{"name":"showme-browser","private":true,"type":"module","scripts":{"test":"node --test tests/protocol.test.mjs","test:browser":"playwright test"},"devDependencies":{"@playwright/test":"1.55.0"}}
