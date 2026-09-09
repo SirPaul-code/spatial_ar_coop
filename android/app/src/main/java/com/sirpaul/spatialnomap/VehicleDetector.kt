@@ -21,32 +21,53 @@ import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
  * Local, on-device vehicle recognition for the AR camera stream.
  *
- * EfficientDet-Lite0 supplies the 2D COCO vehicle box. The same ARCore frame also
- * supplies dense metric support points, so the detector associates the box with a
- * robust 3D point in the phone's current ARCore world before anything is shared.
- * No image, model request, or inference leaves the phone at runtime.
- *
- * A constant-velocity filter is applied before the renderer receives observations.
- * The renderer still owns room track IDs; this layer only removes detector/depth
- * jitter and predicts through tiny measurement gaps so a car marker looks stable.
+ * EfficientDet-Lite0 supplies a 2D COCO vehicle box. Metric supports inside that box
+ * produce a robust world-space centroid and a horizontal oriented 3D footprint. A
+ * constant-velocity alpha-beta filter then gives the renderer a stable detector track
+ * id, position and velocity instead of a fresh anonymous point on every inference.
  */
 class VehicleDetector(context: Context) {
+    data class WorldBox(
+        val centerWorld: FloatArray,
+        /** Horizontal major axis in ARCore world coordinates. */
+        val forwardWorld: FloatArray,
+        val halfLengthM: Float,
+        val halfWidthM: Float,
+        val halfHeightM: Float,
+    )
+
     data class Vehicle(
+        /** Stable only inside this detector process; renderer maps it to a room id. */
+        val trackId: Int,
         val label: String,
         val confidence: Float,
         val pointWorld: FloatArray,
+        val velocityWorld: FloatArray,
+        val worldBox: WorldBox?,
+    )
+
+    private data class RawVehicle(
+        val label: String,
+        val confidence: Float,
+        val pointWorld: FloatArray,
+        val worldBox: WorldBox?,
     )
 
     private data class MotionTrack(
         val id: Int,
-        val label: String,
+        var label: String,
         val filter: MotionTrackFilter,
+        var worldBox: WorldBox?,
         var lastSeenMs: Long,
     )
 
@@ -94,7 +115,7 @@ class VehicleDetector(context: Context) {
                     runCatching { mpImage.close() }
                 }
 
-                val vehicles = ArrayList<Vehicle>()
+                val rawVehicles = ArrayList<RawVehicle>()
                 for (detection in result.detections()) {
                     val category = detection.categories().maxByOrNull { it.score() } ?: continue
                     val name = category.categoryName().lowercase()
@@ -106,15 +127,17 @@ class VehicleDetector(context: Context) {
                         rawHeight,
                         rotation,
                     )
-                    val point = estimateWorldPoint(rawBox, cameraWorld, metricPoints) ?: continue
-                    vehicles += Vehicle(
+                    val geometry = estimateWorldGeometry(rawBox, cameraWorld, metricPoints, name) ?: continue
+                    rawVehicles += RawVehicle(
                         label = name.uppercase(),
                         confidence = category.score(),
-                        pointWorld = point,
+                        pointWorld = geometry.centerWorld.copyOf(),
+                        worldBox = geometry,
                     )
                 }
+
                 val filtered = filterVehicleMotion(
-                    vehicles.sortedByDescending { it.confidence }.take(MAX_RESULTS),
+                    rawVehicles.sortedByDescending { it.confidence }.take(MAX_RESULTS),
                     System.currentTimeMillis(),
                 )
                 onResult(filtered)
@@ -153,7 +176,7 @@ class VehicleDetector(context: Context) {
         return ObjectDetector.createFromOptions(appContext, options)
     }
 
-    private fun filterVehicleMotion(input: List<Vehicle>, nowMs: Long): List<Vehicle> {
+    private fun filterVehicleMotion(input: List<RawVehicle>, nowMs: Long): List<Vehicle> {
         motionTracks.entries.removeIf { nowMs - it.value.lastSeenMs > FILTER_TRACK_TTL_MS }
         if (input.isEmpty()) return emptyList()
         val used = HashSet<Int>()
@@ -163,7 +186,7 @@ class VehicleDetector(context: Context) {
             var best: MotionTrack? = null
             var bestDistance = Float.POSITIVE_INFINITY
             for (track in motionTracks.values) {
-                if (track.id in used || track.label != vehicle.label) continue
+                if (track.id in used) continue
                 val predicted = track.filter.predict(nowMs)?.position ?: continue
                 val distance = pointDistance(predicted, vehicle.pointWorld)
                 if (distance < bestDistance && distance <= FILTER_ASSOCIATION_M) {
@@ -176,18 +199,62 @@ class VehicleDetector(context: Context) {
                 id = nextMotionTrackId++,
                 label = vehicle.label,
                 filter = MotionTrackFilter(alpha = 0.58f, beta = 0.20f),
+                worldBox = null,
                 lastSeenMs = nowMs,
             ).also { motionTracks[it.id] = it }
 
             val state = track.filter.update(vehicle.pointWorld, nowMs, vehicle.confidence)
+            track.label = vehicle.label
             track.lastSeenMs = nowMs
+            track.worldBox = smoothWorldBox(track.worldBox, vehicle.worldBox, state.position, state.velocity)
             used += track.id
-            out += vehicle.copy(
-                pointWorld = state.position,
+            out += Vehicle(
+                trackId = track.id,
+                label = track.label,
                 confidence = state.confidence,
+                pointWorld = state.position.copyOf(),
+                velocityWorld = state.velocity.copyOf(),
+                worldBox = track.worldBox?.copy(
+                    centerWorld = state.position.copyOf(),
+                    forwardWorld = track.worldBox!!.forwardWorld.copyOf(),
+                ),
             )
         }
         return out
+    }
+
+    private fun smoothWorldBox(
+        previous: WorldBox?,
+        observed: WorldBox?,
+        center: FloatArray,
+        velocity: FloatArray,
+    ): WorldBox? {
+        val box = observed ?: previous ?: return null
+        val observedAxis = observed?.forwardWorld ?: box.forwardWorld
+        val velocityAxis = horizontalUnit(velocity)
+        var axis = if (velocityAxis != null && horizontalSpeed(velocity) >= VELOCITY_HEADING_MIN_MPS) {
+            velocityAxis
+        } else {
+            observedAxis.copyOf()
+        }
+        val priorAxis = previous?.forwardWorld
+        if (priorAxis != null && dot3(axis, priorAxis) < 0f) axis = FloatArray(3) { -axis[it] }
+        if (priorAxis != null) {
+            axis = horizontalUnit(
+                FloatArray(3) { i -> priorAxis.getOrElse(i) { 0f } * 0.68f + axis.getOrElse(i) { 0f } * 0.32f },
+            ) ?: axis
+        }
+
+        fun smooth(old: Float?, fresh: Float): Float =
+            if (old == null || !old.isFinite()) fresh else old * 0.68f + fresh * 0.32f
+
+        return WorldBox(
+            centerWorld = center.copyOf(3),
+            forwardWorld = axis,
+            halfLengthM = smooth(previous?.halfLengthM, box.halfLengthM),
+            halfWidthM = smooth(previous?.halfWidthM, box.halfWidthM),
+            halfHeightM = smooth(previous?.halfHeightM, box.halfHeightM),
+        )
     }
 
     private fun cameraRotationDegrees(cameraId: String?, displayRotation: Int): Int {
@@ -235,15 +302,17 @@ class VehicleDetector(context: Context) {
     }
 
     /**
-     * Select a robust metric point from the central region of the detected vehicle.
-     * Median range rejects glass/background outliers; averaging the remaining world
-     * points makes the shared marker less sensitive to a single depth pixel.
+     * Build a robust metric centroid plus an oriented vehicle-sized 3D box. Depth
+     * outliers are rejected by median range first; horizontal PCA then estimates the
+     * dominant world direction. Minimum class dimensions intentionally keep sparse
+     * visible-surface depth from collapsing the box into a tiny flat patch.
      */
-    private fun estimateWorldPoint(
+    private fun estimateWorldGeometry(
         box: RectF,
         cameraWorld: FloatArray,
         metricPoints: List<FloatArray>,
-    ): FloatArray? {
+        category: String,
+    ): WorldBox? {
         if (box.width() < 4f || box.height() < 4f) return null
         val insetX = box.width() * 0.12f
         val insetY = box.height() * 0.12f
@@ -264,9 +333,7 @@ class VehicleDetector(context: Context) {
             val p = floatArrayOf(m[2], m[3], m[4])
             if (!p.all { it.isFinite() }) continue
             val d = pointDistance(cameraWorld, p)
-            if (d.isFinite() && d in MIN_VEHICLE_DISTANCE_M..MAX_VEHICLE_DISTANCE_M) {
-                supports += Support(p, d)
-            }
+            if (d.isFinite() && d in MIN_VEHICLE_DISTANCE_M..MAX_VEHICLE_DISTANCE_M) supports += Support(p, d)
         }
         if (supports.size < MIN_METRIC_SUPPORTS) return null
 
@@ -276,19 +343,98 @@ class VehicleDetector(context: Context) {
         val inliers = supports
             .filter { abs(it.distance - median) <= tolerance }
             .sortedBy { abs(it.distance - median) }
-            .take(48)
+            .take(64)
         if (inliers.size < MIN_METRIC_INLIERS) return null
 
-        val out = FloatArray(3)
+        val mean = FloatArray(3)
+        for (s in inliers) repeat(3) { i -> mean[i] += s.p[i] }
+        repeat(3) { i -> mean[i] /= inliers.size.toFloat() }
+
+        var cxx = 0.0
+        var czz = 0.0
+        var cxz = 0.0
         for (s in inliers) {
-            out[0] += s.p[0]
-            out[1] += s.p[1]
-            out[2] += s.p[2]
+            val x = (s.p[0] - mean[0]).toDouble()
+            val z = (s.p[2] - mean[2]).toDouble()
+            cxx += x * x
+            czz += z * z
+            cxz += x * z
         }
-        val divisor = inliers.size.toFloat()
-        repeat(3) { i -> out[i] = out[i] / divisor }
-        return out
+        val theta = if (cxx + czz > 1e-7) 0.5 * atan2(2.0 * cxz, cxx - czz) else 0.0
+        val forward = floatArrayOf(cos(theta).toFloat(), 0f, sin(theta).toFloat())
+        val right = floatArrayOf(-forward[2], 0f, forward[0])
+
+        val along = ArrayList<Float>(inliers.size)
+        val across = ArrayList<Float>(inliers.size)
+        val vertical = ArrayList<Float>(inliers.size)
+        for (s in inliers) {
+            val dx = s.p[0] - mean[0]
+            val dy = s.p[1] - mean[1]
+            val dz = s.p[2] - mean[2]
+            along += dx * forward[0] + dz * forward[2]
+            across += dx * right[0] + dz * right[2]
+            vertical += dy
+        }
+        along.sort()
+        across.sort()
+        vertical.sort()
+
+        val a0 = percentile(along, 0.10f)
+        val a1 = percentile(along, 0.90f)
+        val b0 = percentile(across, 0.10f)
+        val b1 = percentile(across, 0.90f)
+        val y0 = percentile(vertical, 0.10f)
+        val y1 = percentile(vertical, 0.90f)
+        val centerA = (a0 + a1) * 0.5f
+        val centerB = (b0 + b1) * 0.5f
+        val centerY = (y0 + y1) * 0.5f
+        val center = floatArrayOf(
+            mean[0] + forward[0] * centerA + right[0] * centerB,
+            mean[1] + centerY,
+            mean[2] + forward[2] * centerA + right[2] * centerB,
+        )
+
+        val dims = classDimensionBounds(category)
+        return WorldBox(
+            centerWorld = center,
+            forwardWorld = forward,
+            halfLengthM = (((a1 - a0) * 0.5f).coerceAtLeast(dims[0])).coerceAtMost(dims[3]),
+            halfWidthM = (((b1 - b0) * 0.5f).coerceAtLeast(dims[1])).coerceAtMost(dims[4]),
+            halfHeightM = (((y1 - y0) * 0.5f).coerceAtLeast(dims[2])).coerceAtMost(dims[5]),
+        )
     }
+
+    /** min L/W/H followed by max L/W/H, all half-extents. */
+    private fun classDimensionBounds(category: String): FloatArray = when (category) {
+        "bus" -> floatArrayOf(2.6f, 0.85f, 0.95f, 8.0f, 1.8f, 2.1f)
+        "truck" -> floatArrayOf(1.8f, 0.75f, 0.75f, 6.5f, 1.8f, 2.1f)
+        else -> floatArrayOf(1.25f, 0.62f, 0.52f, 3.2f, 1.45f, 1.35f)
+    }
+
+    private fun percentile(sorted: List<Float>, q: Float): Float {
+        if (sorted.isEmpty()) return 0f
+        val index = ((sorted.size - 1) * q.coerceIn(0f, 1f)).toInt().coerceIn(0, sorted.lastIndex)
+        return sorted[index]
+    }
+
+    private fun horizontalUnit(v: FloatArray): FloatArray? {
+        val x = v.getOrElse(0) { 0f }
+        val z = v.getOrElse(2) { 0f }
+        val n = sqrt(x * x + z * z)
+        if (!n.isFinite() || n < 1e-4f) return null
+        return floatArrayOf(x / n, 0f, z / n)
+    }
+
+    private fun horizontalSpeed(v: FloatArray): Float {
+        val x = v.getOrElse(0) { 0f }
+        val z = v.getOrElse(2) { 0f }
+        return sqrt(x * x + z * z).takeIf { it.isFinite() } ?: 0f
+    }
+
+    private fun dot3(a: FloatArray, b: FloatArray): Float =
+        a.getOrElse(0) { 0f } * b.getOrElse(0) { 0f } +
+            a.getOrElse(1) { 0f } * b.getOrElse(1) { 0f } +
+            a.getOrElse(2) { 0f } * b.getOrElse(2) { 0f }
 
     private fun yuv420ToBitmap(image: Image): Bitmap? {
         val width = image.width
@@ -304,9 +450,7 @@ class VehicleDetector(context: Context) {
         val y = yPlane.buffer.duplicate()
         for (row in 0 until height) {
             val rowStart = row * yPlane.rowStride
-            for (col in 0 until width) {
-                nv21[out++] = y.get(rowStart + col * yPlane.pixelStride)
-            }
+            for (col in 0 until width) nv21[out++] = y.get(rowStart + col * yPlane.pixelStride)
         }
 
         val u = uPlane.buffer.duplicate()
@@ -337,11 +481,10 @@ class VehicleDetector(context: Context) {
         return sqrt(dx * dx + dy * dy + dz * dz)
     }
 
-    private fun errorText(t: Throwable): String =
-        buildString {
-            append(t.javaClass.simpleName)
-            t.message?.takeIf { it.isNotBlank() }?.let { append(": ").append(it) }
-        }
+    private fun errorText(t: Throwable): String = buildString {
+        append(t.javaClass.simpleName)
+        t.message?.takeIf { it.isNotBlank() }?.let { append(": ").append(it) }
+    }
 
     companion object {
         private const val MODEL_ASSET = "efficientdet_lite0_uint8.tflite"
@@ -352,7 +495,8 @@ class VehicleDetector(context: Context) {
         private const val MIN_VEHICLE_DISTANCE_M = 0.35f
         private const val MAX_VEHICLE_DISTANCE_M = 45f
         private const val FILTER_ASSOCIATION_M = 4.0f
-        private const val FILTER_TRACK_TTL_MS = 2_800L
+        private const val FILTER_TRACK_TTL_MS = 3_600L
+        private const val VELOCITY_HEADING_MIN_MPS = 0.60f
         private val VEHICLE_LABELS = setOf("car", "truck", "bus")
     }
 }

@@ -24,6 +24,8 @@ class TargetOverlayView(context: Context) : View(context) {
         val label: String,
         val confidence: Float,
         val isLocal: Boolean,
+        /** Eight projected OBB corners as x0,y0,...,x7,y7. Null for point targets. */
+        val boxCorners: FloatArray? = null,
     )
 
     private val density = resources.displayMetrics.density
@@ -59,6 +61,16 @@ class TargetOverlayView(context: Context) : View(context) {
         strokeWidth = d(7f)
         color = 0x2864a9ff
     }
+    private val boxGlowLocal = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = d(5.5f)
+        color = 0x2055f0bd
+    }
+    private val boxGlowPeer = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = d(5.5f)
+        color = 0x2064a9ff
+    }
     private val title = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xffffffff.toInt()
         textSize = d(13f)
@@ -72,10 +84,6 @@ class TargetOverlayView(context: Context) : View(context) {
 
     @Volatile private var targets: List<Target> = emptyList()
 
-    /**
-     * Scene tap callback. The overlay intentionally owns camera-surface gestures:
-     * it sits above GLSurfaceView and therefore receives a complete DOWN/UP stream.
-     */
     var onSceneTap: ((Float, Float) -> Unit)? = null
 
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
@@ -98,7 +106,6 @@ class TargetOverlayView(context: Context) : View(context) {
                 touchDownAtMs = event.eventTime
                 return true
             }
-
             MotionEvent.ACTION_MOVE -> {
                 if (event.pointerCount > 1) tapCandidate = false
                 val dx = event.x - touchDownX
@@ -106,7 +113,6 @@ class TargetOverlayView(context: Context) : View(context) {
                 if (dx * dx + dy * dy > touchSlop * touchSlop) tapCandidate = false
                 return true
             }
-
             MotionEvent.ACTION_UP -> {
                 val shortEnough = event.eventTime - touchDownAtMs <= MAX_TAP_DURATION_MS
                 val shouldTap = tapCandidate && shortEnough
@@ -117,7 +123,6 @@ class TargetOverlayView(context: Context) : View(context) {
                 }
                 return true
             }
-
             MotionEvent.ACTION_CANCEL -> {
                 tapCandidate = false
                 return true
@@ -136,7 +141,6 @@ class TargetOverlayView(context: Context) : View(context) {
         postInvalidateOnAnimation()
     }
 
-    /** Compatibility helper for any older call sites. */
     fun setTarget(target: Target?) {
         setTargets(if (target == null) emptyList() else listOf(target))
     }
@@ -150,10 +154,8 @@ class TargetOverlayView(context: Context) : View(context) {
         val visible = ArrayList<Target>(snapshot.size)
         val offscreen = ArrayList<Target>(snapshot.size)
         for (target in snapshot) {
-            val isVisible = target.inFront &&
-                target.screenX.isFinite() && target.screenY.isFinite() &&
-                target.screenX in margin..(width - margin) &&
-                target.screenY in margin..(height - margin)
+            val isVisible = target.inFront && target.screenX.isFinite() && target.screenY.isFinite() &&
+                target.screenX in margin..(width - margin) && target.screenY in margin..(height - margin)
             if (isVisible) visible += target else offscreen += target
         }
 
@@ -166,16 +168,9 @@ class TargetOverlayView(context: Context) : View(context) {
             .sortedByDescending { sortableDistance(it.distanceM) }
             .forEach { drawMarker(canvas, it, it.id in labeledIds) }
 
-        val nearestOffscreen = offscreen
-            .sortedBy { sortableDistance(it.distanceM) }
-            .take(MAX_EDGE_TARGETS)
-        nearestOffscreen.forEachIndexed { index, target ->
-            drawEdgeArrow(canvas, target, margin, index)
-        }
-
-        if (offscreen.size > MAX_EDGE_TARGETS) {
-            drawOverflowBadge(canvas, offscreen.size - MAX_EDGE_TARGETS)
-        }
+        val nearestOffscreen = offscreen.sortedBy { sortableDistance(it.distanceM) }.take(MAX_EDGE_TARGETS)
+        nearestOffscreen.forEachIndexed { index, target -> drawEdgeArrow(canvas, target, margin, index) }
+        if (offscreen.size > MAX_EDGE_TARGETS) drawOverflowBadge(canvas, offscreen.size - MAX_EDGE_TARGETS)
     }
 
     private fun sortableDistance(distance: Float): Float =
@@ -189,6 +184,8 @@ class TargetOverlayView(context: Context) : View(context) {
         val fill = if (target.isLocal) localFill else peerFill
         val glow = if (target.isLocal) localGlow else peerGlow
 
+        target.boxCorners?.let { drawWireVehicleBox(canvas, it, target.isLocal) }
+
         canvas.drawCircle(x, y, radius + d(4f), glow)
         canvas.drawCircle(x, y, radius, ring)
         canvas.drawCircle(x, y, d(2.6f), fill)
@@ -201,7 +198,9 @@ class TargetOverlayView(context: Context) : View(context) {
 
         val label = target.label.ifBlank { "TARGET" }
         val distance = if (target.distanceM.isFinite()) "%.1f m".format(target.distanceM) else ""
-        val state = if (target.isLocal) {
+        val state = if (target.boxCorners != null) {
+            if (target.isLocal) "TRACKED 3D" else "SHARED 3D"
+        } else if (target.isLocal) {
             "LOCAL"
         } else {
             when {
@@ -220,6 +219,23 @@ class TargetOverlayView(context: Context) : View(context) {
         canvas.drawRoundRect(RectF(left, top, left + boxW, top + boxH), d(11f), d(11f), panel)
         canvas.drawText(label, left + d(11f), top + d(18f), title)
         if (metaText.isNotBlank()) canvas.drawText(metaText, left + d(11f), top + d(35f), meta)
+    }
+
+    /** Corner indexing uses bit0=length, bit1=width, bit2=height. */
+    private fun drawWireVehicleBox(canvas: Canvas, corners: FloatArray, isLocal: Boolean) {
+        if (corners.size < 16 || corners.take(16).any { !it.isFinite() }) return
+        val ring = if (isLocal) localRing else peerRing
+        val glow = if (isLocal) boxGlowLocal else boxGlowPeer
+        for ((a, b) in BOX_EDGES) {
+            val ax = corners[a * 2]
+            val ay = corners[a * 2 + 1]
+            val bx = corners[b * 2]
+            val by = corners[b * 2 + 1]
+            canvas.drawLine(ax, ay, bx, by, glow)
+            canvas.drawLine(ax, ay, bx, by, ring)
+        }
+        val fill = if (isLocal) localFill else peerFill
+        for (i in 0 until 8) canvas.drawCircle(corners[i * 2], corners[i * 2 + 1], d(2.0f), fill)
     }
 
     private fun drawEdgeArrow(canvas: Canvas, target: Target, margin: Float, slotIndex: Int) {
@@ -283,15 +299,9 @@ class TargetOverlayView(context: Context) : View(context) {
         val boxW = meta.measureText(label) + d(18f)
         val boxH = d(29f)
         val labelLeft = (x - boxW / 2f).coerceIn(d(8f), width - boxW - d(8f))
-        val labelTop = (
-            if (y < height * 0.25f) y + d(27f) else y - d(43f)
-        ).coerceIn(d(8f), height - boxH - d(8f))
-        canvas.drawRoundRect(
-            RectF(labelLeft, labelTop, labelLeft + boxW, labelTop + boxH),
-            d(9f),
-            d(9f),
-            panel,
-        )
+        val labelTop = (if (y < height * 0.25f) y + d(27f) else y - d(43f))
+            .coerceIn(d(8f), height - boxH - d(8f))
+        canvas.drawRoundRect(RectF(labelLeft, labelTop, labelLeft + boxW, labelTop + boxH), d(9f), d(9f), panel)
         canvas.drawText(label, labelLeft + d(9f), labelTop + d(19f), meta)
     }
 
@@ -301,16 +311,16 @@ class TargetOverlayView(context: Context) : View(context) {
         val boxH = d(30f)
         val left = (width - boxW) * 0.5f
         val top = (height - d(88f) - boxH).coerceAtLeast(d(8f))
-        canvas.drawRoundRect(
-            RectF(left, top, left + boxW, top + boxH),
-            d(10f),
-            d(10f),
-            panel,
-        )
+        canvas.drawRoundRect(RectF(left, top, left + boxW, top + boxH), d(10f), d(10f), panel)
         canvas.drawText(text, left + d(11f), top + d(20f), meta)
     }
 
     companion object {
+        private val BOX_EDGES = arrayOf(
+            0 to 1, 2 to 3, 4 to 5, 6 to 7,
+            0 to 2, 1 to 3, 4 to 6, 5 to 7,
+            0 to 4, 1 to 5, 2 to 6, 3 to 7,
+        )
         private const val MAX_TAP_DURATION_MS = 650L
         private const val MAX_VISIBLE_LABELS = 10
         private const val MAX_EDGE_TARGETS = 6

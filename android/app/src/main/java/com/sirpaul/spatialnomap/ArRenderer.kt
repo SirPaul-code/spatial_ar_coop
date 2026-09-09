@@ -26,6 +26,7 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.atan2
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 class ArRenderer(
@@ -65,12 +66,15 @@ class ArRenderer(
         var correctionVotes: Int = 0,
     )
 
-    private data class DynamicTarget(
-        val point: FloatArray,
-        val owner: String,
-        val label: String,
-        val confidence: Float,
-        val lastSeenMs: Long,
+    /** Dynamic vehicle state. Never turn this into a permanent ARCore Anchor. */
+    private class DynamicTarget(
+        var point: FloatArray,
+        var velocity: FloatArray,
+        var worldBox: VehicleDetector.WorldBox?,
+        var owner: String,
+        var label: String,
+        var confidence: Float,
+        var lastSeenMs: Long,
     )
 
     private data class SurfaceResolveJob(
@@ -115,6 +119,9 @@ class ArRenderer(
     private val remoteTargets = LinkedHashMap<Long, RemoteTarget>()
     private val localVehicles = LinkedHashMap<Long, DynamicTarget>()
     private val remoteVehicles = LinkedHashMap<Long, DynamicTarget>()
+
+    /** Detector-local id -> room/shared id. */
+    private val detectorTrackToSharedId = LinkedHashMap<Int, Long>()
 
     private var width = 1
     private var height = 1
@@ -265,11 +272,6 @@ class ArRenderer(
         val metricDistance = metricWorld?.let { pointDistance(cameraWorld, it) }
         val depthTolerance = metricDistance?.let { max(TAP_DEPTH_MIN_TOLERANCE_M, it * TAP_DEPTH_TOLERANCE_RATIO) }
 
-        // A tracked ARCore surface is authoritative for manual placement. CPU depth is
-        // useful corroboration, but a reflective/low-confidence depth sample must never
-        // veto a valid nearby plane/feature hit and push the POI tens of metres down the
-        // same camera ray. This was exactly the failure mode behind visually-correct
-        // local markers reporting ~15-20 m and exploding after the cross-device SE(3).
         var bestHit: HitResult? = null
         var bestScore = Float.POSITIVE_INFINITY
         for (hit in frame.hitTest(tap[0], tap[1])) {
@@ -295,9 +297,6 @@ class ArRenderer(
                 is DepthPoint -> 0.16f
                 else -> 0.25f
             }
-            // Distance dominates the ordering. Metric agreement is only a small bonus,
-            // never a hard gate; this ensures a 1.2 m tracked wall beats a bogus 15 m
-            // depth sample every time.
             val score = hitDistance + typePenalty - if (metricConsistent) METRIC_HIT_BONUS_M else 0f
             if (score < bestScore) {
                 bestScore = score
@@ -306,9 +305,6 @@ class ArRenderer(
         }
 
         var newAnchor = bestHit?.let { runCatching { it.createAnchor() }.getOrNull() }
-        // Depth-only fallback is deliberately near-field. Far depth without a tracked
-        // ARCore surface is not trustworthy enough for a shared manual POI because a
-        // tiny angular registration error becomes metres of remote displacement.
         if (newAnchor == null && metricWorld != null && metricDistance != null &&
             metricDistance.isFinite() && metricDistance in MIN_POI_DISTANCE_M..MAX_METRIC_ONLY_POI_DISTANCE_M
         ) {
@@ -329,8 +325,6 @@ class ArRenderer(
         val owner = usernameProvider()
         val point = newAnchor.pose.translation
 
-        // Capture an explicit visual/depth fingerprint of the physical surface. The
-        // exact tap pixel is scaled into the transmitted CPU-camera frame.
         val referenceFrame = FrameCapture.capture(
             frame = frame,
             camera = camera,
@@ -339,8 +333,10 @@ class ArRenderer(
         )
         val surfaceReference = referenceFrame?.let { captured ->
             val dims = camera.imageIntrinsics.imageDimensions
-            val sx = captured.intrinsics.width.toFloat() / dims.getOrElse(0) { captured.intrinsics.width }.coerceAtLeast(1)
-            val sy = captured.intrinsics.height.toFloat() / dims.getOrElse(1) { captured.intrinsics.height }.coerceAtLeast(1)
+            val sx = captured.intrinsics.width.toFloat() /
+                dims.getOrElse(0) { captured.intrinsics.width }.coerceAtLeast(1)
+            val sy = captured.intrinsics.height.toFloat() /
+                dims.getOrElse(1) { captured.intrinsics.height }.coerceAtLeast(1)
             SurfaceTargetReference(captured, floatArrayOf(imagePixel[0] * sx, imagePixel[1] * sy))
         }
 
@@ -367,22 +363,8 @@ class ArRenderer(
 
         while (true) {
             val request = remoteTargetRequests.poll() ?: break
-            val dynamicCar = request.owner.startsWith(AUTO_CAR_PREFIX)
-            if (dynamicCar) {
-                val cleanOwner = request.owner.removePrefix(AUTO_CAR_PREFIX).ifBlank { "Peer" }
-                synchronized(targetLock) {
-                    if (request.point == null) {
-                        remoteVehicles.remove(request.id)
-                    } else {
-                        remoteVehicles[request.id] = DynamicTarget(
-                            point = request.point.copyOf(3),
-                            owner = cleanOwner,
-                            label = "CAR",
-                            confidence = request.confidence,
-                            lastSeenMs = System.currentTimeMillis(),
-                        )
-                    }
-                }
+            if (request.owner.startsWith(AUTO_CAR_PREFIX)) {
+                applyRemoteVehicleRequest(request)
                 continue
             }
 
@@ -399,9 +381,6 @@ class ArRenderer(
                 existing.confidence = request.confidence
                 if (existing.surface == null && request.surface != null) existing.surface = request.surface
 
-                // Global transform refinement may republish a better provisional XYZ.
-                // Never overwrite a target after its own texture/depth verifier proved
-                // the local surface; that local evidence is more specific.
                 if (!existing.surfaceVerified) {
                     val delta = pointDistance(existing.anchor.pose.translation, request.point)
                     if (delta >= REMOTE_PROVISIONAL_REANCHOR_M && delta <= MAX_SURFACE_CORRECTION_M) {
@@ -425,6 +404,96 @@ class ArRenderer(
                 if (prior != null) runCatching { anchor.detach() }
             }
         }
+    }
+
+    /**
+     * Room-level vehicle reservation/deduplication.
+     *
+     * Both phones may detect the same car before either receives the other's first
+     * packet. Active duplicates converge deterministically to the unsigned-lowest
+     * shared id. A stale owner loses its reservation after a short lease so a peer
+     * that still sees a moving vehicle can take ownership without waiting for the
+     * longer display-memory TTL.
+     */
+    private fun applyRemoteVehicleRequest(request: RemoteTargetRequest) {
+        val now = System.currentTimeMillis()
+        val cleanOwner = request.owner.removePrefix(AUTO_CAR_PREFIX).ifBlank { "Peer" }
+        synchronized(targetLock) {
+            val incomingPoint = request.point
+            if (incomingPoint == null) {
+                remoteVehicles.remove(request.id)
+                return
+            }
+
+            val existingSameId = remoteVehicles[request.id]
+            if (existingSameId != null) {
+                updateRemoteVehicle(existingSameId, incomingPoint, cleanOwner, request.confidence, now)
+                return
+            }
+
+            val localDuplicate = nearestDynamicTrack(
+                localVehicles,
+                incomingPoint,
+                now,
+                CROSS_DEVICE_BASE_GATE_M,
+                CROSS_DEVICE_MAX_GATE_M,
+            )
+            if (localDuplicate != null) {
+                val (localId, localTrack) = localDuplicate
+                val localLeaseActive = now - localTrack.lastSeenMs <= VEHICLE_OWNERSHIP_LEASE_MS
+                if (localLeaseActive && VehicleTrackPolicy.winnerId(localId, request.id) == localId) {
+                    return
+                }
+                localVehicles.remove(localId)
+                detectorTrackToSharedId.entries.removeIf { it.value == localId }
+            }
+
+            val otherRemote = nearestDynamicTrack(
+                remoteVehicles,
+                incomingPoint,
+                now,
+                CROSS_DEVICE_BASE_GATE_M,
+                CROSS_DEVICE_MAX_GATE_M,
+                excludeId = request.id,
+            )
+            if (otherRemote != null) {
+                val otherId = otherRemote.first
+                if (VehicleTrackPolicy.winnerId(otherId, request.id) == otherId) return
+                remoteVehicles.remove(otherId)
+            }
+
+            val velocity = FloatArray(3)
+            remoteVehicles[request.id] = DynamicTarget(
+                point = incomingPoint.copyOf(3),
+                velocity = velocity,
+                worldBox = defaultVehicleBox(incomingPoint, velocity, "CAR"),
+                owner = cleanOwner,
+                label = "CAR",
+                confidence = request.confidence,
+                lastSeenMs = now,
+            )
+        }
+    }
+
+    private fun updateRemoteVehicle(
+        track: DynamicTarget,
+        incomingPoint: FloatArray,
+        owner: String,
+        confidence: Float,
+        now: Long,
+    ) {
+        val dt = ((now - track.lastSeenMs).coerceAtLeast(1L) / 1000f).coerceIn(0.02f, 2f)
+        val measuredVelocity = FloatArray(3) { i ->
+            (incomingPoint.getOrElse(i) { 0f } - track.point.getOrElse(i) { 0f }) / dt
+        }
+        limitVelocity(measuredVelocity, MAX_VEHICLE_SPEED_MPS)
+        track.velocity = smoothPoint(track.velocity, measuredVelocity, REMOTE_VELOCITY_ALPHA)
+        limitVelocity(track.velocity, MAX_VEHICLE_SPEED_MPS)
+        track.point = smoothPoint(track.point, incomingPoint, REMOTE_POSITION_ALPHA)
+        track.owner = owner
+        track.confidence = max(track.confidence * 0.35f, confidence)
+        track.lastSeenMs = now
+        track.worldBox = defaultVehicleBox(track.point, track.velocity, track.label, track.worldBox)
     }
 
     private fun captureIfDue(frame: Frame, camera: Camera) {
@@ -490,7 +559,6 @@ class ArRenderer(
         }
     }
 
-    /** Apply only consensus visual+depth corrections on the AR/render thread. */
     private fun applySurfaceCorrections(session: Session) {
         while (true) {
             val correction = surfaceCorrections.poll() ?: break
@@ -501,8 +569,13 @@ class ArRenderer(
 
     private fun applyLocalSurfaceCorrection(session: Session, correction: SurfaceCorrection) {
         val target = synchronized(targetLock) { localTargets[correction.id] } ?: return
-        val result = correction.result
         val oldPoint = target.anchor.pose.translation
+        val coarse = correction.result
+        val result = target.surface?.let { reference ->
+            runCatching {
+                SurfaceEdgeSnapRefiner.refine(reference, correction.currentFrame, coarse, oldPoint)
+            }.getOrNull()
+        } ?: coarse
         val delta = pointDistance(oldPoint, result.pointWorld)
         if (!delta.isFinite() || delta > MAX_SURFACE_CORRECTION_M) return
         if (delta < SURFACE_CORRECTION_DEADBAND_M) {
@@ -532,8 +605,13 @@ class ArRenderer(
 
     private fun applyRemoteSurfaceCorrection(session: Session, correction: SurfaceCorrection) {
         val target = synchronized(targetLock) { remoteTargets[correction.id] } ?: return
-        val result = correction.result
         val oldPoint = target.anchor.pose.translation
+        val coarse = correction.result
+        val result = target.surface?.let { reference ->
+            runCatching {
+                SurfaceEdgeSnapRefiner.refine(reference, correction.currentFrame, coarse, oldPoint)
+            }.getOrNull()
+        } ?: coarse
         val delta = pointDistance(oldPoint, result.pointWorld)
         if (!delta.isFinite() || delta > MAX_SURFACE_CORRECTION_M) return
         if (delta < SURFACE_CORRECTION_DEADBAND_M) {
@@ -550,8 +628,6 @@ class ArRenderer(
         target.surfaceVerified = true
         target.pendingCorrection = null
         target.correctionVotes = 0
-        // Once this phone has independently seen the surface, continue tracking it
-        // from its own visual reference instead of depending on the peer's old frame.
         target.surface = SurfaceTargetReference(correction.currentFrame, result.matchedPixel.copyOf())
         runCatching { old.detach() }
     }
@@ -624,47 +700,92 @@ class ArRenderer(
         val now = System.currentTimeMillis()
         val owner = usernameProvider()
         val matched = HashSet<Long>()
+        val acceptedObservations = ArrayList<FloatArray>()
 
-        for (vehicle in detections) {
-            var bestId: Long? = null
-            var bestDistance = Float.POSITIVE_INFINITY
-            synchronized(targetLock) {
-                for ((id, existing) in localVehicles) {
-                    if (id in matched) continue
-                    val distance = pointDistance(existing.point, vehicle.pointWorld)
-                    if (distance < bestDistance && distance <= VEHICLE_ASSOCIATION_M) {
-                        bestDistance = distance
-                        bestId = id
+        for (vehicle in detections.sortedByDescending { it.confidence }) {
+            // Suppress duplicate boxes from one detector frame before room association.
+            if (acceptedObservations.any { pointDistance(it, vehicle.pointWorld) <= LOCAL_DETECTION_MERGE_M }) continue
+            acceptedObservations += vehicle.pointWorld
+
+            val remoteReservation = synchronized(targetLock) {
+                nearestDynamicTrack(
+                    remoteVehicles.filterValues { now - it.lastSeenMs <= VEHICLE_OWNERSHIP_LEASE_MS },
+                    vehicle.pointWorld,
+                    now,
+                    CROSS_DEVICE_BASE_GATE_M,
+                    CROSS_DEVICE_MAX_GATE_M,
+                )
+            }
+            if (remoteReservation != null) {
+                synchronized(targetLock) {
+                    detectorTrackToSharedId.remove(vehicle.trackId)?.let { staleId ->
+                        localVehicles.remove(staleId)
                     }
+                }
+                continue
+            }
+
+            var id: Long? = synchronized(targetLock) {
+                detectorTrackToSharedId[vehicle.trackId]?.takeIf { localVehicles.containsKey(it) }
+            }
+            if (id == null) {
+                id = synchronized(targetLock) {
+                    nearestDynamicTrack(
+                        localVehicles,
+                        vehicle.pointWorld,
+                        now,
+                        LOCAL_VEHICLE_BASE_GATE_M,
+                        LOCAL_VEHICLE_MAX_GATE_M,
+                    )?.first
                 }
             }
 
-            val isNew = bestId == null
-            val id = bestId ?: newTargetId()
-            val existing = synchronized(targetLock) { localVehicles[id] }
-            val point = if (existing == null) vehicle.pointWorld.copyOf(3)
-            else smoothPoint(existing.point, vehicle.pointWorld, VEHICLE_SMOOTH_ALPHA)
+            val isNew = id == null
+            val sharedId = id ?: newTargetId()
+            val existing = synchronized(targetLock) { localVehicles[sharedId] }
+            val predicted = existing?.let {
+                VehicleTrackPolicy.predict(it.point, it.velocity, it.lastSeenMs, now, VEHICLE_COAST_MS)
+            }
+            val point = if (predicted == null) vehicle.pointWorld.copyOf(3)
+            else smoothPoint(predicted, vehicle.pointWorld, LOCAL_POSITION_ALPHA)
+            val velocity = if (existing == null) vehicle.velocityWorld.copyOf(3)
+            else smoothPoint(existing.velocity, vehicle.velocityWorld, LOCAL_VELOCITY_ALPHA)
+            limitVelocity(velocity, MAX_VEHICLE_SPEED_MPS)
+            val worldBox = (vehicle.worldBox ?: existing?.worldBox ?: defaultVehicleBox(point, velocity, vehicle.label))
+                ?.let { moveBoxCenter(it, point, velocity) }
 
             synchronized(targetLock) {
-                localVehicles[id] = DynamicTarget(
+                localVehicles[sharedId] = DynamicTarget(
                     point = point,
+                    velocity = velocity,
+                    worldBox = worldBox,
                     owner = owner,
                     label = vehicle.label,
                     confidence = vehicle.confidence,
                     lastSeenMs = now,
                 )
+                detectorTrackToSharedId[vehicle.trackId] = sharedId
             }
-            matched += id
-            coordinator.sendPoi(id, point, "$AUTO_CAR_PREFIX$owner")
-            if (isNew) status("Vehicle detected • sharing automatically")
+            matched += sharedId
+            coordinator.sendPoi(sharedId, point, "$AUTO_CAR_PREFIX$owner")
+            if (isNew) status("Vehicle tracked • shared 3D track reserved")
         }
     }
 
     private fun expireVehicleTracks() {
         val now = System.currentTimeMillis()
         synchronized(targetLock) {
-            localVehicles.filterValues { now - it.lastSeenMs > LOCAL_VEHICLE_TTL_MS }.keys.toList().forEach { localVehicles.remove(it) }
-            remoteVehicles.filterValues { now - it.lastSeenMs > REMOTE_VEHICLE_TTL_MS }.keys.toList().forEach { remoteVehicles.remove(it) }
+            val removedLocal = localVehicles
+                .filterValues { now - it.lastSeenMs > VEHICLE_MEMORY_TTL_MS }
+                .keys.toList()
+            removedLocal.forEach { id -> localVehicles.remove(id) }
+            if (removedLocal.isNotEmpty()) {
+                detectorTrackToSharedId.entries.removeIf { it.value in removedLocal }
+            }
+            remoteVehicles
+                .filterValues { now - it.lastSeenMs > VEHICLE_MEMORY_TTL_MS }
+                .keys.toList()
+                .forEach { remoteVehicles.remove(it) }
         }
     }
 
@@ -688,6 +809,7 @@ class ArRenderer(
         val projection = FloatArray(16)
         camera.getViewMatrix(view, 0)
         camera.getProjectionMatrix(projection, 0, 0.05f, 500f)
+        val now = System.currentTimeMillis()
 
         val localSnapshot: List<Pair<Long, LocalTarget>>
         val remoteSnapshot: List<Pair<Long, RemoteTarget>>
@@ -711,20 +833,47 @@ class ArRenderer(
         }
         for ((id, target) in remoteSnapshot) {
             val owner = target.owner.ifBlank { "PEER" }
-            projectAnchor(camera, target.anchor, id, "$owner • ${shortTargetId(id)}", target.confidence, false, view, projection)
-                ?.let { projected += it }
-        }
-        for ((id, target) in localVehicleSnapshot) {
-            projectPoint(camera, target.point, id, "${target.label} • YOU", target.confidence, true, view, projection)
-                ?.let { projected += it }
-        }
-        for ((id, target) in remoteVehicleSnapshot) {
-            projectPoint(
-                camera, target.point, id, "${target.label} • ${target.owner.ifBlank { "PEER" }}",
+            projectAnchor(
+                camera, target.anchor, id, "$owner • ${shortTargetId(id)}",
                 target.confidence, false, view, projection,
             )?.let { projected += it }
         }
+        for ((id, target) in localVehicleSnapshot) {
+            projectDynamicTarget(camera, target, id, "${target.label} • YOU", true, now, view, projection)
+                ?.let { projected += it }
+        }
+        for ((id, target) in remoteVehicleSnapshot) {
+            projectDynamicTarget(
+                camera,
+                target,
+                id,
+                "${target.label} • ${target.owner.ifBlank { "PEER" }}",
+                false,
+                now,
+                view,
+                projection,
+            )?.let { projected += it }
+        }
         overlay.setTargets(projected)
+    }
+
+    private fun projectDynamicTarget(
+        camera: Camera,
+        target: DynamicTarget,
+        id: Long,
+        label: String,
+        isLocal: Boolean,
+        now: Long,
+        view: FloatArray,
+        projection: FloatArray,
+    ): TargetOverlayView.Target? {
+        val predicted = VehicleTrackPolicy.predict(target.point, target.velocity, target.lastSeenMs, now, VEHICLE_COAST_MS)
+        val age = (now - target.lastSeenMs).coerceAtLeast(0L)
+        val confidenceDecay = (1f - min(0.72f, age / VEHICLE_MEMORY_TTL_MS.toFloat() * 0.72f)).coerceAtLeast(0.20f)
+        val confidence = target.confidence * confidenceDecay
+        val box = target.worldBox?.let { moveBoxCenter(it, predicted, target.velocity) }
+            ?: defaultVehicleBox(predicted, target.velocity, target.label)
+        return projectPoint(camera, predicted, id, label, confidence, isLocal, view, projection, box)
     }
 
     private fun projectAnchor(
@@ -738,7 +887,7 @@ class ArRenderer(
         projection: FloatArray,
     ): TargetOverlayView.Target? {
         if (anchor.trackingState != TrackingState.TRACKING) return null
-        return projectPoint(camera, anchor.pose.translation, id, label, confidence, isLocal, view, projection)
+        return projectPoint(camera, anchor.pose.translation, id, label, confidence, isLocal, view, projection, null)
     }
 
     private fun projectPoint(
@@ -750,14 +899,12 @@ class ArRenderer(
         isLocal: Boolean,
         view: FloatArray,
         projection: FloatArray,
+        worldBox: VehicleDetector.WorldBox?,
     ): TargetOverlayView.Target? {
         if (point.size < 3 || !point.take(3).all { it.isFinite() }) return null
-        val world = floatArrayOf(point[0], point[1], point[2], 1f)
-        val cameraV = FloatArray(4)
-        val clip = FloatArray(4)
-        Matrix.multiplyMV(cameraV, 0, view, 0, world, 0)
-        Matrix.multiplyMV(clip, 0, projection, 0, cameraV, 0)
-
+        val projectedCenter = projectWorldPoint(point, view, projection)
+        val cameraV = projectedCenter?.camera ?: return null
+        val clip = projectedCenter.clip
         val inFront = cameraV[2] < -0.05f
         val bearing = atan2(cameraV[0], -cameraV[2])
         var x = Float.NaN
@@ -783,7 +930,133 @@ class ArRenderer(
             label = label,
             confidence = confidence,
             isLocal = isLocal,
+            boxCorners = worldBox?.let { projectWorldBox(it, view, projection) },
         )
+    }
+
+    private data class ProjectedWorldPoint(val camera: FloatArray, val clip: FloatArray)
+
+    private fun projectWorldPoint(point: FloatArray, view: FloatArray, projection: FloatArray): ProjectedWorldPoint? {
+        if (point.size < 3 || !point.take(3).all { it.isFinite() }) return null
+        val world = floatArrayOf(point[0], point[1], point[2], 1f)
+        val cameraV = FloatArray(4)
+        val clip = FloatArray(4)
+        Matrix.multiplyMV(cameraV, 0, view, 0, world, 0)
+        Matrix.multiplyMV(clip, 0, projection, 0, cameraV, 0)
+        if (!cameraV.take(4).all { it.isFinite() } || !clip.take(4).all { it.isFinite() }) return null
+        return ProjectedWorldPoint(cameraV, clip)
+    }
+
+    /** Project eight world-space OBB corners into the camera overlay. */
+    private fun projectWorldBox(
+        box: VehicleDetector.WorldBox,
+        view: FloatArray,
+        projection: FloatArray,
+    ): FloatArray? {
+        val c = box.centerWorld
+        val f = horizontalUnit(box.forwardWorld) ?: return null
+        val r = floatArrayOf(-f[2], 0f, f[0])
+        val out = FloatArray(16)
+        for (index in 0 until 8) {
+            val sl = if (index and 1 == 0) -1f else 1f
+            val sw = if (index and 2 == 0) -1f else 1f
+            val sh = if (index and 4 == 0) -1f else 1f
+            val p = floatArrayOf(
+                c.getOrElse(0) { 0f } + f[0] * box.halfLengthM * sl + r[0] * box.halfWidthM * sw,
+                c.getOrElse(1) { 0f } + box.halfHeightM * sh,
+                c.getOrElse(2) { 0f } + f[2] * box.halfLengthM * sl + r[2] * box.halfWidthM * sw,
+            )
+            val projected = projectWorldPoint(p, view, projection) ?: return null
+            if (projected.camera[2] >= -0.05f || kotlin.math.abs(projected.clip[3]) <= 1e-5f) return null
+            val ndcX = projected.clip[0] / projected.clip[3]
+            val ndcY = projected.clip[1] / projected.clip[3]
+            val x = (ndcX + 1f) * 0.5f * width
+            val y = (1f - ndcY) * 0.5f * height
+            if (!x.isFinite() || !y.isFinite()) return null
+            out[index * 2] = x
+            out[index * 2 + 1] = y
+        }
+        return out
+    }
+
+    private fun moveBoxCenter(
+        box: VehicleDetector.WorldBox,
+        center: FloatArray,
+        velocity: FloatArray,
+    ): VehicleDetector.WorldBox {
+        val movingAxis = horizontalUnit(velocity)
+        var axis = movingAxis ?: horizontalUnit(box.forwardWorld) ?: floatArrayOf(1f, 0f, 0f)
+        val previous = horizontalUnit(box.forwardWorld)
+        if (previous != null && dot3(axis, previous) < 0f) axis = FloatArray(3) { -axis[it] }
+        return box.copy(centerWorld = center.copyOf(3), forwardWorld = axis)
+    }
+
+    private fun defaultVehicleBox(
+        center: FloatArray,
+        velocity: FloatArray,
+        label: String,
+        previous: VehicleDetector.WorldBox? = null,
+    ): VehicleDetector.WorldBox {
+        var axis = horizontalUnit(velocity) ?: previous?.forwardWorld?.let(::horizontalUnit) ?: floatArrayOf(1f, 0f, 0f)
+        previous?.forwardWorld?.let { prior ->
+            if (dot3(axis, prior) < 0f) axis = FloatArray(3) { -axis[it] }
+        }
+        val dims = when (label.uppercase(Locale.US)) {
+            "BUS" -> floatArrayOf(4.8f, 1.15f, 1.45f)
+            "TRUCK" -> floatArrayOf(3.2f, 1.05f, 1.20f)
+            else -> floatArrayOf(2.15f, 0.90f, 0.78f)
+        }
+        return VehicleDetector.WorldBox(
+            centerWorld = center.copyOf(3),
+            forwardWorld = axis,
+            halfLengthM = previous?.halfLengthM ?: dims[0],
+            halfWidthM = previous?.halfWidthM ?: dims[1],
+            halfHeightM = previous?.halfHeightM ?: dims[2],
+        )
+    }
+
+    private fun nearestDynamicTrack(
+        tracks: Map<Long, DynamicTarget>,
+        observation: FloatArray,
+        now: Long,
+        baseGateM: Float,
+        maxGateM: Float,
+        excludeId: Long? = null,
+    ): Pair<Long, DynamicTarget>? {
+        var best: Pair<Long, DynamicTarget>? = null
+        var bestDistance = Float.POSITIVE_INFINITY
+        for ((id, track) in tracks) {
+            if (excludeId != null && id == excludeId) continue
+            if (now - track.lastSeenMs > VEHICLE_MEMORY_TTL_MS) continue
+            val predicted = VehicleTrackPolicy.predict(track.point, track.velocity, track.lastSeenMs, now, VEHICLE_COAST_MS)
+            val distance = pointDistance(predicted, observation)
+            val gate = VehicleTrackPolicy.associationGateM(track.velocity, track.lastSeenMs, now, baseGateM, maxGateM)
+            if (distance <= gate && distance < bestDistance) {
+                bestDistance = distance
+                best = id to track
+            }
+        }
+        return best
+    }
+
+    private fun horizontalUnit(v: FloatArray): FloatArray? {
+        val x = v.getOrElse(0) { 0f }
+        val z = v.getOrElse(2) { 0f }
+        val n = sqrt(x * x + z * z)
+        if (!n.isFinite() || n < 1e-4f) return null
+        return floatArrayOf(x / n, 0f, z / n)
+    }
+
+    private fun dot3(a: FloatArray, b: FloatArray): Float =
+        a.getOrElse(0) { 0f } * b.getOrElse(0) { 0f } +
+            a.getOrElse(1) { 0f } * b.getOrElse(1) { 0f } +
+            a.getOrElse(2) { 0f } * b.getOrElse(2) { 0f }
+
+    private fun limitVelocity(velocity: FloatArray, maxSpeedMps: Float) {
+        val speed = VehicleTrackPolicy.speedMps(velocity)
+        if (speed <= maxSpeedMps || speed < 1e-4f) return
+        val scale = maxSpeedMps / speed
+        repeat(3) { i -> velocity[i] *= scale }
     }
 
     private fun newTargetId(): Long =
@@ -805,18 +1078,14 @@ class ArRenderer(
             remoteTargets.clear()
             localVehicles.clear()
             remoteVehicles.clear()
+            detectorTrackToSharedId.clear()
         }
         locals.forEach { anchor -> runCatching { anchor.detach() } }
         remotes.forEach { anchor -> runCatching { anchor.detach() } }
         overlay.setTargets(emptyList())
     }
 
-    private fun pointDistance(a: FloatArray, b: FloatArray): Float {
-        val dx = a.getOrElse(0) { 0f } - b.getOrElse(0) { 0f }
-        val dy = a.getOrElse(1) { 0f } - b.getOrElse(1) { 0f }
-        val dz = a.getOrElse(2) { 0f } - b.getOrElse(2) { 0f }
-        return sqrt(dx * dx + dy * dy + dz * dz)
-    }
+    private fun pointDistance(a: FloatArray, b: FloatArray): Float = VehicleTrackPolicy.distance(a, b)
 
     private fun errorText(t: Throwable): String {
         val parts = ArrayList<String>(3)
@@ -860,9 +1129,18 @@ class ArRenderer(
         private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
         private const val VEHICLE_DETECT_INTERVAL_MS = 450L
         private const val VEHICLE_METRIC_BUDGET = 5000
-        private const val VEHICLE_ASSOCIATION_M = 3.0f
-        private const val VEHICLE_SMOOTH_ALPHA = 0.38f
-        private const val LOCAL_VEHICLE_TTL_MS = 2_200L
-        private const val REMOTE_VEHICLE_TTL_MS = 3_000L
+        private const val LOCAL_DETECTION_MERGE_M = 1.45f
+        private const val LOCAL_VEHICLE_BASE_GATE_M = 1.9f
+        private const val LOCAL_VEHICLE_MAX_GATE_M = 4.8f
+        private const val CROSS_DEVICE_BASE_GATE_M = 2.1f
+        private const val CROSS_DEVICE_MAX_GATE_M = 5.2f
+        private const val VEHICLE_OWNERSHIP_LEASE_MS = 2_800L
+        private const val VEHICLE_COAST_MS = 2_600L
+        private const val VEHICLE_MEMORY_TTL_MS = 6_500L
+        private const val LOCAL_POSITION_ALPHA = 0.62f
+        private const val LOCAL_VELOCITY_ALPHA = 0.60f
+        private const val REMOTE_POSITION_ALPHA = 0.72f
+        private const val REMOTE_VELOCITY_ALPHA = 0.36f
+        private const val MAX_VEHICLE_SPEED_MPS = 75f
     }
 }
