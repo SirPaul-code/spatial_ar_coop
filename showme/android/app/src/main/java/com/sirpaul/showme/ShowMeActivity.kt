@@ -48,14 +48,22 @@ class ShowMeActivity : Activity(), LanSessionServer.Callbacks {
     override fun onCreate(savedInstanceState:Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        window.setDecorFitsSystemWindows(true)
+        // Explicit insets keep controls out of system bars on target SDK 36.
+        window.setDecorFitsSystemWindows(false)
         buildUi()
         voice=VoiceBridge(this) { server?.send(it) }
         handler.post(ticker)
         if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED) requestPermissions(arrayOf(Manifest.permission.CAMERA),101)
     }
     private fun buildUi() {
-        root=FrameLayout(this).apply { setBackgroundColor(ink) }
+        root=FrameLayout(this).apply {
+            setBackgroundColor(ink)
+            setOnApplyWindowInsetsListener { view,insets ->
+                val safe=insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                view.setPadding(safe.left,safe.top,safe.right,safe.bottom)
+                WindowInsets.CONSUMED
+            }
+        }
         gl=GLSurfaceView(this).apply { setEGLContextClientVersion(2); preserveEGLContextOnPause=true }
         val overlay=DrawingOverlay(this)
         renderer=ShowMeRenderer(overlay,{server},{display?.rotation ?: Surface.ROTATION_0},{cameraRotation}) { text,count -> runOnUiThread { if(!isDestroyed) { state.text=text; if(active) invite.text="INVITE HELPER   /   $count MARKS" } } }
@@ -70,12 +78,18 @@ class ShowMeActivity : Activity(), LanSessionServer.Callbacks {
         home.addView(label("Share your camera. A helper joins in their browser and draws directly into your world.",15,false,0xffb6c4d4.toInt()),spaced(18))
         listOf("01   Start a private local session","02   Send the link or show the QR code","03   Their marks stay on real surfaces").forEach { home.addView(label(it,13,false,0xffdce8f4.toInt()),spaced(14)) }
         home.addView(button("Start sharing",mint,ink) { startSession() },spaced(24,58))
-        home.addView(label("First preview: both devices on the same Wi-Fi or hotspot. No account. No cloud upload.",12,false,0xff8d9bad.toInt()),spaced(14))
+        home.addView(label("Both devices on the same Wi-Fi or hotspot. No account. No cloud upload.\nBuild ${BuildConfig.BUILD_SHA}",12,false,0xff8d9bad.toInt()),spaced(14))
         root.addView(home,FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM).apply { setMargins(dp(12),0,dp(12),dp(12)) })
         controls=column().apply { visibility=View.GONE; setPadding(dp(16),dp(16),dp(16),dp(20)); background=rounded(0xf20e1620.toInt(),26) }
         invite=button("INVITE HELPER",0xff1d3038.toInt(),mint) { inviteDialog() }; controls.addView(invite,spaced(0,48))
         val actions=row()
-        pause=button("Pause",0xff202c3b.toInt()) { renderer.sharingPaused=!renderer.sharingPaused; pause.text=if(renderer.sharingPaused) "Resume" else "Pause"; if(renderer.sharingPaused) { voice.setEnabled(false); mic.text="Mic off" }; server?.let { it.paused=renderer.sharingPaused; it.pauseReason=if(renderer.sharingPaused) "Camera owner paused sharing" else "Resuming camera"; it.status() } }
+        pause=button("Pause",0xff202c3b.toInt()) {
+            renderer.sharingPaused=!renderer.sharingPaused
+            pause.text=if(renderer.sharingPaused) "Resume" else "Pause"
+            if(renderer.sharingPaused) { voice.setEnabled(false); mic.text="Mic off" }
+            server?.let { it.paused=true; it.pauseReason=if(renderer.sharingPaused) "Camera owner paused sharing" else "Resuming camera"; it.status() }
+            // The render thread, after a fresh tracking frame, resumes publishing.
+        }
         mic=button("Mic off",0xff202c3b.toInt()) { toggleMicrophone() }
         val end=button("End",0xff49272f.toInt(),0xffffa3ac.toInt()) { AlertDialog.Builder(this).setTitle("End this session?").setMessage("The link expires and all marks are cleared.").setPositiveButton("End session") { _,_ -> endSession() }.setNegativeButton("Cancel",null).show() }
         listOf(pause,mic,end).forEach { actions.addView(it,LinearLayout.LayoutParams(0,dp(50),1f).apply { setMargins(dp(3),0,dp(3),0) }) }; controls.addView(actions,spaced(10))
@@ -83,7 +97,7 @@ class ShowMeActivity : Activity(), LanSessionServer.Callbacks {
         secondary.addView(button("Send a note",Color.TRANSPARENT,0xffb8c9d8.toInt()) { val text=EditText(this).apply { hint="Message your helper" }; AlertDialog.Builder(this).setTitle("Send a note").setView(text).setPositiveButton("Send") { _,_ -> val message=text.text.toString().take(300); server?.send(JSONObject().put("type","chat").put("name","Camera owner").put("text",message)); caption.text="You: $message" }.setNegativeButton("Cancel",null).show() },LinearLayout.LayoutParams(0,dp(40),1f)); controls.addView(secondary)
         caption=label("Only approve someone you trust with this view.",12,false,0xffa8b9c9.toInt()); controls.addView(caption,spaced(6))
         root.addView(controls,FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM).apply { setMargins(dp(12),0,dp(12),dp(12)) })
-        setContentView(root)
+        setContentView(root); root.requestApplyInsets()
     }
     private fun startSession() {
         if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED) { requestPermissions(arrayOf(Manifest.permission.CAMERA),101); return }
@@ -112,12 +126,13 @@ class ShowMeActivity : Activity(), LanSessionServer.Callbacks {
         val link=s.link(address)
         val panel=column().apply { setPadding(dp(22),dp(16),dp(22),dp(18)) }
         val bitmap=Bitmap.createBitmap(600,600,Bitmap.Config.ARGB_8888)
-        runCatching { val qr=MultiFormatWriter().encode(link,BarcodeFormat.QR_CODE,600,600); for(y in 0 until 600) for(x in 0 until 600) bitmap.setPixel(x,y,if(qr[x,y]) Color.BLACK else Color.WHITE) }
+        runCatching { val qr=MultiFormatWriter().encode(link,BarcodeFormat.QR_CODE,600,600); val pixels=IntArray(600*600) { i -> if(qr[i%600,i/600]) Color.BLACK else Color.WHITE }; bitmap.setPixels(pixels,0,600,0,0,600,600) }
         panel.addView(ImageView(this).apply { setImageBitmap(bitmap); contentDescription="QR code for this private session" },LinearLayout.LayoutParams(dp(220),dp(220)).apply { gravity=Gravity.CENTER_HORIZONTAL })
         panel.addView(label("http://$address:${s.port}",15,true),spaced(12))
-        panel.addView(label("The helper only needs a browser. They must be connected to your Wi-Fi or hotspot. You approve them before video is shared.",13,false,0xffb5c5d6.toInt()),spaced(10))
+        panel.addView(label("The helper only needs a browser on your Wi-Fi or hotspot. You approve them before video is shared. After sharing through another app, return here and tap Resume.",13,false,0xffb5c5d6.toInt()),spaced(10))
         if(addresses.size>1) panel.addView(button("Choose network address",0xff253142.toInt()) { AlertDialog.Builder(this).setTitle("Local address").setItems(addresses.toTypedArray()) { _,i -> address=addresses[i]; inviteDialog() }.show() },spaced(10,42))
-        AlertDialog.Builder(this).setTitle("Invite someone to ShowMe").setView(panel)
+        val scroll=ScrollView(this).apply { addView(panel) }
+        AlertDialog.Builder(this).setTitle("Invite someone to ShowMe").setView(scroll)
             .setPositiveButton("Share link") { _,_ -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type="text/plain"; putExtra(Intent.EXTRA_TEXT,"Join my ShowMe camera session. Open this link on the same Wi-Fi or hotspot:\n$link") },"Invite your helper")) }
             .setNeutralButton("Copy link") { _,_ -> getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("ShowMe private session",link)); Toast.makeText(this,"Link copied",Toast.LENGTH_SHORT).show() }
             .setNegativeButton("Done",null).show()
@@ -132,17 +147,17 @@ class ShowMeActivity : Activity(), LanSessionServer.Callbacks {
     override fun onJoin(name:String,decide:(Boolean)->Unit) { runOnUiThread {
         if(!foreground || !active) { decide(false); return@runOnUiThread }
         AlertDialog.Builder(this).setTitle("$name wants to help").setMessage("Allow them to see your camera and place AR marks? Only approve someone you trust.")
-            .setPositiveButton("Allow") { _,_ -> decide(true) }.setNegativeButton("Decline") { _,_ -> decide(false) }.setOnCancelListener { decide(false) }.show()
+            .setPositiveButton("Allow") { _,_ -> decide(foreground && active) }.setNegativeButton("Decline") { _,_ -> decide(false) }.setOnCancelListener { decide(false) }.show()
     } }
     override fun onPeer(connected:Boolean,name:String) { runOnUiThread {
-        if(isDestroyed) return@runOnUiThread
+        if(isDestroyed || !active) return@runOnUiThread
         peer.text=if(connected) "$name connected / browser helper" else "Helper disconnected / marks retained"
         if(!connected) { voice.setEnabled(false); mic.text="Mic off" }
     } }
     override fun onCommand(message:JSONObject) {
         when(message.optString("type")) {
             "voiceOffer","voiceIce","voiceStop" -> voice.message(message)
-            "chat" -> { val text=message.optString("text").take(300); runOnUiThread { caption.text="Helper: $text" }; server?.send(JSONObject().put("type","chat").put("name","Helper").put("text",text)) }
+            "chat" -> { val text=message.optString("text").take(300); runOnUiThread { if(!isDestroyed) caption.text="Helper: $text" }; server?.send(JSONObject().put("type","chat").put("name","Helper").put("text",text)) }
             else -> renderer.queue(message)
         }
     }

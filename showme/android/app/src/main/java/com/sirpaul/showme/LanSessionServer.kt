@@ -1,7 +1,6 @@
 package com.sirpaul.showme
 
 import android.content.Context
-import android.os.SystemClock
 import org.json.JSONObject
 import java.io.*
 import java.net.*
@@ -13,7 +12,8 @@ import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Embedded LAN transport. No external backend; deliberately NOT an Internet endpoint. */
-class LanSessionServer(private val context:Context,private val callbacks:Callbacks) : AutoCloseable {
+class LanSessionServer(private val loadAsset:(String)->ByteArray,private val callbacks:Callbacks) : AutoCloseable {
+    constructor(context:Context,callbacks:Callbacks):this({ path -> context.assets.open(path).use { it.readBytes() } },callbacks)
     interface Callbacks {
         fun onJoin(name:String, decide:(Boolean)->Unit)
         fun onPeer(connected:Boolean,name:String)
@@ -35,6 +35,7 @@ class LanSessionServer(private val context:Context,private val callbacks:Callbac
     val port:Int get()=listener.localPort
     val addresses:List<String> get()=localAddresses()
     fun link(address:String)= "http://$address:$port/#token=$token"
+    private fun nowMs()=System.nanoTime()/1_000_000L
 
     fun start() {
         listener.reuseAddress=true; listener.bind(InetSocketAddress("0.0.0.0",0)); running.set(true)
@@ -48,12 +49,16 @@ class LanSessionServer(private val context:Context,private val callbacks:Callbac
         },"showme-listen").apply { isDaemon=true; start() }
     }
 
+    /** All externally triggered writes, including owner approval, stay off UI/AR threads. */
+    private fun enqueue(p:Peer,task:()->Unit) {
+        try { outgoing.execute { if(peer===p && running.get()) runCatching(task).onFailure { runCatching { p.socket.close() } } } }
+        catch(_:RejectedExecutionException) { runCatching { p.socket.close() } }
+    }
     fun send(json:JSONObject) {
         val p=peer ?: return
         if(!p.approved) return
         val text=json.toString()
-        try { outgoing.execute { if(peer===p) runCatching { p.text(text) }.onFailure { p.socket.close() } } }
-        catch(_:RejectedExecutionException) { runCatching { p.socket.close() } }
+        enqueue(p) { p.text(text) }
     }
     fun status()=send(JSONObject().put("type",if(paused) "paused" else "live").put("message",pauseReason))
     override fun close() {
@@ -83,7 +88,7 @@ class LanSessionServer(private val context:Context,private val callbacks:Callbac
                 val asset=when(uri.path) { "/" -> "index.html"; "/index.html" -> "index.html"; "/app.css" -> "app.css"; "/app.mjs" -> "app.mjs"; "/protocol.mjs" -> "protocol.mjs"; else -> null }
                 if(asset==null) { http(output,404,"text/plain","Not found".toByteArray()); return }
                 val mime=when { asset.endsWith("css") -> "text/css"; asset.endsWith("mjs") -> "text/javascript"; else -> "text/html" }
-                http(output,200,mime,context.assets.open(asset).use { it.readBytes() }); return
+                http(output,200,mime,loadAsset(asset)); return
             }
             val params=(uri.rawQuery ?: "").split('&').mapNotNull { pair ->
                 val i=pair.indexOf('='); if(i<0) null else pair.substring(0,i) to URLDecoder.decode(pair.substring(i+1),"UTF-8")
@@ -98,36 +103,46 @@ class LanSessionServer(private val context:Context,private val callbacks:Callbac
             val key=headers["sec-websocket-key"] ?: return
             if(Base64.getDecoder().decode(key).size!=16) return
             val name=(params["name"] ?: "Helper").take(32).filter { it>=' ' }.ifBlank { "Helper" }
-            connection=Peer(socket,output,client,name)
+            val current=Peer(socket,output,client,name)
+            connection=current
             synchronized(this) {
                 if(peer!=null) { http(output,409,"text/plain","A helper is already connected".toByteArray()); return }
-                peer=connection
+                peer=current
             }
             val digest=MessageDigest.getInstance("SHA-1").digest((key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").toByteArray(Charsets.US_ASCII))
             output.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${Base64.getEncoder().encodeToString(digest)}\r\n\r\n").toByteArray(Charsets.US_ASCII)); output.flush()
             socket.soTimeout=40_000
-            val current=connection
             current.text(JSONObject().put("type","waiting").put("message","Waiting for the camera owner to approve you").toString())
             fun approve(allowed:Boolean) {
-                if(peer!==current || socket.isClosed) return
-                if(!allowed) { runCatching { current.text("{\"type\":\"denied\"}") }; socket.close(); return }
-                current.approved=true; approvedClient=client
-                runCatching { current.text(JSONObject().put("type","ready").put("name",name).put("protocol",1).put("localOnly",true).toString()) }
-                callbacks.onPeer(true,name)
+                enqueue(current) {
+                    if(!socket.isClosed) {
+                        if(!allowed) {
+                            current.text("{\"type\":\"denied\"}"); socket.close()
+                        } else if(!current.approved) {
+                            // Approval and READY share the writer lock: the first
+                            // browser pull cannot race ahead of this acknowledgement.
+                            synchronized(current) {
+                                current.approved=true; approvedClient=client
+                                current.text(JSONObject().put("type","ready").put("name",name).put("protocol",1).put("localOnly",true).toString())
+                            }
+                            callbacks.onPeer(true,name)
+                        }
+                    }
+                }
             }
             if(approvedClient==client) approve(true) else callbacks.onJoin(name,::approve)
-            var window=SystemClock.elapsedRealtime(); var count=0
+            var window=nowMs(); var count=0
             val joinedAt=window
             while(running.get() && !socket.isClosed) {
                 val frame=WebSocketIO.readClient(input) ?: break
+                val now=nowMs()
+                if(now-window>1000) { window=now; count=0 }
+                if(++count>50 || now-joinedAt>5_400_000L || !current.approved && now-joinedAt>45_000L) throw IOException("Session limit")
                 if(frame.first==8) break
                 if(frame.first==9) { current.pong(frame.second); continue }
                 if(frame.first==10) continue
                 if(frame.first!=1) throw IOException("Only text commands are accepted")
-                val now=SystemClock.elapsedRealtime()
-                if(now-window>1000) { window=now; count=0 }
-                if(++count>50 || now-joinedAt>5_400_000L) throw IOException("Session limit")
-                if(!current.approved) { if(now-joinedAt>45_000) break; continue }
+                if(!current.approved) continue
                 val msg=try { JSONObject(String(frame.second,Charsets.UTF_8)) } catch(_:Exception) { current.text("{\"type\":\"error\",\"message\":\"Invalid message\"}"); continue }
                 when(msg.optString("type")) {
                     "pull" -> {
@@ -141,15 +156,17 @@ class LanSessionServer(private val context:Context,private val callbacks:Callbac
                 }
             }
         } catch(_:Exception) {
-            // Deliberately do not log request URLs, bearer tokens, SDP or camera data.
+            // Do not log request URLs, bearer tokens, SDP or camera data.
         } finally {
-            synchronized(this) { if(peer===connection) { peer=null; if(connection?.approved==true) callbacks.onPeer(false,connection!!.name) } }
+            synchronized(this) { if(peer===connection) { peer=null; connection?.takeIf { it.approved }?.let { callbacks.onPeer(false,it.name) } } }
             sockets.remove(socket); runCatching { socket.close() }
         }
     }
     private fun http(out:OutputStream,code:Int,mime:String,body:ByteArray) {
         val status=if(code==200) "OK" else "Error"
-        val headers="HTTP/1.1 $code $status\r\nContent-Type: $mime; charset=utf-8\r\nContent-Length: ${body.size}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'\r\n\r\n"
+        // Some browsers do not expand connect-src 'self' to ws:. Actual client
+        // connections are same-origin; the server independently verifies Origin.
+        val headers="HTTP/1.1 $code $status\r\nContent-Type: $mime; charset=utf-8\r\nContent-Length: ${body.size}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' ws:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n\r\n"
         out.write(headers.toByteArray(Charsets.US_ASCII)); out.write(body); out.flush()
     }
     companion object {
@@ -161,6 +178,7 @@ class LanSessionServer(private val context:Context,private val callbacks:Callbac
         }.getOrDefault(emptyList())
         fun packet(id:Long,metadata:JSONObject,jpeg:ByteArray):Packet {
             val header=metadata.toString().toByteArray(Charsets.UTF_8)
+            require(header.size<=512*1024 && jpeg.size<=7*1024*1024) { "Frame envelope too large" }
             return Packet(id,ByteBuffer.allocate(4+header.size+jpeg.size).putInt(header.size).put(header).put(jpeg).array())
         }
     }
@@ -182,6 +200,7 @@ object WebSocketIO {
         val b=input.read(); if(b<0) throw EOFException()
         val op=a and 15
         if(a and 0x80==0 || a and 0x70!=0 || b and 0x80==0) throw IOException("Invalid or fragmented frame")
+        if(op !in setOf(1,2,8,9,10)) throw IOException("Unsupported frame opcode")
         val data=DataInputStream(input); var size=(b and 127).toLong()
         if(size==126L) size=data.readUnsignedShort().toLong() else if(size==127L) size=data.readLong()
         if(size !in 0L..32_768L || op>=8 && size>125) throw IOException("Frame too large")

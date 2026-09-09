@@ -1,13 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="true" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
-    <application android:name=".ShowMeApplication" android:label="ShowMe" android:icon="@drawable/ic_showme" android:theme="@style/ShowMeTheme" android:allowBackup="false" android:usesCleartextTraffic="true" android:supportsRtl="true">
+    <application android:name=".ShowMeApplication" android:label="ShowMe" android:icon="@drawable/ic_showme" android:theme="@style/ShowMeTheme" android:allowBackup="false" android:dataExtractionRules="@xml/data_extraction_rules" android:usesCleartextTraffic="true" android:supportsRtl="true">
         <meta-data android:name="com.google.ar.core" android:value="required" />
         <activity android:name=".ShowMeActivity" android:exported="true" android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden" android:windowSoftInputMode="adjustResize">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>

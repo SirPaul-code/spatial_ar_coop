@@ -71,7 +71,7 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs ShowMe-local-release.apk | tee ShowMe-signature.txt
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs ShowMe-local-debug.apk >> ShowMe-signature.txt
           sha256sum ShowMe-local-release.apk ShowMe-local-debug.apk > ShowMe-SHA256SUMS.txt
-          git archive --format=zip HEAD showme/ > ShowMe-source.zip
+          git archive --format=zip HEAD showme/ android/ AGENTS.md .github/workflows/showme.yml > ShowMe-source.zip
       - uses: actions/upload-artifact@v4
         with:
           name: showme-local-apks
