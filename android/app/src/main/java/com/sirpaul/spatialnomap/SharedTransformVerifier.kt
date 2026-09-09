@@ -64,7 +64,9 @@ object SharedTransformVerifier {
         local: CapturedFrame,
         transformLocalFromRemote: DoubleArray,
     ): Verification? {
-        if (!isRigid(transformLocalFromRemote)) return failedStructuralVerification(remote, local, transformLocalFromRemote)
+        if (!isRigid(transformLocalFromRemote)) {
+            return failedStructuralVerification(remote, local, transformLocalFromRemote)
+        }
         val matchSet = siftMatches(remote, local) ?: return null
         if (matchSet.matches.size < MIN_MATCHES) return null
 
@@ -82,6 +84,7 @@ object SharedTransformVerifier {
         for (match in matchSet.matches) {
             val remoteKey = matchSet.remoteKeys.getOrNull(match.queryIdx)?.pt ?: continue
             val localKey = matchSet.localKeys.getOrNull(match.trainIdx)?.pt ?: continue
+
             val remoteMetricIndex = nearestMetricIndex(
                 remote.metricPoints,
                 remoteKey.x,
@@ -90,14 +93,32 @@ object SharedTransformVerifier {
                 METRIC_ASSOCIATION_RADIUS_PX,
             )
             if (remoteMetricIndex < 0) continue
+            val localMetricIndex = nearestMetricIndex(
+                local.metricPoints,
+                localKey.x,
+                localKey.y,
+                usedLocalMetric,
+                METRIC_ASSOCIATION_RADIUS_PX,
+            )
+            if (localMetricIndex < 0) continue
+
             usedRemoteMetric += remoteMetricIndex
+            usedLocalMetric += localMetricIndex
             val remoteSupport = remote.metricPoints[remoteMetricIndex]
-            if (remoteSupport.size < 5) continue
+            val localSupport = local.metricPoints[localMetricIndex]
+            if (remoteSupport.size < 5 || localSupport.size < 5) continue
 
             val remoteWorld = floatArrayOf(remoteSupport[2], remoteSupport[3], remoteSupport[4])
+            val localWorld = floatArrayOf(localSupport[2], localSupport[3], localSupport[4])
             val predictedLocal = AlignmentEngine.transformPoint(transformLocalFromRemote, remoteWorld)
             if (!predictedLocal.all { it.isFinite() }) continue
 
+            // The metric sample is associated to a SIFT feature within a radius, but
+            // it is not necessarily the exact SIFT pixel. Reproject against the local
+            // metric support UV, which is the pixel that actually generated localWorld.
+            // Comparing against localKey with a 4 px gate was internally inconsistent
+            // with a 10 px association radius and could reject a geometrically correct
+            // transform simply because the depth sample lived a few pixels away.
             val cameraPoint = AlignmentEngine.transformPoint(
                 localCameraFromWorld,
                 floatArrayOf(predictedLocal[0].toFloat(), predictedLocal[1].toFloat(), predictedLocal[2].toFloat()),
@@ -108,28 +129,18 @@ object SharedTransformVerifier {
             } else {
                 val u = local.intrinsics.fx * cameraPoint[0] / zCv + local.intrinsics.cx
                 val v = local.intrinsics.fy * (-cameraPoint[1]) / zCv + local.intrinsics.cy
-                val du = u - localKey.x
-                val dv = v - localKey.y
+                val du = u - localSupport[0]
+                val dv = v - localSupport[1]
                 sqrt(du * du + dv * dv).takeIf { it.isFinite() } ?: FAILED_REPROJECTION_PX
             }
             reprojectionErrors += reprojection
             if (reprojection <= VISUAL_INLIER_PX) {
                 visualInliers += 1
+                // Coverage remains tied to the matched feature distribution rather
+                // than the sampler lattice so repeated nearby depth supports do not
+                // fake broad visual support.
                 visualInlierPoints += Point(localKey.x, localKey.y)
             }
-
-            val localMetricIndex = nearestMetricIndex(
-                local.metricPoints,
-                localKey.x,
-                localKey.y,
-                usedLocalMetric,
-                METRIC_ASSOCIATION_RADIUS_PX,
-            )
-            if (localMetricIndex < 0) continue
-            usedLocalMetric += localMetricIndex
-            val localSupport = local.metricPoints[localMetricIndex]
-            if (localSupport.size < 5) continue
-            val localWorld = floatArrayOf(localSupport[2], localSupport[3], localSupport[4])
 
             val dx = predictedLocal[0] - localWorld[0]
             val dy = predictedLocal[1] - localWorld[1]
@@ -365,8 +376,6 @@ object SharedTransformVerifier {
             t[2] * (t[4] * t[9] - t[5] * t[8])
         if (det !in 0.985..1.015) return false
 
-        // An orthonormal determinant alone is not enough when bad numeric matrices
-        // slip through. Bound relative rotation as a real SO(3) angle as well.
         val trace = t[0] + t[5] + t[10]
         val angle = Math.toDegrees(acos(((trace - 1.0) * 0.5).coerceIn(-1.0, 1.0)))
         return angle.isFinite()
