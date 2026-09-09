@@ -442,8 +442,6 @@ class ArRenderer(
             }
             matched += id
 
-            // Reuse the existing metric POI packet as a small high-rate dynamic
-            // position update. AUTO:CAR tells the receiver not to create an anchor.
             coordinator.sendPoi(id, point, "$AUTO_CAR_PREFIX$owner")
             if (isNew) status("Vehicle detected • sharing automatically")
         }
@@ -466,12 +464,9 @@ class ArRenderer(
         status("Vehicle detection unavailable: $error")
     }
 
-    /**
-     * While alignment is still being acquired, periodically surface one concise
-     * instruction through the existing English UI banner.
-     */
+    /** Only a real DIRECT peer may put the UI into shared-space syncing. */
     private fun publishSyncGuidanceIfNeeded() {
-        if (coordinator.quality().bothReady) return
+        if (!coordinator.isPeerConnected() || coordinator.quality().bothReady) return
         val now = System.currentTimeMillis()
         if (now - lastSyncHintAtMs < SYNC_HINT_INTERVAL_MS) return
         lastSyncHintAtMs = now
