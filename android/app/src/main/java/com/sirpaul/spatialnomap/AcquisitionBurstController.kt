@@ -20,7 +20,7 @@ object AcquisitionBurstController {
 
     private const val BURST_FRAMES = 12
     private const val BURST_INTERVAL_NS = 250_000_000L
-    private const val RETRY_AFTER_NS = 1_500_000_000L
+    private const val RETRY_AFTER_NS = 5_000_000_000L
 
     private var localIdentity = ""
     private var peerIdentity = ""
@@ -67,18 +67,6 @@ object AcquisitionBurstController {
             // without requiring synchronized clocks or another control packet.
             burstStartedNs = now
         }
-    }
-
-    /**
-     * A failed post-lock validation is not a transport reconnect. Keep the stable
-     * peer identity/burst id, but immediately reopen a synchronized high-rate burst
-     * so the shared world can be solved again in seconds instead of waiting for a
-     * new socket or a stale retry timer.
-     */
-    @Synchronized fun reacquire() {
-        if (!ready) return
-        locked = false
-        burstStartedNs = System.nanoTime()
     }
 
     @Synchronized fun tagForCapture(nowNs: Long = System.nanoTime()): Tag {

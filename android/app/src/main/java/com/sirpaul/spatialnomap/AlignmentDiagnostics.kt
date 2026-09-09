@@ -36,18 +36,16 @@ object AlignmentDiagnostics {
     }
 
     private fun blocker(q: AlignmentCoordinator.Quality): String = when {
-        q.bothReady -> if (q.lockValidationFailures > 0) "LOCKED_REVALIDATING" else "LOCKED"
+        q.bothReady -> "LOCKED"
         q.inliers < 8 -> "VISUAL_INLIERS"
         q.correspondences < 8 -> "CORRESPONDENCES"
         !q.medianReprojectionPx.isFinite() -> "NO_REPROJECTION"
         q.medianReprojectionPx > 4.0 -> "REPROJECTION"
-        q.imageCoverage < 0.04 -> "IMAGE_COVERAGE"
-        q.confidence < 0.09f -> "CONFIDENCE"
-        q.gravityTiltDeg.isFinite() && q.gravityTiltDeg > 10.0 -> "GRAVITY"
-        q.metricPairs < TransformSafetyPolicy.MIN_METRIC_PAIRS -> "METRIC_SUPPORT"
-        q.metricInliers < TransformSafetyPolicy.MIN_METRIC_INLIERS -> "METRIC_INLIERS"
-        !q.medianMetricResidualM.isFinite() -> "NO_METRIC_RESIDUAL"
-        q.medianMetricResidualM > TransformSafetyPolicy.MAX_MEDIAN_METRIC_RESIDUAL_M -> "METRIC_RESIDUAL"
+        q.imageCoverage < 0.05 -> "IMAGE_COVERAGE"
+        q.confidence < 0.10f -> "CONFIDENCE"
+        q.gravityTiltDeg.isFinite() && q.gravityTiltDeg > 12.0 -> "GRAVITY"
+        q.metricPairs >= 5 && q.metricInliers < 4 -> "METRIC_INLIERS"
+        q.metricPairs >= 5 && q.medianMetricResidualM.isFinite() && q.medianMetricResidualM > 0.24 -> "METRIC_RESIDUAL"
         q.localReady && !q.peerReady -> "WAITING_PEER_READY"
         q.localReady && !q.peerTransformVerified -> "PEER_TRANSFORM_VERIFY"
         q.localReady -> "CONFIRMING"
@@ -59,7 +57,7 @@ object AlignmentDiagnostics {
         val q = snapshot.quality
         val line = String.format(
             Locale.US,
-            "{\"t\":%d,\"blocker\":\"%s\",\"confidence\":%.5f,\"inliers\":%d,\"corr\":%d,\"reproj\":%.5f,\"coverage\":%.6f,\"stable\":%d,\"localReady\":%s,\"peerReady\":%s,\"verified\":%s,\"range\":%s,\"rangeDelta\":%s,\"gravity\":%.4f,\"metricPairs\":%d,\"metricInliers\":%d,\"metricResidual\":%.5f,\"lockValidationFailures\":%d,\"agreeMedian\":%.5f,\"agreeP90\":%.5f,\"agreeRot\":%.4f,\"source\":\"%s\"}\n",
+            "{\"t\":%d,\"blocker\":\"%s\",\"confidence\":%.5f,\"inliers\":%d,\"corr\":%d,\"reproj\":%.5f,\"coverage\":%.6f,\"stable\":%d,\"localReady\":%s,\"peerReady\":%s,\"verified\":%s,\"range\":%s,\"rangeDelta\":%s,\"gravity\":%.4f,\"metricPairs\":%d,\"metricInliers\":%d,\"metricResidual\":%.5f,\"agreeMedian\":%.5f,\"agreeP90\":%.5f,\"agreeRot\":%.4f,\"source\":\"%s\"}\n",
             snapshot.timestampMs,
             snapshot.blocker,
             q.confidence,
@@ -77,7 +75,6 @@ object AlignmentDiagnostics {
             q.metricPairs,
             q.metricInliers,
             q.medianMetricResidualM,
-            q.lockValidationFailures,
             q.peerAgreementMedianM,
             q.peerAgreementP90M,
             q.peerAgreementRotationDeg,

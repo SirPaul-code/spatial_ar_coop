@@ -19,6 +19,7 @@ import com.google.ar.core.TrackingState
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
@@ -41,17 +42,27 @@ class ArRenderer(
         val point: FloatArray?,
         val owner: String,
         val confidence: Float,
+        val surface: SurfaceTargetReference?,
     )
 
-    private data class LocalTarget(
-        val anchor: Anchor,
-        val owner: String,
+    private class LocalTarget(
+        var anchor: Anchor,
+        var owner: String,
+        var surface: SurfaceTargetReference?,
+        var surfaceVerified: Boolean = false,
+        var pendingCorrection: FloatArray? = null,
+        var correctionVotes: Int = 0,
+        var lastSurfaceShareMs: Long = 0L,
     )
 
-    private data class RemoteTarget(
-        val anchor: Anchor,
-        val owner: String,
-        val confidence: Float,
+    private class RemoteTarget(
+        var anchor: Anchor,
+        var owner: String,
+        var confidence: Float,
+        var surface: SurfaceTargetReference?,
+        var surfaceVerified: Boolean = false,
+        var pendingCorrection: FloatArray? = null,
+        var correctionVotes: Int = 0,
     )
 
     private data class DynamicTarget(
@@ -60,6 +71,20 @@ class ArRenderer(
         val label: String,
         val confidence: Float,
         val lastSeenMs: Long,
+    )
+
+    private data class SurfaceResolveJob(
+        val id: Long,
+        val local: Boolean,
+        val reference: SurfaceTargetReference,
+        val expectedWorld: FloatArray,
+    )
+
+    private data class SurfaceCorrection(
+        val id: Long,
+        val local: Boolean,
+        val currentFrame: CapturedFrame,
+        val result: SurfaceTargetResolver.Result,
     )
 
     @Volatile var session: Session? = null
@@ -76,17 +101,18 @@ class ArRenderer(
     private val pendingVehicleDetections = AtomicReference<List<VehicleDetector.Vehicle>?>(null)
     private val pendingVehicleError = AtomicReference<String?>(null)
 
-    /** Manual targets are persistent ARCore anchors until CLEAR. */
+    /**
+     * Surface resolution is intentionally separate from ARCore. ARCore keeps the
+     * marker stable frame-to-frame; this verifier periodically proves that the
+     * anchor is still attached to the original texture + metric surface and repairs
+     * it if the local VIO world has drifted.
+     */
+    private val surfaceResolverExecutor = Executors.newSingleThreadExecutor()
+    private val surfaceResolveBusy = AtomicBoolean(false)
+    private val surfaceCorrections = ConcurrentLinkedQueue<SurfaceCorrection>()
+
     private val localTargets = LinkedHashMap<Long, LocalTarget>()
     private val remoteTargets = LinkedHashMap<Long, RemoteTarget>()
-
-    /**
-     * Vehicle targets are deliberately NOT ARCore Anchors. A car can move, so its
-     * world position is updated from every detector/depth observation and projected
-     * directly. The same POI wire packet is reused with an AUTO:CAR owner prefix;
-     * this keeps today's APK wire-compatible with the current peer transport while
-     * preserving static-anchor behavior for manual taps.
-     */
     private val localVehicles = LinkedHashMap<Long, DynamicTarget>()
     private val remoteVehicles = LinkedHashMap<Long, DynamicTarget>()
 
@@ -99,6 +125,8 @@ class ArRenderer(
     private var lastSyncHintAtMs = 0L
     private var lastVehicleSubmitMs = 0L
     private var lastVehicleError = ""
+    private var lastSurfaceResolveMs = 0L
+    private var surfaceResolveCursor = 0
 
     init {
         overlay.onSceneTap = { x, y -> queueTap(x, y) }
@@ -108,7 +136,6 @@ class ArRenderer(
         pendingTap.set(floatArrayOf(x, y))
     }
 
-    /** Network/UI threads only enqueue mutations; render thread owns ARCore state. */
     fun setRemoteTarget(id: Long, pointLocalWorld: FloatArray?, owner: String = "", confidence: Float = 0f) {
         remoteTargetRequests.add(
             RemoteTargetRequest(
@@ -116,6 +143,7 @@ class ArRenderer(
                 point = pointLocalWorld?.copyOf(3),
                 owner = owner,
                 confidence = confidence,
+                surface = if (pointLocalWorld != null) SurfaceTargetRegistry.remote(id) else null,
             ),
         )
     }
@@ -126,6 +154,7 @@ class ArRenderer(
 
     fun clearTargets() {
         remoteTargetRequests.clear()
+        surfaceCorrections.clear()
         clearTargetsRequested.set(true)
         pendingTap.set(null)
         pendingVehicleDetections.set(null)
@@ -142,6 +171,7 @@ class ArRenderer(
         textureBoundSession = null
         pendingTap.set(null)
         remoteTargetRequests.clear()
+        surfaceCorrections.clear()
         pendingVehicleDetections.set(null)
         clearTargetsRequested.set(false)
         detachAnchorsAndTracks()
@@ -149,11 +179,14 @@ class ArRenderer(
         lastFrameError = ""
         lastSyncHintAtMs = 0L
         lastVehicleSubmitMs = 0L
+        lastSurfaceResolveMs = 0L
+        surfaceResolveCursor = 0
         trackingGate.reset()
     }
 
     fun close() {
         vehicleDetector.close()
+        surfaceResolverExecutor.shutdownNow()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -166,9 +199,7 @@ class ArRenderer(
         this.width = width
         this.height = height
         GLES20.glViewport(0, 0, width, height)
-        if (sessionResumed) {
-            runCatching { session?.setDisplayGeometry(rotationProvider(), width, height) }
-        }
+        if (sessionResumed) runCatching { session?.setDisplayGeometry(rotationProvider(), width, height) }
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -199,6 +230,7 @@ class ArRenderer(
             }
             if (!tracking) return
 
+            applySurfaceCorrections(s)
             handleTap(s, frame, camera)
             captureIfDue(frame, camera)
             maybeDetectVehicles(s, frame, camera)
@@ -219,11 +251,6 @@ class ArRenderer(
         }
     }
 
-    /**
-     * A tap is accepted only when ARCore hit testing and metric depth agree, when
-     * both are available. This prevents a valid screen tap from silently landing on
-     * a different plane several metres behind the intended surface.
-     */
     private fun handleTap(session: Session, frame: Frame, camera: Camera) {
         val tap = pendingTap.getAndSet(null) ?: return
         if (!coordinator.canPlacePoi()) {
@@ -270,8 +297,8 @@ class ArRenderer(
         }
 
         var newAnchor = bestHit?.let { runCatching { it.createAnchor() }.getOrNull() }
-        if (newAnchor == null && metricWorld != null &&
-            metricDistance != null && metricDistance.isFinite() && metricDistance <= MAX_POI_DISTANCE_M
+        if (newAnchor == null && metricWorld != null && metricDistance != null &&
+            metricDistance.isFinite() && metricDistance <= MAX_POI_DISTANCE_M
         ) {
             newAnchor = runCatching { session.createAnchor(Pose.makeTranslation(metricWorld)) }.getOrNull()
         }
@@ -290,22 +317,39 @@ class ArRenderer(
         val owner = usernameProvider()
         val point = newAnchor.pose.translation
 
-        if (coordinator.sendPoi(id, point, owner)) {
+        // Capture an explicit visual/depth fingerprint of the physical surface. The
+        // exact tap pixel is scaled into the transmitted CPU-camera frame.
+        val referenceFrame = FrameCapture.capture(
+            frame = frame,
+            camera = camera,
+            maxWidth = SURFACE_REFERENCE_MAX_WIDTH,
+            sensors = sensorSnapshotProvider(),
+        )
+        val surfaceReference = referenceFrame?.let { captured ->
+            val dims = camera.imageIntrinsics.imageDimensions
+            val sx = captured.intrinsics.width.toFloat() / dims.getOrElse(0) { captured.intrinsics.width }.coerceAtLeast(1)
+            val sy = captured.intrinsics.height.toFloat() / dims.getOrElse(1) { captured.intrinsics.height }.coerceAtLeast(1)
+            SurfaceTargetReference(captured, floatArrayOf(imagePixel[0] * sx, imagePixel[1] * sy))
+        }
+
+        val sent = if (surfaceReference != null) {
+            lastCaptureNs = System.nanoTime()
+            coordinator.sendSurfacePoi(id, point, owner, surfaceReference.frame)
+        } else {
+            coordinator.sendPoi(id, point, owner)
+        }
+
+        if (sent) {
             synchronized(targetLock) {
-                localTargets[id] = LocalTarget(newAnchor, owner)
+                localTargets[id] = LocalTarget(newAnchor, owner, surfaceReference)
             }
-            status("POI sent")
+            status(if (surfaceReference != null) "POI sent • surface lock armed" else "POI sent")
         } else {
             runCatching { newAnchor.detach() }
             status("Target blocked: spatial alignment is not ready")
         }
     }
 
-    /**
-     * Manual remote POIs become fixed ARCore anchors. AUTO:CAR packets instead
-     * update a direct world-space track because moving objects must never be frozen
-     * into ARCore's static map.
-     */
     private fun applyRemoteTargetRequests(session: Session, tracking: Boolean) {
         if (!tracking) return
 
@@ -332,29 +376,39 @@ class ArRenderer(
 
             if (request.point == null) {
                 val removed = synchronized(targetLock) { remoteTargets.remove(request.id) }
+                SurfaceTargetRegistry.remove(request.id)
                 runCatching { removed?.anchor?.detach() }
                 continue
             }
 
             val existing = synchronized(targetLock) { remoteTargets[request.id] }
             if (existing != null) {
-                synchronized(targetLock) {
-                    remoteTargets[request.id] = existing.copy(
-                        owner = request.owner,
-                        confidence = request.confidence,
-                    )
+                existing.owner = request.owner
+                existing.confidence = request.confidence
+                if (existing.surface == null && request.surface != null) existing.surface = request.surface
+
+                // Global transform refinement may republish a better provisional XYZ.
+                // Never overwrite a target after its own texture/depth verifier proved
+                // the local surface; that local evidence is more specific.
+                if (!existing.surfaceVerified) {
+                    val delta = pointDistance(existing.anchor.pose.translation, request.point)
+                    if (delta >= REMOTE_PROVISIONAL_REANCHOR_M && delta <= MAX_SURFACE_CORRECTION_M) {
+                        val replacement = runCatching { session.createAnchor(Pose.makeTranslation(request.point)) }.getOrNull()
+                        if (replacement != null) {
+                            val old = existing.anchor
+                            existing.anchor = replacement
+                            runCatching { old.detach() }
+                        }
+                    }
                 }
                 continue
             }
 
-            val anchor = runCatching {
-                session.createAnchor(Pose.makeTranslation(request.point))
-            }.getOrNull() ?: continue
-
+            val anchor = runCatching { session.createAnchor(Pose.makeTranslation(request.point)) }.getOrNull() ?: continue
             synchronized(targetLock) {
                 val prior = remoteTargets.putIfAbsent(
                     request.id,
-                    RemoteTarget(anchor, request.owner, request.confidence),
+                    RemoteTarget(anchor, request.owner, request.confidence, request.surface),
                 )
                 if (prior != null) runCatching { anchor.detach() }
             }
@@ -373,14 +427,166 @@ class ArRenderer(
             sensors = sensorSnapshotProvider(),
         ) ?: return
         coordinator.onLocalFrame(packet)
+        if (locked) scheduleSurfaceResolve(packet)
         lastCaptureNs = now
     }
 
-    /**
-     * Vehicle inference runs only after the shared world is verified. The RGB image
-     * and the metric supports come from the same ARCore frame, so every accepted 2D
-     * car box can be turned into a real 3D point before it is sent to the peer.
-     */
+    private fun scheduleSurfaceResolve(currentFrame: CapturedFrame) {
+        val now = System.currentTimeMillis()
+        if (now - lastSurfaceResolveMs < SURFACE_RESOLVE_INTERVAL_MS) return
+        if (!surfaceResolveBusy.compareAndSet(false, true)) return
+
+        val jobs = ArrayList<SurfaceResolveJob>()
+        synchronized(targetLock) {
+            localTargets.forEach { (id, target) ->
+                val ref = target.surface ?: return@forEach
+                if (target.anchor.trackingState == TrackingState.TRACKING) {
+                    jobs += SurfaceResolveJob(id, true, ref, target.anchor.pose.translation.copyOf())
+                }
+            }
+            remoteTargets.forEach { (id, target) ->
+                val ref = target.surface ?: return@forEach
+                if (target.anchor.trackingState == TrackingState.TRACKING) {
+                    jobs += SurfaceResolveJob(id, false, ref, target.anchor.pose.translation.copyOf())
+                }
+            }
+        }
+
+        if (jobs.isEmpty()) {
+            surfaceResolveBusy.set(false)
+            return
+        }
+        lastSurfaceResolveMs = now
+        val selected = ArrayList<SurfaceResolveJob>(SURFACE_RESOLVE_BATCH)
+        repeat(minOf(SURFACE_RESOLVE_BATCH, jobs.size)) {
+            selected += jobs[(surfaceResolveCursor + it) % jobs.size]
+        }
+        surfaceResolveCursor = (surfaceResolveCursor + selected.size) % jobs.size
+
+        surfaceResolverExecutor.execute {
+            try {
+                for (job in selected) {
+                    if (Thread.currentThread().isInterrupted) break
+                    val result = runCatching {
+                        SurfaceTargetResolver.resolve(job.reference, currentFrame, job.expectedWorld)
+                    }.getOrNull() ?: continue
+                    surfaceCorrections.add(SurfaceCorrection(job.id, job.local, currentFrame, result))
+                }
+            } finally {
+                surfaceResolveBusy.set(false)
+            }
+        }
+    }
+
+    /** Apply only consensus visual+depth corrections on the AR/render thread. */
+    private fun applySurfaceCorrections(session: Session) {
+        while (true) {
+            val correction = surfaceCorrections.poll() ?: break
+            if (correction.local) applyLocalSurfaceCorrection(session, correction)
+            else applyRemoteSurfaceCorrection(session, correction)
+        }
+    }
+
+    private fun applyLocalSurfaceCorrection(session: Session, correction: SurfaceCorrection) {
+        val target = synchronized(targetLock) { localTargets[correction.id] } ?: return
+        val result = correction.result
+        val oldPoint = target.anchor.pose.translation
+        val delta = pointDistance(oldPoint, result.pointWorld)
+        if (!delta.isFinite() || delta > MAX_SURFACE_CORRECTION_M) return
+        if (delta < SURFACE_CORRECTION_DEADBAND_M) {
+            target.surfaceVerified = true
+            target.pendingCorrection = null
+            target.correctionVotes = 0
+            return
+        }
+        if (!voteForCorrection(target, result.pointWorld, result.confidence, result.visualInliers, delta)) return
+
+        val replacement = runCatching { session.createAnchor(Pose.makeTranslation(result.pointWorld)) }.getOrNull() ?: return
+        val old = target.anchor
+        target.anchor = replacement
+        target.surfaceVerified = true
+        target.pendingCorrection = null
+        target.correctionVotes = 0
+        val refreshed = SurfaceTargetReference(correction.currentFrame, result.matchedPixel.copyOf())
+        target.surface = refreshed
+        runCatching { old.detach() }
+
+        val now = System.currentTimeMillis()
+        if (delta >= SURFACE_RESHARE_MIN_M && now - target.lastSurfaceShareMs >= SURFACE_RESHARE_INTERVAL_MS) {
+            target.lastSurfaceShareMs = now
+            coordinator.sendSurfacePoi(correction.id, replacement.pose.translation, target.owner, refreshed.frame)
+        }
+    }
+
+    private fun applyRemoteSurfaceCorrection(session: Session, correction: SurfaceCorrection) {
+        val target = synchronized(targetLock) { remoteTargets[correction.id] } ?: return
+        val result = correction.result
+        val oldPoint = target.anchor.pose.translation
+        val delta = pointDistance(oldPoint, result.pointWorld)
+        if (!delta.isFinite() || delta > MAX_SURFACE_CORRECTION_M) return
+        if (delta < SURFACE_CORRECTION_DEADBAND_M) {
+            target.surfaceVerified = true
+            target.pendingCorrection = null
+            target.correctionVotes = 0
+            return
+        }
+        if (!voteForCorrection(target, result.pointWorld, result.confidence, result.visualInliers, delta)) return
+
+        val replacement = runCatching { session.createAnchor(Pose.makeTranslation(result.pointWorld)) }.getOrNull() ?: return
+        val old = target.anchor
+        target.anchor = replacement
+        target.surfaceVerified = true
+        target.pendingCorrection = null
+        target.correctionVotes = 0
+        // Once this phone has independently seen the surface, continue tracking it
+        // from its own visual reference instead of depending on the peer's old frame.
+        target.surface = SurfaceTargetReference(correction.currentFrame, result.matchedPixel.copyOf())
+        runCatching { old.detach() }
+    }
+
+    private fun voteForCorrection(
+        target: LocalTarget,
+        point: FloatArray,
+        confidence: Float,
+        inliers: Int,
+        delta: Float,
+    ): Boolean {
+        val prior = target.pendingCorrection
+        if (prior != null && pointDistance(prior, point) <= SURFACE_VOTE_CONSISTENCY_M) {
+            target.correctionVotes += 1
+            target.pendingCorrection = averagePoint(prior, point)
+        } else {
+            target.pendingCorrection = point.copyOf()
+            target.correctionVotes = 1
+        }
+        val oneShot = delta <= SURFACE_ONE_SHOT_MAX_M && confidence >= SURFACE_ONE_SHOT_CONFIDENCE &&
+            inliers >= SURFACE_ONE_SHOT_INLIERS
+        return oneShot || target.correctionVotes >= SURFACE_REQUIRED_VOTES
+    }
+
+    private fun voteForCorrection(
+        target: RemoteTarget,
+        point: FloatArray,
+        confidence: Float,
+        inliers: Int,
+        delta: Float,
+    ): Boolean {
+        val prior = target.pendingCorrection
+        if (prior != null && pointDistance(prior, point) <= SURFACE_VOTE_CONSISTENCY_M) {
+            target.correctionVotes += 1
+            target.pendingCorrection = averagePoint(prior, point)
+        } else {
+            target.pendingCorrection = point.copyOf()
+            target.correctionVotes = 1
+        }
+        val oneShot = delta <= SURFACE_ONE_SHOT_MAX_M && confidence >= SURFACE_ONE_SHOT_CONFIDENCE &&
+            inliers >= SURFACE_ONE_SHOT_INLIERS
+        return oneShot || target.correctionVotes >= SURFACE_REQUIRED_VOTES
+    }
+
+    private fun averagePoint(a: FloatArray, b: FloatArray): FloatArray =
+        FloatArray(3) { i -> (a.getOrElse(i) { 0f } + b.getOrElse(i) { 0f }) * 0.5f }
+
     private fun maybeDetectVehicles(session: Session, frame: Frame, camera: Camera) {
         if (!coordinator.quality().bothReady || vehicleDetector.isBusy()) return
         val now = System.currentTimeMillis()
@@ -401,7 +607,6 @@ class ArRenderer(
         if (accepted) lastVehicleSubmitMs = now
     }
 
-    /** Associate repeated detector observations with persistent room track IDs. */
     private fun applyVehicleDetections() {
         val detections = pendingVehicleDetections.getAndSet(null) ?: return
         val now = System.currentTimeMillis()
@@ -425,11 +630,8 @@ class ArRenderer(
             val isNew = bestId == null
             val id = bestId ?: newTargetId()
             val existing = synchronized(targetLock) { localVehicles[id] }
-            val point = if (existing == null) {
-                vehicle.pointWorld.copyOf(3)
-            } else {
-                smoothPoint(existing.point, vehicle.pointWorld, VEHICLE_SMOOTH_ALPHA)
-            }
+            val point = if (existing == null) vehicle.pointWorld.copyOf(3)
+            else smoothPoint(existing.point, vehicle.pointWorld, VEHICLE_SMOOTH_ALPHA)
 
             synchronized(targetLock) {
                 localVehicles[id] = DynamicTarget(
@@ -441,7 +643,6 @@ class ArRenderer(
                 )
             }
             matched += id
-
             coordinator.sendPoi(id, point, "$AUTO_CAR_PREFIX$owner")
             if (isNew) status("Vehicle detected • sharing automatically")
         }
@@ -450,10 +651,8 @@ class ArRenderer(
     private fun expireVehicleTracks() {
         val now = System.currentTimeMillis()
         synchronized(targetLock) {
-            val localExpired = localVehicles.filterValues { now - it.lastSeenMs > LOCAL_VEHICLE_TTL_MS }.keys.toList()
-            localExpired.forEach { localVehicles.remove(it) }
-            val remoteExpired = remoteVehicles.filterValues { now - it.lastSeenMs > REMOTE_VEHICLE_TTL_MS }.keys.toList()
-            remoteExpired.forEach { remoteVehicles.remove(it) }
+            localVehicles.filterValues { now - it.lastSeenMs > LOCAL_VEHICLE_TTL_MS }.keys.toList().forEach { localVehicles.remove(it) }
+            remoteVehicles.filterValues { now - it.lastSeenMs > REMOTE_VEHICLE_TTL_MS }.keys.toList().forEach { remoteVehicles.remove(it) }
         }
     }
 
@@ -464,9 +663,8 @@ class ArRenderer(
         status("Vehicle detection unavailable: $error")
     }
 
-    /** Only a real DIRECT peer may put the UI into shared-space syncing. */
     private fun publishSyncGuidanceIfNeeded() {
-        if (!coordinator.isPeerConnected() || coordinator.quality().bothReady) return
+        if (coordinator.quality().bothReady) return
         val now = System.currentTimeMillis()
         if (now - lastSyncHintAtMs < SYNC_HINT_INTERVAL_MS) return
         lastSyncHintAtMs = now
@@ -495,54 +693,25 @@ class ArRenderer(
         )
         for ((id, target) in localSnapshot) {
             projectAnchor(
-                camera = camera,
-                anchor = target.anchor,
-                id = id,
-                label = "YOU • ${shortTargetId(id)}",
-                confidence = coordinator.quality().confidence,
-                isLocal = true,
-                view = view,
-                projection = projection,
+                camera, target.anchor, id, "YOU • ${shortTargetId(id)}",
+                coordinator.quality().confidence, true, view, projection,
             )?.let { projected += it }
         }
         for ((id, target) in remoteSnapshot) {
             val owner = target.owner.ifBlank { "PEER" }
-            projectAnchor(
-                camera = camera,
-                anchor = target.anchor,
-                id = id,
-                label = "$owner • ${shortTargetId(id)}",
-                confidence = target.confidence,
-                isLocal = false,
-                view = view,
-                projection = projection,
-            )?.let { projected += it }
+            projectAnchor(camera, target.anchor, id, "$owner • ${shortTargetId(id)}", target.confidence, false, view, projection)
+                ?.let { projected += it }
         }
         for ((id, target) in localVehicleSnapshot) {
-            projectPoint(
-                camera = camera,
-                point = target.point,
-                id = id,
-                label = "${target.label} • YOU",
-                confidence = target.confidence,
-                isLocal = true,
-                view = view,
-                projection = projection,
-            )?.let { projected += it }
+            projectPoint(camera, target.point, id, "${target.label} • YOU", target.confidence, true, view, projection)
+                ?.let { projected += it }
         }
         for ((id, target) in remoteVehicleSnapshot) {
             projectPoint(
-                camera = camera,
-                point = target.point,
-                id = id,
-                label = "${target.label} • ${target.owner.ifBlank { "PEER" }}",
-                confidence = target.confidence,
-                isLocal = false,
-                view = view,
-                projection = projection,
+                camera, target.point, id, "${target.label} • ${target.owner.ifBlank { "PEER" }}",
+                target.confidence, false, view, projection,
             )?.let { projected += it }
         }
-
         overlay.setTargets(projected)
     }
 
@@ -571,8 +740,7 @@ class ArRenderer(
         projection: FloatArray,
     ): TargetOverlayView.Target? {
         if (point.size < 3 || !point.take(3).all { it.isFinite() }) return null
-        val p = point
-        val world = floatArrayOf(p[0], p[1], p[2], 1f)
+        val world = floatArrayOf(point[0], point[1], point[2], 1f)
         val cameraV = FloatArray(4)
         val clip = FloatArray(4)
         Matrix.multiplyMV(cameraV, 0, view, 0, world, 0)
@@ -589,9 +757,9 @@ class ArRenderer(
             y = (1f - ndcY) * 0.5f * height
         }
 
-        val dx = p[0] - camera.pose.tx()
-        val dy = p[1] - camera.pose.ty()
-        val dz = p[2] - camera.pose.tz()
+        val dx = point[0] - camera.pose.tx()
+        val dy = point[1] - camera.pose.ty()
+        val dz = point[2] - camera.pose.tz()
         val distance = sqrt(dx * dx + dy * dy + dz * dz)
         return TargetOverlayView.Target(
             id = id,
@@ -658,6 +826,20 @@ class ArRenderer(
         private const val TAP_DEPTH_TOLERANCE_RATIO = 0.06f
         private const val MAX_POI_DISTANCE_M = 30f
         private const val SYNC_HINT_INTERVAL_MS = 9000L
+
+        private const val SURFACE_REFERENCE_MAX_WIDTH = 1440
+        private const val SURFACE_RESOLVE_INTERVAL_MS = 420L
+        private const val SURFACE_RESOLVE_BATCH = 2
+        private const val MAX_SURFACE_CORRECTION_M = 0.65f
+        private const val REMOTE_PROVISIONAL_REANCHOR_M = 0.025f
+        private const val SURFACE_CORRECTION_DEADBAND_M = 0.010f
+        private const val SURFACE_ONE_SHOT_MAX_M = 0.045f
+        private const val SURFACE_ONE_SHOT_CONFIDENCE = 0.42f
+        private const val SURFACE_ONE_SHOT_INLIERS = 10
+        private const val SURFACE_VOTE_CONSISTENCY_M = 0.065f
+        private const val SURFACE_REQUIRED_VOTES = 2
+        private const val SURFACE_RESHARE_MIN_M = 0.015f
+        private const val SURFACE_RESHARE_INTERVAL_MS = 800L
 
         private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
         private const val VEHICLE_DETECT_INTERVAL_MS = 450L

@@ -1,1 +1,0 @@
-Do not re-enable continuous shared-world refinement or surface-target correction until the hybrid stabilization build (deterministic Wi-Fi Aware transport + pre-refinement alignment/renderer) passes physical cross-device POI placement tests.

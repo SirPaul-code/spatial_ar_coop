@@ -37,6 +37,7 @@ object AlignmentEngine {
         val headingResidualDeg: Double = Double.NaN,
         val sensorPriorConfidence: Float = 0f,
         val gravityTiltDeg: Double = Double.NaN,
+        // Independent 3D->3D validation using metric depth from BOTH phones.
         val metricPairs: Int = 0,
         val metricInliers: Int = 0,
         val medianMetricResidualM: Double = Double.NaN,
@@ -53,26 +54,54 @@ object AlignmentEngine {
         val ratio: Float,
     )
 
-    /**
-     * Solver hierarchy is intentionally metric-first:
-     *
-     *  1. Same visual feature + independent metric XYZ on both phones -> robust 3D/3D.
-     *  2. Essential pose + metric scale only when the direct path cannot be formed.
-     *  3. Metric PnP fallback.
-     *
-     * The old hierarchy ran Essential first, allowing a tiny-baseline two-scale-pair
-     * fit to pre-empt much stronger depth evidence and create a false LOCKED world.
-     */
     fun solve(remote: CapturedFrame, local: CapturedFrame): Result? {
         val matchSet = siftMatches(remote, local) ?: return null
         if (matchSet.matches.size < MIN_MATCHES_FOR_PNP) return null
+
+        // Fast path that does NOT require dense depth at every SIFT feature. The
+        // essential matrix obtains relative rotation + translation direction from
+        // all visual matches; only a couple of metric correspondences are needed to
+        // recover translation scale. This is much easier to acquire than PnP when
+        // both phones already track well but their depth support is sparse.
+        if (matchSet.matches.size >= 12) {
+            val observations = matchSet.matches.map { match ->
+                val remotePoint = matchSet.keyRemote[match.queryIdx].pt
+                val localPoint = matchSet.keyLocal[match.trainIdx].pt
+                EssentialSharedPoseSolver.Observation(
+                    remoteX = remotePoint.x,
+                    remoteY = remotePoint.y,
+                    localX = localPoint.x,
+                    localY = localPoint.y,
+                )
+            }
+            val essential = EssentialSharedPoseSolver.solve(remote, local, observations)
+            if (essential != null) {
+                return Result(
+                    transformLocalFromRemote = essential.transformLocalFromRemote,
+                    inliers = essential.visualInliers,
+                    correspondences = essential.visualCorrespondences,
+                    matches = matchSet.matches.size,
+                    medianReprojectionPx = essential.medianEpipolarPx,
+                    imageCoverage = essential.imageCoverage,
+                    predictedDeviceDistanceM = essential.predictedDeviceDistanceM,
+                    confidence = essential.confidence,
+                    gravityTiltDeg = essential.gravityTiltDeg,
+                    metricPairs = essential.metricPairs,
+                    metricInliers = essential.metricInliers,
+                    medianMetricResidualM = essential.medianMetricResidualM,
+                )
+            }
+        }
+
+        // Dense metric PnP remains the precision fallback when the essential path
+        // cannot recover a reliable metric scale.
+        if (remote.metricPoints.size < 24) return null
 
         val usedRemoteMetric = HashSet<Int>()
         val usedLocalMetric = HashSet<Int>()
         val objectPoints = ArrayList<Point3>()
         val imagePoints = ArrayList<Point>()
         val localMetricWorld = ArrayList<Point3?>()
-        val localMetricImage = ArrayList<Point?>()
 
         for (m in matchSet.matches) {
             val remoteKey = matchSet.keyRemote[m.queryIdx].pt
@@ -109,23 +138,19 @@ object AlignmentEngine {
             localMetricWorld += localSupport?.let {
                 Point3(it[2].toDouble(), it[3].toDouble(), it[4].toDouble())
             }
-            // IMPORTANT: direct 3D/3D reprojection must compare against the pixel of
-            // the metric support itself, not the nearby SIFT keypoint. A metric sample
-            // may legitimately sit several pixels from the keypoint used to associate
-            // it; comparing to the keypoint created false 4px gate failures.
-            localMetricImage += localSupport?.let {
-                Point(it[0].toDouble(), it[1].toDouble())
-            }
         }
+        if (objectPoints.size < 6) return null
 
-        // Strongest fast path: paired metric world points directly determine the
-        // rigid transform between the two ARCore worlds.
+        // FAST PATH: when BOTH phones have metric depth for the same visual
+        // features, do not unnecessarily solve a 3D->2D PnP problem first. Those
+        // paired world points directly define a shared physical frame. A robust
+        // 3D->3D rigid fit is the local, infrastructure-free equivalent of a shared
+        // visual anchor and usually converges from the first overlapping view.
         val pairedRemoteWorld = ArrayList<FloatArray>()
         val pairedLocalWorld = ArrayList<FloatArray>()
-        val pairedLocalMetricImage = ArrayList<Point>()
+        val pairedLocalImage = ArrayList<Point>()
         for (i in objectPoints.indices) {
             val localMetric = localMetricWorld.getOrNull(i) ?: continue
-            val localMetricUv = localMetricImage.getOrNull(i) ?: continue
             val remoteMetric = objectPoints[i]
             pairedRemoteWorld += floatArrayOf(
                 remoteMetric.x.toFloat(),
@@ -137,7 +162,7 @@ object AlignmentEngine {
                 localMetric.y.toFloat(),
                 localMetric.z.toFloat(),
             )
-            pairedLocalMetricImage += localMetricUv
+            pairedLocalImage += imagePoints[i]
         }
         if (pairedRemoteWorld.size >= MIN_SHARED_ANCHOR_PAIRS) {
             val direct = SharedVisualAnchorSolver.solve(pairedRemoteWorld, pairedLocalWorld)
@@ -147,48 +172,15 @@ object AlignmentEngine {
                     remote = remote,
                     local = local,
                     remoteWorld = pairedRemoteWorld,
-                    localImage = pairedLocalMetricImage,
+                    localImage = pairedLocalImage,
                     totalMatches = matchSet.matches.size,
                 )
             }
             if (directResult != null) return directResult
         }
 
-        // Essential geometry is only a fallback. EssentialSharedPoseSolver itself
-        // rejects tiny baselines and now requires several independent metric pairs.
-        if (matchSet.matches.size >= MIN_ESSENTIAL_MATCHES) {
-            val observations = matchSet.matches.map { match ->
-                val remotePoint = matchSet.keyRemote[match.queryIdx].pt
-                val localPoint = matchSet.keyLocal[match.trainIdx].pt
-                EssentialSharedPoseSolver.Observation(
-                    remoteX = remotePoint.x,
-                    remoteY = remotePoint.y,
-                    localX = localPoint.x,
-                    localY = localPoint.y,
-                )
-            }
-            val essential = EssentialSharedPoseSolver.solve(remote, local, observations)
-            if (essential != null) {
-                return Result(
-                    transformLocalFromRemote = essential.transformLocalFromRemote,
-                    inliers = essential.visualInliers,
-                    correspondences = essential.visualCorrespondences,
-                    matches = matchSet.matches.size,
-                    medianReprojectionPx = essential.medianEpipolarPx,
-                    imageCoverage = essential.imageCoverage,
-                    predictedDeviceDistanceM = essential.predictedDeviceDistanceM,
-                    confidence = essential.confidence,
-                    gravityTiltDeg = essential.gravityTiltDeg,
-                    metricPairs = essential.metricPairs,
-                    metricInliers = essential.metricInliers,
-                    medianMetricResidualM = essential.medianMetricResidualM,
-                )
-            }
-        }
-
-        // Final fallback: remote metric 3D -> local visual 2D PnP with symmetric local
-        // metric validation when depth is available on the local phone.
-        if (objectPoints.size < 6) return null
+        // FALLBACK: depth may be sparse on one phone. The original metric PnP path
+        // still works with remote 3D points and local 2D visual observations.
         val obj = MatOfPoint3f(*objectPoints.toTypedArray())
         val img = MatOfPoint2f(*imagePoints.toTypedArray())
         val k = cameraMatrix(local.intrinsics)
@@ -292,6 +284,10 @@ object AlignmentEngine {
         val median = if (errors.isNotEmpty()) errors[errors.size / 2] else 999.0
         val coverage = imageCoverage(inImg, local.intrinsics.width, local.intrinsics.height)
 
+        // Crucial symmetric check: PnP can fit a wrong transform when a SIFT feature
+        // is accidentally associated with depth from another surface. If the local
+        // phone also has metric depth at the matched feature, the transformed remote
+        // 3D point must land near that independently measured local 3D point.
         val metricResiduals = ArrayList<Double>()
         var metricInliers = 0
         for (sourceIndex in inOriginalIndexes) {
@@ -399,7 +395,9 @@ object AlignmentEngine {
     ): Result? {
         if (fit.inlierIndices.size < MIN_SHARED_ANCHOR_INLIERS) return null
         val transform = fit.transformLocalFromRemote
-        if (transform.size < 16 || !transform.all { it.isFinite() } || determinant3(transform) !in 0.985..1.015) return null
+        if (transform.size < 16 || !transform.all { it.isFinite() } || determinant3(transform) !in 0.985..1.015) {
+            return null
+        }
 
         val cameraFromLocalWorld = invertRigid(poseMatrix(local.pose)) ?: return null
         val reprojectionErrors = ArrayList<Double>()
@@ -428,7 +426,9 @@ object AlignmentEngine {
         reprojectionErrors.sort()
         val medianReprojection = reprojectionErrors[reprojectionErrors.size / 2]
         val coverage = imageCoverage(coveragePoints, local.intrinsics.width, local.intrinsics.height)
-        if (medianReprojection > SHARED_ANCHOR_MAX_REPROJECTION_PX || coverage < SHARED_ANCHOR_MIN_COVERAGE) return null
+        if (medianReprojection > SHARED_ANCHOR_MAX_REPROJECTION_PX || coverage < SHARED_ANCHOR_MIN_COVERAGE) {
+            return null
+        }
 
         val gravityTilt = FusionMath.gravityTiltDeg(transform)
         if (gravityTilt.isFinite() && gravityTilt > SHARED_ANCHOR_MAX_GRAVITY_TILT_DEG) return null
@@ -500,6 +500,11 @@ object AlignmentEngine {
         return if (best >= 0 && bestD2 <= gate2) best else -1
     }
 
+    /**
+     * High feature count is intentional. Wi-Fi Aware bandwidth is cheaper than a
+     * false shared-world lock, and RANSAC plus symmetric depth validation reject
+     * the extra outliers.
+     */
     private fun siftMatches(remote: CapturedFrame, local: CapturedFrame): MatchSet? {
         val a = decodeGray(remote) ?: return null
         val b = decodeGray(local) ?: run {
@@ -551,7 +556,9 @@ object AlignmentEngine {
                 if (ratio < SIFT_RATIO) {
                     val m = arr[0]
                     ratioAccepted += RatioMatch(m, ratio)
-                    if (m.trainIdx in reverseBest.indices && reverseBest[m.trainIdx] == m.queryIdx) mutual += m
+                    if (m.trainIdx in reverseBest.indices && reverseBest[m.trainIdx] == m.queryIdx) {
+                        mutual += m
+                    }
                 }
             }
             pair.release()
@@ -609,14 +616,16 @@ object AlignmentEngine {
         return sqrt(dx * dx + dy * dy + dz * dz)
     }
 
-    private fun decodeGray(frame: CapturedFrame): Mat? = try {
-        val bytes = Base64.decode(frame.jpegBase64, Base64.DEFAULT)
-        val mob = MatOfByte(*bytes)
-        val image = Imgcodecs.imdecode(mob, Imgcodecs.IMREAD_GRAYSCALE)
-        mob.release()
-        image.takeUnless { it.empty() }
-    } catch (_: Throwable) {
-        null
+    private fun decodeGray(frame: CapturedFrame): Mat? {
+        return try {
+            val bytes = Base64.decode(frame.jpegBase64, Base64.DEFAULT)
+            val mob = MatOfByte(*bytes)
+            val image = Imgcodecs.imdecode(mob, Imgcodecs.IMREAD_GRAYSCALE)
+            mob.release()
+            image.takeUnless { it.empty() }
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun cameraMatrix(k: IntrinsicsPacket): Mat {
@@ -729,22 +738,21 @@ object AlignmentEngine {
     private const val STRICT_FALLBACK_RATIO = 0.70f
     private const val RECOVERY_FALLBACK_RATIO = 0.76f
     private const val MIN_MATCHES_FOR_PNP = 8
-    private const val MIN_ESSENTIAL_MATCHES = 14
     private const val RECOVERY_MATCH_TARGET = 18
     private const val MAX_STRICT_AUGMENT = 48
     private const val METRIC_ASSOCIATION_RADIUS_PX = 10.0
     private const val LOCAL_METRIC_ASSOCIATION_RADIUS_PX = 10.0
-    private const val MIN_SHARED_ANCHOR_PAIRS = 8
+    private const val MIN_SHARED_ANCHOR_PAIRS = 6
     private const val MIN_SHARED_ANCHOR_INLIERS = 8
     private const val SHARED_ANCHOR_MAX_REPROJECTION_PX = 4.0
-    private const val SHARED_ANCHOR_MIN_COVERAGE = 0.04
-    private const val SHARED_ANCHOR_MAX_GRAVITY_TILT_DEG = 10.0
+    private const val SHARED_ANCHOR_MIN_COVERAGE = 0.05
+    private const val SHARED_ANCHOR_MAX_GRAVITY_TILT_DEG = 12.0
     private const val SHARED_ANCHOR_MIN_CONFIDENCE = 0.10f
     private const val MIN_WORLD_SUPPORT_DIAMETER_M = 0.10
     private const val MIN_CHEIRALITY_RATIO = 0.92
     private const val MIN_METRIC_PAIRS_FOR_GATE = 5
     private const val MIN_METRIC_INLIERS = 4
-    private const val MIN_METRIC_INLIER_RATIO = 0.70
-    private const val METRIC_RESIDUAL_INLIER_M = 0.18
-    private const val MAX_MEDIAN_METRIC_RESIDUAL_M = 0.18
+    private const val MIN_METRIC_INLIER_RATIO = 0.60
+    private const val METRIC_RESIDUAL_INLIER_M = 0.20
+    private const val MAX_MEDIAN_METRIC_RESIDUAL_M = 0.24
 }

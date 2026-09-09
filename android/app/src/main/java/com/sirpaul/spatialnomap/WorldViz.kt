@@ -5,12 +5,13 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * Process-local mirror of the shared spatial state used by the visualizer.
+ * Process-local mirror of the shared spatial state used by the demo visualizer.
  *
- * The WORLD/Bird's Eye view is presentation only and must never make a raw transform
- * proposal look authoritative. Remote geometry is therefore exposed only after a
- * PEER_ACK has been observed in the current connection and both ready flags are true.
- * This is deliberately stricter than simply seeing senderFromPeer on the wire.
+ * This deliberately observes the same wire messages that drive the real app. It
+ * does not invent a second coordinate system. Incoming remote frames/targets are
+ * transformed with the currently observed localFromPeer transform; local data stay
+ * in the local ARCore world. This makes the Bird's Eye view an honest visualization
+ * of the exact shared-world transform currently being used by the product.
  */
 object WorldVizBus {
     enum class Direction { OUT, IN }
@@ -50,7 +51,6 @@ object WorldVizBus {
     private var peerName = "PEER"
     private var localReady = false
     private var peerReady = false
-    private var peerAckObserved = false
     private val localTargets = LinkedHashMap<Long, VizTarget>()
     private val remoteTargets = LinkedHashMap<Long, VizTarget>()
 
@@ -58,19 +58,8 @@ object WorldVizBus {
         val now = System.currentTimeMillis()
         when (message) {
             is WireMessage.Hello -> {
-                if (direction == Direction.OUT) {
-                    localName = message.username.ifBlank { "YOU" }
-                    // A local Hello is emitted for a newly attached TCP socket. Do
-                    // not let a prior connection's ACK make the new WORLD look locked.
-                    localReady = false
-                    peerReady = false
-                    peerAckObserved = false
-                    localFromPeer = null
-                    latestRemoteFrame = null
-                    remoteTargets.clear()
-                } else {
-                    peerName = message.username.ifBlank { "PEER" }
-                }
+                if (direction == Direction.OUT) localName = message.username.ifBlank { "YOU" }
+                else peerName = message.username.ifBlank { "PEER" }
                 AcquisitionBurstController.observeHello(
                     local = direction == Direction.OUT,
                     username = message.username,
@@ -95,8 +84,7 @@ object WorldVizBus {
                         lastSeenMs = now,
                     )
                 } else {
-                    val transform = verifiedTransform() ?: return
-                    val mapped = transformPoint(transform, message.pointWorld) ?: return
+                    val mapped = transformPoint(localFromPeer, message.pointWorld) ?: return
                     val clean = cleanOwner(message.owner, peerName)
                     remoteTargets[message.id] = VizTarget(
                         id = message.id,
@@ -123,28 +111,18 @@ object WorldVizBus {
                         invertRigid(senderFromLocal)?.let { localFromPeer = it }
                     }
                 }
-                if (message.transformSource == "PEER_ACK" && message.senderFromPeer != null) {
-                    peerAckObserved = true
-                }
                 AcquisitionBurstController.observeQuality(direction == Direction.OUT, message.ready)
             }
             is WireMessage.ResetAlignment -> {
                 localReady = false
                 peerReady = false
-                peerAckObserved = false
                 localFromPeer = null
                 latestLocalFrame = null
                 latestRemoteFrame = null
                 localTargets.clear()
                 remoteTargets.clear()
                 SpatialMapAccumulator.clear()
-
-                // ResetAlignment is a spatial-state reset on an already alive DIRECT
-                // connection, not a transport disconnect. The coordinator explicitly
-                // asks for immediate reacquisition; resetting the burst controller here
-                // used to erase peer identities after reacquire() and could leave both
-                // phones unable to start another synchronized burst until reconnect.
-                AcquisitionBurstController.reacquire()
+                AcquisitionBurstController.reset()
             }
             is WireMessage.Range -> Unit
         }
@@ -160,8 +138,7 @@ object WorldVizBus {
                 points += VizPoint(floatArrayOf(p[2], p[3], p[4]), remote = false)
             }
         }
-
-        val transform = verifiedTransform()
+        val transform = localFromPeer
         if (transform != null) {
             latestRemoteFrame?.let { frame ->
                 sampleMetric(frame.metricPoints, maxPointsPerSide).forEach { p ->
@@ -204,16 +181,13 @@ object WorldVizBus {
             points = points,
             actors = actors,
             targets = localTargets.values.map { it.copy(position = it.position.copyOf()) } +
-                if (transform != null) remoteTargets.values.map { it.copy(position = it.position.copyOf()) } else emptyList(),
-            locked = transform != null,
+                remoteTargets.values.map { it.copy(position = it.position.copyOf()) },
+            locked = localReady && peerReady && localFromPeer != null,
             burstProgress = AcquisitionBurstController.currentProgress(),
             recorderPath = AlignmentSessionRecorder.latestSessionPath(),
             timestampMs = now,
         )
     }
-
-    private fun verifiedTransform(): DoubleArray? =
-        localFromPeer?.takeIf { peerAckObserved && localReady && peerReady }
 
     private fun sampleMetric(points: List<FloatArray>, limit: Int): List<FloatArray> {
         if (points.size <= limit) return points
