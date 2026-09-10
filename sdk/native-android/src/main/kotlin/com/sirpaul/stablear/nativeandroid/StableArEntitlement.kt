@@ -25,11 +25,14 @@ object StableArEntitlement {
     @Suppress("DEPRECATION")
     fun androidAppBinding(context:Context):String {
         val pm=context.packageManager;val pkg=context.packageName
-        val certs=if(Build.VERSION.SDK_INT>=28){
+        val cert=if(Build.VERSION.SDK_INT>=28){
             val info=pm.getPackageInfo(pkg,PackageManager.GET_SIGNING_CERTIFICATES).signingInfo
-            if(info.hasMultipleSigners())info.apkContentsSigners else info.signingCertificateHistory
-        }else pm.getPackageInfo(pkg,PackageManager.GET_SIGNATURES).signatures
-        val cert=certs.firstOrNull()?.toByteArray()?:error("No signing certificate for $pkg")
+                ?: error("No signing information for $pkg")
+            val certs=if(info.hasMultipleSigners())info.apkContentsSigners else info.signingCertificateHistory
+            certs?.firstOrNull()?.toByteArray()
+        }else{
+            pm.getPackageInfo(pkg,PackageManager.GET_SIGNATURES).signatures?.firstOrNull()?.toByteArray()
+        }?:error("No signing certificate for $pkg")
         val digest=MessageDigest.getInstance("SHA-256").digest(cert).joinToString(""){"%02x".format(it)}
         return "$pkg:$digest"
     }
