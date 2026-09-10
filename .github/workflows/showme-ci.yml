@@ -120,7 +120,7 @@ jobs:
           cp android/showme/build/outputs/apk/release/showme-release.apk ShowMe-latest-release.apk
           sha256sum ShowMe-latest-dev.apk ShowMe-latest-release.apk > SHOWME-SHA256SUMS.txt
           zip -j ShowMe-browser.zip showme/web/index.html showme/web/style.css showme/web/app.js showme/web/geometry.mjs showme/web/live-video.mjs showme/web/remote-session.mjs showme/web/control-rpc.mjs
-          zip -r ShowMe-server.zip showme/server -x 'showme/server/node_modules/*' 'showme/server/public/*' 'showme/server/.dry-run/*'
+          zip -r ShowMe-server.zip showme/server showme/web -x 'showme/server/node_modules/*' 'showme/server/public/*' 'showme/server/.dry-run/*'
           cat > SHOWME-RELEASE.md <<EOF
           ShowMe zero-config Internet build from \`showme/remote-assistance\` at \`$GITHUB_SHA\`.
 
