@@ -214,7 +214,9 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
             queueWorker {
                 runCatching { tracker.add(id, gray.bytes, gray.width, gray.height, sensorPixel) }
             }
-        } else diagnostics[id = placed.attachment.id]?.lastReason = "Depth attachment active; exact-size visual reference unavailable"
+        } else {
+            diagnostics[placed.attachment.id]?.lastReason = "Depth attachment active; exact-size visual reference unavailable"
+        }
         updateDiagnostics(force = true)
         return Placement(placed.attachment.id, world.floatArray(), videoFrameId, placed.fit.depth)
     }
