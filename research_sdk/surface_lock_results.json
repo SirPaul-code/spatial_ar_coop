@@ -1,0 +1,48 @@
+{
+  "exact_camera_poses": {
+    "trials": 300,
+    "supported": 300,
+    "seed_error_mm": 120.0,
+    "supported_median_error_mm": 5.378900502600592,
+    "supported_p95_error_mm": 15.513479766243911,
+    "median_assumed_sigma_mm": 12.309382090706327
+  },
+  "shared_5mm_error_ignored": {
+    "trials": 300,
+    "supported": 116,
+    "seed_error_mm": 120.0,
+    "supported_median_error_mm": 27.723205461581358,
+    "supported_p95_error_mm": 78.01584171965037,
+    "median_assumed_sigma_mm": 12.384858516709182
+  },
+  "shared_5mm_error_modelled": {
+    "trials": 300,
+    "supported": 0,
+    "seed_error_mm": 120.0,
+    "supported_median_error_mm": null,
+    "supported_p95_error_mm": null,
+    "median_assumed_sigma_mm": null
+  },
+  "shared_5mm_error_modelled_80cm_baseline": {
+    "trials": 300,
+    "supported": 111,
+    "seed_error_mm": 120.0,
+    "supported_median_error_mm": 8.754708013067436,
+    "supported_p95_error_mm": 24.54533420134608,
+    "median_assumed_sigma_mm": 19.96265671494802
+  },
+  "no_parallax": {
+    "state": "PENDING",
+    "depth_m": 2.12,
+    "sigma_depth_m": 0.12,
+    "inliers": 0,
+    "max_parallax_deg": 0.0,
+    "point_A": [
+      0.0,
+      0.0,
+      2.12
+    ],
+    "reason": "Insufficient translational parallax; do not claim a visual depth correction"
+  },
+  "limits": "Synthetic supplied correspondences, no image tracker or hardware. Stale-ID/dedup/parallax checks included. Noise floor 10 mm is ASSUMED, not calibrated."
+}

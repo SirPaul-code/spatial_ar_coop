@@ -1,0 +1,45 @@
+name: research-sdk-tests
+on:
+  push:
+    branches: [research_sdk]
+    paths: ['research_sdk/*.py', 'research_sdk/requirements.txt', '.github/workflows/research-sdk-tests.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: research-sdk-tests
+  cancel-in-progress: false
+jobs:
+  synthetic:
+    if: github.ref == 'refs/heads/research_sdk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research_sdk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: research_sdk/requirements.txt
+      - name: Install pinned numerical dependencies
+        run: python -m pip install -r research_sdk/requirements.txt
+      - name: Run synthetic experiments and original browser geometry tests
+        env:
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+        run: |
+          python research_sdk/experiments.py > research_sdk/experiments-ci.txt
+          python research_sdk/surface_lock.py > research_sdk/surface-lock-ci.txt
+          node --test showme/web/geometry.test.mjs > research_sdk/node-tests-ci.txt
+      - name: Save measured synthetic outputs only on the research branch
+        run: |
+          test "$(git branch --show-current)" = research_sdk
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research_sdk/results.json research_sdk/surface_lock_results.json research_sdk/experiments-ci.txt research_sdk/surface-lock-ci.txt research_sdk/node-tests-ci.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'research: record reproducible synthetic experiment results'
+            git push origin HEAD:research_sdk
+          fi

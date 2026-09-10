@@ -1,0 +1,1 @@
+PASS: 7005 checks against unchanged repository geometry (not Android runtime).
