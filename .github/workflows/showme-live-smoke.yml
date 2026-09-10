@@ -1,0 +1,43 @@
+name: showme-live-smoke
+
+on:
+  push:
+    branches: [showme/remote-assistance]
+    paths: [.github/workflows/showme-live-smoke.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe live ShowMe Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORIGIN='https://showme-calls.sirpaul-showme.workers.dev'
+          echo '--- GET /api/health ---'
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 20 "$ORIGIN/api/health" | tee /tmp/health.json
+          echo
+          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("/tmp/health.json","utf8")); console.log("health",j); if(j.protocol!==4) process.exit(40)'
+          echo '--- POST /api/installations ---'
+          INSTALLATION=$(printf 'live-smoke-%s' "$GITHUB_RUN_ID" | sha256sum | cut -c1-32)
+          code=$(curl --silent --show-error --connect-timeout 10 --max-time 20 -o /tmp/install.json -w '%{http_code}' \
+            -H 'content-type: application/json' \
+            --data "{\"installation\":\"$INSTALLATION\",\"platform\":\"ci-smoke\"}" \
+            "$ORIGIN/api/installations")
+          echo "HTTP $code"
+          cat /tmp/install.json; echo
+          test "$code" = 200 -o "$code" = 201
+          node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync("/tmp/install.json","utf8")); if(!j.ok||typeof j.installationToken!=="string"||j.installationToken.length<20) process.exit(41); console.log("live zero-config installation endpoint OK")'
+      - name: Remove one-shot probe workflow
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/showme-live-smoke.yml
+          git commit -m "ci(showme): remove one-shot live probe [stage-only]"
+          git push origin HEAD:showme/remote-assistance
