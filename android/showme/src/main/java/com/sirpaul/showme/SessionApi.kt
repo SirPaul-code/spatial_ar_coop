@@ -51,7 +51,13 @@ class SessionApi(private val state: ShowMeSession, private val call: RtcVoice) {
                     ShowMeSession.validateDraw(body)?.let{return error("INVALID_DRAWING",it)}
                     val frame=state.frames.get(body.optLong("frameId",-1L)) ?: return error("STALE_FRAME","Resume live view before drawing again.")
                     if(frame.epoch!=body.optInt("epoch",-1)||frame.epoch!=state.epoch)return error("WORLD_CHANGED","This image belongs to an old camera session.")
-                    StrokePlacement.prepare(body,frame) ?: return error("NO_SURFACE","No reliable surface under the whole drawing. Move slightly around the object and try a smaller mark.")
+                    // A StableAR pin's Z is computed only by StableAR from the exact retained SDK
+                    // frame. Do not let the legacy ShowMe metric fitter reject or bias that pin.
+                    val stablePin=state.stableArEnabled && body.optString("tool")=="pin"
+                    StrokePlacement.prepare(body,frame,requireMetricDepth=!stablePin)
+                        ?: return error("NO_SURFACE",if(stablePin)
+                            "The exact camera pixel could not be prepared for StableAR. Resume live view and try again."
+                        else "No reliable surface under the whole drawing. Move slightly around the object and try a smaller mark.")
                 }else null
                 val future=state.submit(body,prepared)
                 try{future.get(4,TimeUnit.SECONDS)}catch(_:java.util.concurrent.TimeoutException){
