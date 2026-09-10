@@ -132,14 +132,14 @@ private fun grossDepthBootstrap() {
     val seeded=engine.create(root,fit(3.0))
     var proposal: LockProposal?=null
     for(i in 1..6) {
-        val o=observation(seeded,i,i*.08,truth=1.0); now=o.capturedNs
+        val o=observation(seeded,i,i*.03,truth=1.0); now=o.capturedNs
         engine.offer(seeded.id,o)?.let { proposal=it }
     }
     val p=proposal ?: error("Grossly wrong seed never produced a multi-view bootstrap proposal")
     verify(p.bootstrap,"First gross-depth correction was not treated as bootstrap")
     verify(abs(p.depthM-1.0)<.05,"Bootstrap stayed near wrong 3m seed instead of 1m visual geometry: ${p.depthM}")
     verify(abs(p.depthM-3.0)>1.0,"Bootstrap did not make the required large correction")
-    val heldOut=observation(seeded,9,.72,truth=1.0); now=heldOut.capturedNs
+    val heldOut=observation(seeded,9,.24,truth=1.0); now=heldOut.capturedNs
     val accepted=engine.commit(p,heldOut)
     verify(accepted.accepted,"Held-out visual frame rejected valid large bootstrap: ${accepted.reason}")
     val locked=checkNotNull(accepted.snapshot)
