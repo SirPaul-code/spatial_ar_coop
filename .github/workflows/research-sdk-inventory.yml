@@ -1,0 +1,35 @@
+name: research-sdk-inventory
+on:
+  push:
+    branches: [research_sdk]
+    paths: ['research_sdk/tools/inventory.py', '.github/workflows/research-sdk-inventory.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: research-sdk-inventory
+  cancel-in-progress: false
+jobs:
+  inventory:
+    if: github.ref == 'refs/heads/research_sdk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: research_sdk
+      - name: Inventory all heads without executing branch code
+        run: |
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          python3 research_sdk/tools/inventory.py
+      - name: Preserve inventory on research branch only
+        run: |
+          test "$(git branch --show-current)" = research_sdk
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research_sdk/generated/branch_inventory.json research_sdk/generated/branch_inventory.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'research: record all-branch structural inventory'
+            git push origin HEAD:research_sdk
+          fi
