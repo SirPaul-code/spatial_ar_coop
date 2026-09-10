@@ -7,7 +7,8 @@
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": true
+    "run_worker_first": true,
+    "html_handling": "none"
   },
   "durable_objects": {
     "bindings": [{ "name": "ROOMS", "class_name": "ShowMeRoom" }]
