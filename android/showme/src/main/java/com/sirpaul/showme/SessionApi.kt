@@ -18,16 +18,28 @@ class SessionApi(private val state: ShowMeSession, private val call: RtcVoice) {
                 val observed=state.videoFrames.get(id)
                 if(observed==null||epoch!=state.epoch||observed.epoch!=epoch||state.paused||!state.tracking)
                     return error("STALE_FRAME","This video frame has expired. Resume video and try again.")
+                // Acquire the matching StableAR FrameRef lease before doing JPEG materialization. The
+                // request is executed by ShowMeRenderer on the AR/GL owner thread and fails closed.
+                val stableHeld=try{state.requestSpatialFreeze(id,epoch).get(1500,TimeUnit.MILLISECONDS)}
+                    catch(_:Exception){false}
+                if(!stableHeld)return error("STALE_FRAME","The exact spatial frame expired. Resume video and draw again.")
                 val encoded=body.optString("jpeg")
-                if(encoded.length !in 20..2_000_000)return error("INVALID_FRAME","Invalid frozen image.")
-                val jpeg=try{Base64.getDecoder().decode(encoded)}catch(_:IllegalArgumentException){return error("INVALID_FRAME","Invalid frozen image.")}
-                val packet=try{observed.materialize(jpeg)}catch(_:IllegalArgumentException){return error("FRAME_GEOMETRY","The frozen image does not match its camera geometry.")}
-                if(!state.active||state.paused||state.epoch!=epoch)return error("WORLD_CHANGED","The camera session changed. Resume live view.")
+                if(encoded.length !in 20..2_000_000){state.requestSpatialUnfreeze();return error("INVALID_FRAME","Invalid frozen image.")}
+                val jpeg=try{Base64.getDecoder().decode(encoded)}catch(_:IllegalArgumentException){
+                    state.requestSpatialUnfreeze();return error("INVALID_FRAME","Invalid frozen image.")}
+                val packet=try{observed.materialize(jpeg)}catch(_:IllegalArgumentException){
+                    state.requestSpatialUnfreeze();return error("FRAME_GEOMETRY","The frozen image does not match its camera geometry.")}
+                if(!state.active||state.paused||state.epoch!=epoch){
+                    state.requestSpatialUnfreeze();return error("WORLD_CHANGED","The camera session changed. Resume live view.")
+                }
                 state.frames.add(packet)
-                if(!state.frames.pin(id))return error("STALE_FRAME","The frozen frame expired. Try again.")
+                if(!state.frames.pin(id)){
+                    state.requestSpatialUnfreeze();return error("STALE_FRAME","The frozen frame expired. Try again.")
+                }
                 packet.metadata().put("ok",true).put("cameraTimestampNs",observed.cameraTimestampNs.toString())
+                    .put("spatialMode",if(state.stableArEnabled)"STABLE_AR" else "LEGACY")
             }
-            "/api/resume" -> {state.frames.unpin();ok()}
+            "/api/resume" -> {state.frames.unpin();state.requestSpatialUnfreeze();ok()}
             "/api/draw" -> {
                 if(!allowMutation())return error("RATE_LIMIT","Please wait a moment before drawing again.")
                 val id=body.optString("requestId")
