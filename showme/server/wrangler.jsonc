@@ -14,7 +14,10 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShowMeRoom"] }],
   "vars": {
-    "MAX_ROOMS_PER_DAY": "20",
+    "MAX_INSTALLATIONS_PER_DAY": "1000",
+    "MAX_INSTALLATIONS_PER_IP_PER_DAY": "10",
+    "MAX_ROOMS_PER_DAY": "1000",
+    "MAX_ROOMS_PER_INSTALL_PER_DAY": "50",
     "SESSION_SECONDS": "1800"
   },
   "observability": { "enabled": false }
