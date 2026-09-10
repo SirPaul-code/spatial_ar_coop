@@ -60,16 +60,13 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
     fun freeze(frameId: Long): FrameRef? { owner(); return history.freeze(frameId) }
     fun unfreeze(frameId: Long) { owner(); history.unfreeze(frameId) }
 
-    /**
-     * Placement for application use. Try the strict research fit first, then the bounded
-     * evidence-based interactive fit for sparse/one-sided real-world depth support.
-     */
+    /** Application placement is interactive/foreground-aware by definition. */
     fun place(sample: CameraSample,pixel: V2): Placement? = placeInteractive(sample,pixel).placement
 
     /**
-     * User-facing placement: strict fit first, then a bounded edge-aware fit based only on measured
-     * depth evidence. Returns enough diagnostics for a host to explain a refusal instead of hiding
-     * every failure behind a generic NO_SURFACE message.
+     * User-facing placement. Resolve local depth layers before accepting the strict plane result:
+     * a large background plane is not allowed to beat a thinner foreground object solely because
+     * it has more smoothed-depth samples.
      */
     fun placeInteractive(sample: CameraSample,pixel: V2): PlacementAttempt {
         owner()
@@ -78,25 +75,36 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
         val valid=sample.depth.filter { it.confidence>=.5 && it.z in .15..8.0 }
         val nearby=valid.filter { (it.pixel-pixel).norm()<=radius }
         val nearest=valid.minOfOrNull { (it.pixel-pixel).norm() }
+        val raw=nearby.count { it.evidence.origin==DepthOrigin.RAW }
+        val cloud=nearby.count { it.evidence.origin==DepthOrigin.POINT_CLOUD }
+        val smooth=nearby.count { it.evidence.origin==DepthOrigin.SMOOTHED }
         fun rejected(reason:String)=PlacementAttempt(null,"REJECTED",reason,sample.depth.size,nearby.size,nearest)
         if(attachments.size>=64) return rejected("StableAR attachment capacity reached")
         if(!k.contains(pixel)) return rejected("Mapped helper pixel is outside the AR camera image")
         val cameraNow=history.currentWorldFromCamera(sample.ref)
             ?: return rejected("The retained ARCore frame/anchor is no longer tracking")
         if(sample.depth.isEmpty()) return rejected("ARCore returned no depth or point-cloud evidence for this exact video frame")
-        if(valid.isEmpty()) return rejected("ARCore depth exists, but none of it has usable confidence/range")
+        if(valid.isEmpty()) return rejected("ARCore evidence exists, but none has usable confidence/range")
 
-        val strict=SurfaceFitter.fit(k,pixel,sample.depth)
-        val fit=strict ?: SurfaceFitter.fitInteractive(k,pixel,sample.depth,radius)
+        // Interactive layer selection is authoritative for an actual user click. Strict fitting is
+        // retained only as an agreement signal; it may not override an ambiguous/foreground result.
+        val fit=SurfaceFitter.fitInteractive(k,pixel,sample.depth,radius)
         if(fit==null) {
             val nearText=if(nearest==null) "none" else "%.1f px".format(java.util.Locale.US,nearest)
-            return rejected("Depth evidence is present but not coherent at this pixel (samples=${sample.depth.size}, local=${nearby.size}, nearest=$nearText)")
+            return rejected("No unambiguous local surface: total=${sample.depth.size}, local=${nearby.size} (raw=$raw, cloud=$cloud, smooth=$smooth), nearest=$nearText")
+        }
+        val strict=SurfaceFitter.fit(k,pixel,sample.depth)
+        val agreement=strict?.let { abs(it.depth-fit.depth)<=max(.04,fit.depth*.04) } == true
+        val mode=when {
+            agreement -> "STRICT_CONFIRMED"
+            strict!=null -> "FOREGROUND_OVERRIDE"
+            else -> "FOREGROUND_AWARE"
         }
         val placement=createPlacement(sample,pixel,cameraNow,fit)
-            ?: return rejected("Metric depth fit succeeded, but ARCore could not create/retain the surface anchor")
-        val mode=if(strict!=null)"STRICT" else "EDGE_AWARE"
+            ?: return rejected("Metric surface fit succeeded, but ARCore could not create/retain its anchor")
+        val origins=fit.evidence.map { it.origin.name }.toSet().sorted().joinToString("+")
         return PlacementAttempt(placement,mode,
-            "$mode depth fit: ${fit.supportCount} supports, z=${"%.3f".format(java.util.Locale.US,fit.depth)} m",
+            "$mode: ${fit.supportCount} supports [$origins], z=${"%.3f".format(java.util.Locale.US,fit.depth)} m; local raw=$raw cloud=$cloud smooth=$smooth",
             sample.depth.size,nearby.size,nearest)
     }
 
@@ -163,7 +171,7 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
         } catch(_: Exception) { null }
 
         fun sampleDepth(frame: Frame,k: Intrinsics): List<DepthSample> {
-            val result=ArrayList<DepthSample>(8000)
+            val result=ArrayList<DepthSample>(10000)
             fun read(image: android.media.Image,confidence: android.media.Image?,origin: DepthOrigin) {
                 if(image.timestamp<=0 || image.width*image.height>1024*1024) return
                 if(confidence!=null && (confidence.width!=image.width || confidence.height!=image.height)) return
@@ -188,12 +196,20 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
             }
             try { frame.acquireRawDepthImage16Bits().use { d -> frame.acquireRawDepthConfidenceImage().use { c -> read(d,c,DepthOrigin.RAW) } } } catch(_: Exception) { }
             try { frame.acquireDepthImage16Bits().use { read(it,null,DepthOrigin.SMOOTHED) } } catch(_: Exception) { }
-            if(result.size<12) try {
+
+            // Point-cloud features are an independent metric cue and are especially valuable on a
+            // thin textured foreground object. Never suppress them merely because a smoothed depth
+            // image exists; that was exactly how a background monitor could dominate a PCB click.
+            try {
                 frame.acquirePointCloud().use { cloud ->
                     if(cloud.timestamp<=0) return@use
-                    val buf=cloud.points; val inv=frame.camera.worldFromCv().inverse()
+                    val buf=cloud.points
+                    val count=buf.remaining()/4
+                    if(count<=0) return@use
+                    val inv=frame.camera.worldFromCv().inverse()
                     val evidence=EvidenceId(DepthOrigin.POINT_CLOUD,cloud.timestamp)
-                    for(i in 0 until min(2000,buf.remaining()/4)) {
+                    val step=max(1,ceil(count/1500.0).toInt())
+                    for(i in 0 until count step step) {
                         val c=buf.get(i*4+3).toDouble(); if(c<.5) continue
                         val p=inv.point(V3(buf.get(i*4).toDouble(),buf.get(i*4+1).toDouble(),buf.get(i*4+2).toDouble()))
                         val px=k.project(p) ?: continue
