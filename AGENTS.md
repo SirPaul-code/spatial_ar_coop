@@ -10,6 +10,7 @@ This branch is `showme/remote-assistance`. Read `docs/SHOWME.md` first, then `do
 - The `outdoor/gnss-global` and `fresh/no-map-runtime-poc` branches are not targets for ShowMe commits.
 - ShowMe releases go to `showme-latest`, never `latest-dev`.
 - No Google Cloud Anchors. Only the camera owner's ARCore world is needed; the browser has no AR world and does not perform two-device alignment.
+- Live video is WebRTC, with a 30-fps capture/sender target. Never restore JPEG live polling. The CRC-coded video identity footer is cropped from presentation and must be correlated with per-frame depth history before placement. See `docs/SHOWME.md`.
 - Remote input always carries the exact displayed frame ID and AR epoch. Never hit-test an old browser pixel against a new camera frame.
 - Invalid/expired frame, missing depth, discontinuity, lost tracking or world reset must reject the drawing. Never invent a fixed-distance plane to make a demo look successful.
 - Drawings remain 3D geometry attached to local ARCore anchors. Browser overlay geometry must originate from those anchors, not a permanent screen-space sketch.

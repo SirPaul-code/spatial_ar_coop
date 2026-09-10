@@ -40,7 +40,7 @@ android {
         minSdk = 33
         targetSdk = 36
         versionCode = 100000 + runNumber * 10 + runAttempt
-        versionName = "0.1.0-local.$runNumber.$runAttempt"
+        versionName = "0.2.0-webrtc.$runNumber.$runAttempt"
         // Commodity phones used for the physical trial are ARM64.
         ndk { abiFilters += "arm64-v8a" }
     }

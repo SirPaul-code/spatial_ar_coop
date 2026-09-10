@@ -69,6 +69,7 @@ class FrameHistory(private val clock: () -> Long = ::monotonicMs) {
 
 class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     val frames = FrameHistory(clock)
+    val videoFrames = VideoDepthHistory(clock)
     data class Command(val body: JSONObject, val answer: CompletableFuture<JSONObject>)
     private val commands = ArrayDeque<Command>()
     private val random = SecureRandom()
@@ -86,6 +87,8 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     @Volatile var annotationCount = 0
     @Volatile var voiceEnabled = false
     @Volatile var voiceState = "OFF"
+    @Volatile var videoState = "STARTING"
+    @Volatile var captureFps = 0f
     @Volatile var secure = false
     @Volatile var hostName = "Camera owner"
     private var helperId = ""
@@ -102,14 +105,14 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     }
     @Synchronized fun end() {
         active = false; token = ""; helperId = ""; helperName = ""; helperSeenMs = 0L
-        voiceState = "OFF"; frames.clear(); applied.clear()
+        voiceState = "OFF"; frames.clear(); videoFrames.clear(); applied.clear()
         while (true) {
             val command = commands.pollFirst() ?: break
             command.answer.complete(failure("SESSION_ENDED", "The camera owner ended this session."))
         }
     }
     @Synchronized fun resetWorld() {
-        epoch += 1; frames.clear(); applied.clear()
+        epoch += 1; frames.clear(); videoFrames.clear(); applied.clear()
         while (true) {
             val command = commands.pollFirst() ?: break
             command.answer.complete(failure("WORLD_CHANGED", "The AR camera session changed. Please try again."))
@@ -137,6 +140,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         .put("hostName", hostName).put("helper", if (hasHelper()) helperName else "")
         .put("annotations", annotationCount).put("voiceEnabled", voiceEnabled).put("voiceState", voiceState)
         .put("secure", secure).put("version", BuildConfig.VERSION_NAME)
+        .put("videoTransport", "WEBRTC").put("videoState", videoState).put("captureFps", captureFps.toDouble()).put("targetFps", 30)
     @Synchronized fun previous(id: String): JSONObject? = applied[id]
     @Synchronized fun remember(id: String, result: JSONObject) {
         applied[id] = result

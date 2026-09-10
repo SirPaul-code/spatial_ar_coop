@@ -11,3 +11,8 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+
+android/showme/build/
+showme/node_modules/
+showme/test-results/
+showme-build.log

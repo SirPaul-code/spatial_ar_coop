@@ -18,7 +18,7 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.*
 
 class ShowMeRenderer(private val state: ShowMeSession, private val overlay: ShowMeOverlay,
-    private val notice: (String) -> Unit) : GLSurfaceView.Renderer {
+    private val notice: (String) -> Unit, private val call: RtcVoice) : GLSurfaceView.Renderer {
     @Volatile var arSession: Session? = null
     @Volatile var resumed = false
     @Volatile var imageRotation = 90
@@ -33,6 +33,8 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
     private val repairs = ConcurrentLinkedQueue<Repair>()
     private var lastCapture = 0L; private var nextFrameId = 0L; private var lastVerify = 0L; private var verifyIndex = 0
     private var lastError = ""
+    private var videoPipe: RtcVideoPipe? = null
+    private val verificationFrame = java.util.concurrent.atomic.AtomicReference<FramePacket?>(null)
     private data class Drawing(val id: String, val tool: String, val color: String, val label: String,
         var anchor: Anchor, val offsets: List<FloatArray>, val reference: SurfaceTargetReference,
         var verified: Boolean = false, var pending: FloatArray? = null, var votes: Int = 0,
@@ -44,8 +46,12 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
     fun close() {
         encoding.shutdownNow(); verifying.shutdownNow()
     }
+    fun releaseGlResources() {
+        runCatching { videoPipe?.close() }; videoPipe = null
+    }
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.035f, 0.05f, 0.08f, 1f)
+        releaseGlResources()
         background.createOnGlThread(); boundSession = null
     }
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {
@@ -82,10 +88,15 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
                 }
                 command.answer.complete(result)
             }
-            if (!tracking) { overlay.show(emptyList()); return }
+            if (!tracking) {
+                overlay.show(emptyList())
+                publishVideo(frame, camera, emptyList())
+                return
+            }
             applyRepairs(session)
             val snapshot = snapshot()
             showNativeOverlay(frame, camera, snapshot)
+            publishVideo(frame, camera, snapshot)
             captureIfDue(frame, camera, snapshot)
             state.annotationCount = drawings.size
         } catch (t: Throwable) {
@@ -151,7 +162,7 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
     }
     private fun detachAll() {
         drawings.values.forEach { runCatching { it.anchor.detach() } }
-        drawings.clear(); repairs.clear(); state.annotationCount = 0
+        drawings.clear(); repairs.clear(); verificationFrame.set(null); state.annotationCount = 0
         SurfaceTargetResolver.clearLearnedReferences()
         overlay.show(emptyList())
     }
@@ -179,9 +190,31 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         overlay.show(screen)
     }
 
+    private fun publishVideo(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>) {
+        if (!state.active || state.paused) return
+        try {
+            val dims = camera.imageIntrinsics.imageDimensions
+            val pipe = videoPipe ?: RtcVideoPipe(call, dims[0], dims[1], imageRotation).also { videoPipe = it }
+            if (!state.hasHelper() || !pipe.isDue(frame.timestamp, System.nanoTime())) return
+            val id = ++nextFrameId
+            val epoch = state.epoch
+            val captured = VideoDepthFrame.capture(frame, camera, id, epoch, imageRotation, strokes,
+                pipe.videoWidth, pipe.videoHeight, pipe.contentHeight)
+            if (state.active && !state.paused && state.epoch == epoch) {
+                state.videoFrames.add(captured)
+                call.publishMetadata(captured.metadata())
+                pipe.draw(frame, camera, background.textureId, id, epoch)
+            }
+        } catch (t: Throwable) {
+            state.videoState = "CAPTURE_ERROR"
+            val error = "Video capture: ${t.javaClass.simpleName}: ${t.message.orEmpty()}"
+            if (error != lastError) { lastError = error; notice(error) }
+        }
+    }
+
     private fun captureIfDue(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>) {
         val now = monotonicMs()
-        if (!state.active || state.paused || now - lastCapture < 140L || !encoderBusy.compareAndSet(false, true)) return
+        if (!state.active || state.paused || drawings.isEmpty() || now - lastCapture < 1_000L || !encoderBusy.compareAndSet(false, true)) return
         val image = runCatching { frame.acquireCameraImage() }.getOrNull()
         if (image == null) { encoderBusy.set(false); return }
         try {
@@ -222,7 +255,7 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
                         val bytes = jpeg.toArray()
                         val captured = CapturedFrame(stamp, pose, intrinsics, Base64.getEncoder().encodeToString(bytes), supports)
                         if (state.active && !state.paused && state.epoch == epoch) {
-                            state.frames.add(FramePacket(id, epoch, captured, bytes, rotation, now, strokes))
+                            verificationFrame.set(FramePacket(id, epoch, captured, bytes, rotation, now, strokes))
                         }
                     }
                 } catch (t: Throwable) {
@@ -241,7 +274,7 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
     private fun scheduleVerification() {
         val now = monotonicMs()
         if (drawings.isEmpty() || now - lastVerify < 900L || !verifierBusy.compareAndSet(false, true)) return
-        val packet = state.frames.latest()
+        val packet = verificationFrame.get()?.takeIf { it.epoch == state.epoch && now - it.capturedMs < 2500L }
         if (packet == null) { verifierBusy.set(false); return }
         val candidates = drawings.values.filter { it.anchor.trackingState == TrackingState.TRACKING && it.repairBudgetM < 0.15f }
         if (candidates.isEmpty()) { verifierBusy.set(false); return }

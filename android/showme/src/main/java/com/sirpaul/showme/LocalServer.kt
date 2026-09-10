@@ -32,6 +32,7 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
                     "/", "/index.html" -> "index.html"
                     "/app.js" -> "app.js"
                     "/geometry.mjs" -> "geometry.mjs"
+                    "/live-video.mjs" -> "live-video.mjs"
                     "/style.css" -> "style.css"
                     else -> return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
                 }
@@ -58,7 +59,7 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
             if (!state.heartbeat(viewer)) return json(ShowMeSession.failure("REJOIN", "Reconnect to the session."), Response.Status.CONFLICT)
             if (request.method == Method.GET) return when (path) {
                 "/api/state" -> json(state.info())
-                "/api/frame" -> nextFrame(request)
+                "/api/frame" -> json(ShowMeSession.failure("VIDEO_REQUIRED", "Use the WebRTC video connection."), Response.Status.GONE)
                 "/api/certificate" -> {
                     val cert = tls?.certificate ?: return json(ShowMeSession.failure("NO_TLS", "This session uses local HTTP."))
                     harden(newFixedLengthResponse(Response.Status.OK, "application/pkix-cert", ByteArrayInputStream(cert), cert.size.toLong())).apply {
@@ -71,8 +72,18 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
             val body = body(request)
             return when (path) {
                 "/api/freeze" -> {
-                    val ok = body.optInt("epoch", -1) == state.epoch && state.frames.pin(body.optLong("frameId", -1L))
-                    json(if (ok) JSONObject().put("ok", true) else ShowMeSession.failure("STALE_FRAME", "Resume live view and try again."))
+                    val id = body.optLong("frameId", -1L)
+                    val epoch = body.optInt("epoch", -1)
+                    val observed = state.videoFrames.get(id)
+                    if (observed == null || epoch != state.epoch || observed.epoch != epoch || state.paused || !state.tracking)
+                        return json(ShowMeSession.failure("STALE_FRAME", "The video frame is no longer placeable. Resume live view and try again."))
+                    val jpeg = java.util.Base64.getDecoder().decode(body.optString("jpeg"))
+                    val packet = observed.materialize(jpeg)
+                    if (!state.active || state.paused || state.epoch != epoch)
+                        return json(ShowMeSession.failure("WORLD_CHANGED", "The camera session changed. Please resume live video."))
+                    state.frames.add(packet)
+                    val ok = state.frames.pin(packet.id)
+                    json(if (ok) packet.metadata().put("ok", true) else ShowMeSession.failure("STALE_FRAME", "Resume live view and retry."))
                 }
                 "/api/resume" -> { state.frames.unpin(); json(JSONObject().put("ok", true)) }
                 "/api/draw" -> {
@@ -90,18 +101,18 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
                         answer.complete(error); json(error)
                     }
                 }
-                "/api/voice" -> {
+                "/api/call", "/api/voice" -> {
                     val sdp = body.optString("sdp")
                     if (sdp.length !in 20..60_000 || !sdp.startsWith("v=0")) return json(ShowMeSession.failure("INVALID_SDP", "Invalid audio offer"))
-                    if (!state.voiceEnabled) return json(ShowMeSession.failure("MIC_OFF", "Ask the camera owner to enable Voice in ShowMe."))
                     try {
                         val answer = voice.answer(sdp).get(12, TimeUnit.SECONDS)
-                        json(JSONObject().put("ok", true).put("sdp", answer))
+                        json(JSONObject().put("ok", true).put("sdp", answer).put("video", voice.videoLayout()))
                     } catch (_: Exception) {
-                        voice.disconnect(); json(ShowMeSession.failure("VOICE_FAILED", "Audio could not connect on this network. Video and drawing remain available."))
+                        voice.disconnect(); json(ShowMeSession.failure("VOICE_FAILED", "The video call could not connect. Keep ShowMe open and retry on the same network."))
                     }
                 }
-                "/api/voice-stop" -> { voice.disconnect(); json(JSONObject().put("ok", true)) }
+                "/api/voice-stop" -> { voice.setMuted(true); json(JSONObject().put("ok", true)) }
+                "/api/call-stop" -> { voice.disconnect(); json(JSONObject().put("ok", true)) }
                 "/api/leave" -> { state.leave(viewer); voice.disconnect(); json(JSONObject().put("ok", true)) }
                 else -> newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
             }
@@ -113,26 +124,14 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
             return json(ShowMeSession.failure("UNAVAILABLE", "Local session temporarily unavailable"), Response.Status.SERVICE_UNAVAILABLE)
         } finally { inFlight.decrementAndGet() }
     }
-    private fun nextFrame(request: IHTTPSession): Response {
-        if (state.paused || !state.tracking) return harden(newFixedLengthResponse(Response.Status.NO_CONTENT, MIME_PLAINTEXT, ""))
-        val after = request.parameters["after"]?.firstOrNull()?.toLongOrNull() ?: -1L
-        val frame = state.frames.latest()
-        if (frame == null || frame.id <= after || monotonicMs() - frame.capturedMs > 3000L)
-            return harden(newFixedLengthResponse(Response.Status.NO_CONTENT, MIME_PLAINTEXT, ""))
-        val metadata = frame.metadata().toString().toByteArray(Charsets.UTF_8)
-        val bytes = ByteArrayOutputStream(metadata.size + frame.jpeg.size + 4).also { output ->
-            DataOutputStream(output).apply { writeInt(metadata.size); write(metadata); write(frame.jpeg); flush() }
-        }.toByteArray()
-        return harden(newFixedLengthResponse(Response.Status.OK, "application/octet-stream", ByteArrayInputStream(bytes), bytes.size.toLong()))
-    }
     private fun body(request: IHTTPSession): JSONObject {
         require(request.headers["content-type"]?.startsWith("application/json") == true)
         val length = request.headers["content-length"]?.toLongOrNull() ?: throw IllegalArgumentException("Content-Length required")
-        require(length in 2..65_536L)
+        require(length in 2..2_100_000L)
         val files = HashMap<String, String>()
         request.parseBody(files)
         val content = files["postData"] ?: throw IllegalArgumentException("Missing JSON")
-        require(content.length <= 65_536)
+        require(content.length <= 2_100_000)
         return JSONObject(content)
     }
     @Synchronized private fun allowMutation(): Boolean {

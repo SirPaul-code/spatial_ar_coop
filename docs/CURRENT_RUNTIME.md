@@ -10,6 +10,14 @@ ShowMe was forked from `a5970e9be7fef9434dbf2e681274dc56c9462fe4` on `fresh/no-m
 
 The `outdoor/gnss-global` branch is a separate experiment and is not modified by this branch.
 
+## Current live-video implementation
+
+The 0.2 implementation replaces 7-fps JPEG live polling with shared-EGL ARCore camera capture and a real WebRTC video/audio/data connection. Target: 30 fps, up to 720 x 1280 visible camera pixels (orientation/aspect dependent). Receiver UI reports actual WebRTC FPS/codec; hardware performance is not assumed from the target.
+
+Precise gestures use a CRC-coded identity embedded in the video frame's cropped-out footer plus that frame's compact native depth history. JPEG is only an on-demand frozen reference and a low-rate verifier input. The browser does not fetch `/api/frame` for live video. Preserve the exact-ID/epoch checks; never substitute the latest depth when an ID is missing.
+
+New files: `RtcVideoPipe.kt`, `VideoFrameStamp.kt`, `VideoDepthHistory.kt`, `live-video.mjs`, and new geometry/history/media integration tests. `RtcVoice` now owns a unified media connection rather than audio only. The original Spatial Sync runtime remains unchanged.
+
 ## New product flow
 
 Android camera owner -> generated local invite link / Android share sheet / QR -> browser helper -> exact-frame pin/arrow/freehand/circle -> historical metric surface reconstruction -> local ARCore anchor -> native and browser world-projected annotations.

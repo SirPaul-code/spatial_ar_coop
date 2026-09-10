@@ -62,10 +62,11 @@ class ShowMeActivity : Activity() {
             presence.text = if (state.hasHelper()) "${state.helperName} is connected" else if (state.active) "Waiting for your helper" else "Show someone exactly where"
             val seconds = if (startedAt == 0L) 0 else (monotonicMs() - startedAt) / 1000
             detail.text = if (state.active) "%02d:%02d  /  %d annotations  /  %s".format(seconds / 60, seconds % 60, state.annotationCount,
-                if (state.secure) "LOCAL HTTPS" else "LOCAL WI-FI") else "${state.annotationCount} annotations / ${BuildConfig.VERSION_NAME}"
+                "WebRTC %.0f fps".format(state.captureFps)) else "${state.annotationCount} annotations / ${BuildConfig.VERSION_NAME}"
             pauseButton.text = if (state.paused) "Resume video" else "Pause video"
             voiceButton.text = if (state.voiceEnabled) "Voice on" else "Enable voice"
             if (state.active && !state.authorized(state.token)) endSession()
+            if (state.active && state.videoState == "CONNECTED" && !state.hasHelper()) voice.disconnect()
             handler.postDelayed(this, 500L)
         }
     }
@@ -78,7 +79,7 @@ class ShowMeActivity : Activity() {
         state.hostName = Build.MODEL
         root = FrameLayout(this).apply { setBackgroundColor(dark) }
         overlay = ShowMeOverlay(this)
-        renderer = ShowMeRenderer(state, overlay, ::notice)
+        renderer = ShowMeRenderer(state, overlay, ::notice, voice)
         gl = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
             preserveEGLContextOnPause = true
@@ -116,7 +117,7 @@ class ShowMeActivity : Activity() {
         pauseButton = button("Pause video") {
             if (!state.active) { startLocal(false); return@button }
             state.paused = !state.paused
-            if (state.paused) state.frames.clear()
+            if (state.paused) { state.frames.clear(); state.videoFrames.clear() }
         }
         voiceButton = button("Enable voice") { toggleVoice() }
         second.addView(pauseButton, LinearLayout.LayoutParams(0, d(42), 1f))
@@ -143,9 +144,9 @@ class ShowMeActivity : Activity() {
         home.addView(label("A little direction.\nRight where it matters.", 35f, Color.WHITE, true).apply { setPadding(0, d(35), 0, d(18)) })
         home.addView(label("Share your camera. A helper opens a link and pins, draws or points into your world. The guidance stays on the surface as you move.", 16f, muted).apply { setLineSpacing(d(4).toFloat(), 1f) })
         home.addView(label("01  START A SESSION\n02  SHARE THE LINK\n03  FOLLOW THE GUIDANCE", 11f, mint, true).apply { setPadding(0, d(28), 0, d(25)); setLineSpacing(d(9).toFloat(), 1f) })
-        home.addView(button("Start local session", true) { startLocal(false) }, LinearLayout.LayoutParams(-1, d(56)))
+        home.addView(button("Start video call", true) { startLocal(false) }, LinearLayout.LayoutParams(-1, d(56)))
         home.addView(button("Secure session / voice setup") { secureOptions() }, LinearLayout.LayoutParams(-1, d(48)).apply { topMargin = d(10) })
-        home.addView(label("LOCAL PREVIEW  /  No account or cloud server\nBoth devices must be on the same Wi-Fi or hotspot. Ordinary HTTP is for trusted local networks; two-way browser voice needs trusted HTTPS.", 11f, muted).apply { setPadding(0, d(20), 0, 0); setLineSpacing(d(3).toFloat(), 1f) })
+        home.addView(label("LIVE VIDEO CALL  /  No account or cloud server\nBoth devices must be on the same Wi-Fi or hotspot. Ordinary HTTP is for trusted local networks; two-way browser voice needs trusted HTTPS.", 11f, muted).apply { setPadding(0, d(20), 0, 0); setLineSpacing(d(3).toFloat(), 1f) })
         root.addView(home, FrameLayout.LayoutParams(-1, -1))
     }
     private fun secureOptions() {
@@ -214,7 +215,7 @@ class ShowMeActivity : Activity() {
     }
     private fun toggleVoice() {
         if (!state.active) { notice("Start a session first"); return }
-        if (state.voiceEnabled) { state.voiceEnabled = false; voice.setMuted(true); voice.disconnect(); return }
+        if (state.voiceEnabled) { state.voiceEnabled = false; voice.setMuted(true); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 72); return
         }
@@ -242,7 +243,7 @@ class ShowMeActivity : Activity() {
                 installRequested = true; return
             }
             val session = ar ?: Session(this).also { created ->
-                val camera = created.getSupportedCameraConfigs(CameraConfigFilter(created)).filter {
+                val camera = created.getSupportedCameraConfigs(CameraConfigFilter(created).setTargetFps(java.util.EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30))).filter {
                     it.imageSize.width <= 1920 && it.imageSize.height <= 1920
                 }.maxByOrNull { it.imageSize.width * it.imageSize.height }
                 if (camera != null) created.cameraConfig = camera
@@ -267,13 +268,13 @@ class ShowMeActivity : Activity() {
     }
     override fun onPause() {
         resumeSharing = state.active && !state.paused
-        if (state.active) { state.paused = true; state.frames.clear(); voice.setMuted(true) }
+        if (state.active) { state.paused = true; state.frames.clear(); state.videoFrames.clear(); voice.setMuted(true); voice.disconnect() }
         renderer.resumed = false; gl.onPause(); runCatching { ar?.pause() }
         super.onPause()
     }
     override fun onDestroy() {
         destroyed = true; handler.removeCallbacksAndMessages(null)
-        state.end(); server?.stop(); voice.close(); renderer.close()
+        state.end(); server?.stop(); voice.close(); gl.queueEvent { renderer.releaseGlResources() }; renderer.close()
         runCatching { ar?.close() }; io.shutdownNow()
         super.onDestroy()
     }
