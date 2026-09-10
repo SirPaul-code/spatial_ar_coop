@@ -15,6 +15,7 @@ fun main() {
         "bounded frame history and freeze ownership" to ::history,
         "ray-consistent surface fitting" to ::surfaces,
         "correction transactions and held-out validation" to ::transactions,
+        "gross depth seed bootstrap with held-out validation" to ::grossDepthBootstrap,
         "no-parallax and systematic uncertainty" to ::uncertainty,
         "presented crop mapping" to ::mapping,
         "input validation" to ::validation
@@ -122,6 +123,28 @@ private fun transactions() {
     verify(engine.offer(s.id,observation(s,10,.72))==null,"Old worker generation accepted")
     engine.remove(s.id)
     verify(!engine.commit(p,good).accepted,"Removed attachment resurrected")
+}
+private fun grossDepthBootstrap() {
+    var now=1_000_000_000L
+    val policy=LockPolicy(assumedCommonTranslationSigmaM=.001,bootstrapMaxCorrectionM=3.0)
+    val engine=AttachmentEngine({now},policy)
+    val root=RootReference(1,1,1,1,Rigid.ID,k,center)
+    val seeded=engine.create(root,fit(3.0))
+    var proposal: LockProposal?=null
+    for(i in 1..6) {
+        val o=observation(seeded,i,i*.08,truth=1.0); now=o.capturedNs
+        engine.offer(seeded.id,o)?.let { proposal=it }
+    }
+    val p=proposal ?: error("Grossly wrong seed never produced a multi-view bootstrap proposal")
+    verify(p.bootstrap,"First gross-depth correction was not treated as bootstrap")
+    verify(abs(p.depthM-1.0)<.05,"Bootstrap stayed near wrong 3m seed instead of 1m visual geometry: ${p.depthM}")
+    verify(abs(p.depthM-3.0)>1.0,"Bootstrap did not make the required large correction")
+    val heldOut=observation(seeded,9,.72,truth=1.0); now=heldOut.capturedNs
+    val accepted=engine.commit(p,heldOut)
+    verify(accepted.accepted,"Held-out visual frame rejected valid large bootstrap: ${accepted.reason}")
+    val locked=checkNotNull(accepted.snapshot)
+    verify(locked.state==LockState.GEOMETRY_SUPPORTED,"Bootstrap did not enter geometry-supported state")
+    verify(abs(locked.depthM-1.0)<.05,"Committed depth is wrong after bootstrap: ${locked.depthM}")
 }
 private fun uncertainty() {
     val root=RootReference(1,1,1,1,Rigid.ID,k,center)
