@@ -9,4 +9,5 @@ for(const file of ['index.html','style.css','app.js','geometry.mjs','live-video.
   catch(error){throw new Error(`Missing ../web/${file}. Keep the web and server folders together.`,{cause:error});}
 }
 await copyFile(path.join(root,'static','welcome.html'),path.join(output,'welcome.html'));
-console.log('Browser assets prepared. No activation page or camera files are uploaded.');
+await copyFile(path.join(root,'static','_headers'),path.join(output,'_headers'));
+console.log('Browser assets prepared. Helper SPA routing and security headers are included; no activation page or camera files are uploaded.');
