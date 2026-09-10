@@ -18,6 +18,14 @@ class StableArIntegrationTest {
         }
     }
 
+    @Test fun bridgeConstructionDoesNotTouchOpenCvNativeRuntime() {
+        // Local JVM tests have the OpenCV Java classes but deliberately do not load Android's
+        // native OpenCV runtime. Renderer/bridge construction must therefore stay native-free.
+        // This catches the exact startup crash caused by eagerly constructing ORB/BFMatcher.
+        val bridge = StableArShowMeBridge { }
+        assertEquals("{}", bridge.diagnosticsJson())
+    }
+
     @Test fun exactVideoIdentityAcceptsLiveAndDelayedFramesButRejectsWrongEpochAndStaleFrames() {
         var now=1_000_000_000L
         val frames=StableArFrameRegistry<String>({now},historyNs=4_000_000_000L)
