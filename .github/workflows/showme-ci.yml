@@ -1,4 +1,4 @@
-name: showme-local-ci
+name: showme-internet-ci
 
 on:
   push:
@@ -29,16 +29,37 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Browser geometry unit tests
+      - name: Browser geometry, frame identity and control tests
         run: node --test showme/web/*.test.mjs
       - name: Browser integration dependencies
         working-directory: showme
         run: |
-          npm install --ignore-scripts --no-audit --no-fund
+          npm ci --ignore-scripts --no-audit --no-fund
           npx playwright install --with-deps chromium
-      - name: Browser interaction and layout smoke test
+      - name: Real browser WebRTC and annotation smoke test
         working-directory: showme
         run: npm run test:browser
+      - name: Worker zero-config installation, signaling and deploy validation
+        working-directory: showme/server
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run build
+          npm run test:integration
+          npm run check
+      - name: Deploy production Worker when repository credentials are available
+        working-directory: showme/server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            npm run deploy
+            echo "Production Worker deployed by CI."
+          else
+            echo "Cloudflare CI credentials are not configured; validated Worker source is included in the release."
+          fi
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -68,7 +89,7 @@ jobs:
             "$TOOLS/aapt" dump badging "$APK" | grep "package: name='com.sirpaul.showme'"
           done
           if "$TOOLS/aapt" dump badging android/showme/build/outputs/apk/release/showme-release.apk | grep -q application-debuggable; then exit 1; fi
-      - name: Upload diagnostics and browser screenshots
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -88,7 +109,7 @@ jobs:
           path: android/showme/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 30
-      - name: Publish isolated ShowMe release
+      - name: Publish ShowMe zero-config Internet release
         if: github.ref == 'refs/heads/showme/remote-assistance'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -98,25 +119,22 @@ jobs:
           cp android/showme/build/outputs/apk/debug/showme-debug.apk ShowMe-latest-dev.apk
           cp android/showme/build/outputs/apk/release/showme-release.apk ShowMe-latest-release.apk
           sha256sum ShowMe-latest-dev.apk ShowMe-latest-release.apk > SHOWME-SHA256SUMS.txt
-          zip -j ShowMe-browser.zip showme/web/index.html showme/web/style.css showme/web/app.js showme/web/geometry.mjs showme/web/live-video.mjs
+          zip -j ShowMe-browser.zip showme/web/index.html showme/web/style.css showme/web/app.js showme/web/geometry.mjs showme/web/live-video.mjs showme/web/remote-session.mjs showme/web/control-rpc.mjs
+          zip -r ShowMe-server.zip showme/server -x 'showme/server/node_modules/*' 'showme/server/public/*' 'showme/server/.dry-run/*'
           cat > SHOWME-RELEASE.md <<EOF
-          ShowMe WebRTC build from \`showme/remote-assistance\` at \`$GITHUB_SHA\`.
+          ShowMe zero-config Internet build from \`showme/remote-assistance\` at \`$GITHUB_SHA\`.
 
-          Install \`ShowMe-latest-release.apk\` on the camera owner's Android phone. The helper opens the invitation in a browser on the same Wi-Fi or hotspot; no helper APK is required.
+          Install \`ShowMe-latest-release.apk\` and tap **Start a call**. There is no activation link, Cloudflare setup, service URL, or secret for the app user. The Android app is bound to the production ShowMe service and registers its installation automatically.
 
-          - Separate application ID: \`com.sirpaul.showme\` (coexists with Spatial Sync).
-          - Browser desktop/mobile smoke tests and geometry tests passed.
-          - Android unit tests and debug/release lint passed.
-          - Both APK signatures verified; release APK is non-debuggable.
-          - Real WebRTC video (30-fps target), GPU camera capture, audio/data and frame-exact AR annotations.
-          - Browser tests exercise an actual RTP encode/decode connection with synthetic camera/depth fixtures; no native-device performance guarantee.
-          - HTTP local mode: video and drawings. Browser microphone requires trusted HTTPS; local HTTPS/trusted PKCS12 options included.
-          - No external hosting, internet-room connectivity, login or billing is provisioned.
-          - Real phone/browser spatial and audio acceptance tests are still required. CI is not a hardware accuracy guarantee.
-          - Uses a public trial signing key; NOT a production Play signing identity.
-
-          Existing Spatial Sync \`latest-dev\` and the outdoor branch are unchanged.
+          - Public helper flow: Start a call -> share HTTPS invitation -> owner Allow -> WebRTC Direct/Relay.
+          - The Worker keeps the server signing secret and TURN API token server-side; neither is embedded in the APK.
+          - Anonymous installation capabilities are server-issued and rate-limited; stale/invalid installation capabilities automatically re-register.
+          - Real WebRTC video/audio/data with direct ICE and TURN relay fallback.
+          - Worker/Durable Object tests, browser WebRTC smoke tests, Android tests/lint/build and APK signature checks passed.
+          - Existing Spatial Sync runtime is unchanged.
+          - Physical phone/browser FPS and centimetre placement accuracy still require real-device measurement.
+          - This GitHub release still uses the repository trial signing identity; Google Play production distribution should use Play App Signing.
           EOF
           gh release delete showme-latest --cleanup-tag -y || true
-          gh release create showme-latest ShowMe-latest-release.apk ShowMe-latest-dev.apk ShowMe-browser.zip SHOWME-SHA256SUMS.txt showme-signatures.txt \
-            --target "$GITHUB_SHA" --prerelease --latest=false --title "ShowMe - WebRTC camera assistance" --notes-file SHOWME-RELEASE.md
+          gh release create showme-latest ShowMe-latest-release.apk ShowMe-latest-dev.apk ShowMe-browser.zip ShowMe-server.zip SHOWME-SHA256SUMS.txt showme-signatures.txt \
+            --target "$GITHUB_SHA" --prerelease --latest=false --title "ShowMe - zero-config Internet WebRTC assistance" --notes-file SHOWME-RELEASE.md
