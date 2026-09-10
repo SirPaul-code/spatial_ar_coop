@@ -9,11 +9,9 @@ import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.os.*
 import android.provider.Settings
-import android.text.InputType
 import android.view.*
 import android.widget.*
 import com.google.ar.core.*
@@ -26,7 +24,7 @@ import java.net.NetworkInterface
 import java.util.Locale
 import java.util.concurrent.Executors
 
-/** User-facing call controls. Hosting setup is a one-time activation, not call UI. */
+/** Production call UI: Internet calling is zero-config for the user. */
 class ShowMeActivity : Activity() {
     private val state = ShowMeSession()
     private lateinit var renderer: ShowMeRenderer
@@ -72,7 +70,7 @@ class ShowMeActivity : Activity() {
                 state.hasHelper() -> state.helperName.ifBlank { "Connected" }
                 else -> "Waiting for helper"
             }
-            detail.text = if (state.active) String.format(Locale.US, "%02d:%02d  \u00b7  %d marks  \u00b7  %.0f fps", elapsed/60,elapsed%60,state.annotationCount,state.captureFps)
+            detail.text = if (state.active) String.format(Locale.US, "%02d:%02d  ·  %d marks  ·  %.0f fps", elapsed/60,elapsed%60,state.annotationCount,state.captureFps)
                 else "${state.annotationCount} marks"
             micButton.text = if (micMuted || !state.voiceEnabled) "Unmute" else "Mute"
             pauseButton.text = if (state.paused) "Resume" else "Pause"
@@ -87,6 +85,7 @@ class ShowMeActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setDecorFitsSystemWindows(false)
+        settings.edit().remove("origin").remove("key").apply()
         voice = RtcVoice(this,state)
         val api = SessionApi(state,voice)
         voice.controlHandler = api::handle
@@ -97,7 +96,6 @@ class ShowMeActivity : Activity() {
         buildCallUi()
         buildHome()
         setContentView(root)
-        // A background verifier must not fan out onto every CPU core used by video.
         if (OpenCVLoader.initLocal()) Core.setNumThreads(1) else notice("Computer vision could not start on this device.")
         root.setOnApplyWindowInsetsListener { _, insets ->
             val safe=insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
@@ -107,7 +105,6 @@ class ShowMeActivity : Activity() {
         }
         root.requestApplyInsets()
         handler.post(tick)
-        receiveActivation(intent)
     }
     private fun buildCallUi() {
         val header=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL; setPadding(d(18),d(8),d(10),d(8)) }
@@ -171,10 +168,9 @@ class ShowMeActivity : Activity() {
     }
     private fun addEqual(row:LinearLayout,view:View){row.addView(view,LinearLayout.LayoutParams(0,d(46),1f).apply{setMargins(d(3),0,d(3),0)})}
     private fun settingsMenu() {
-        val configured=settings.getString("origin","").orEmpty().isNotBlank()
-        AlertDialog.Builder(this).setTitle("ShowMe").setItems(arrayOf(if(configured)"Replace service activation" else "Activate Internet calls","Use local Wi-Fi","About this build")) { _,which->
-            when(which){0->activationDialog();1->startCall(true);2->AlertDialog.Builder(this).setTitle("ShowMe")
-                .setMessage("${BuildConfig.VERSION_NAME}\n\nInternet calls use encrypted WebRTC media, with relay fallback. Surface marks stay in this AR camera session. This build still needs physical-device acceptance testing.")
+        AlertDialog.Builder(this).setTitle("ShowMe").setItems(arrayOf("Use local Wi-Fi","About this build")) { _,which->
+            when(which){0->startCall(true);1->AlertDialog.Builder(this).setTitle("ShowMe")
+                .setMessage("${BuildConfig.VERSION_NAME}\n\nInternet calls use encrypted WebRTC media with relay fallback. No service activation or Cloudflare setup is required in the app. Surface marks stay in this AR camera session.")
                 .setPositiveButton("Done",null).show()}
         }.show()
     }
@@ -188,7 +184,6 @@ class ShowMeActivity : Activity() {
     private fun startCall(local:Boolean) {
         if(starting)return
         if(state.active){inviteDialog();return}
-        if(!local&&settings.getString("origin","").isNullOrBlank()){activationDialog();return}
         pendingLocal=local
         val permissions=listOf(Manifest.permission.CAMERA,Manifest.permission.RECORD_AUDIO)
             .filter { checkSelfPermission(it)!=PackageManager.PERMISSION_GRANTED }
@@ -207,7 +202,8 @@ class ShowMeActivity : Activity() {
         notice("Starting your call...")
         val connection=RemoteHostConnection(state,voice,{id,name->runOnUiThread { requestApproval(id,name) }},{text->notice(text)})
         remote=connection
-        connection.start(settings.getString("origin","")!!,settings.getString("key","")!!,"ShowMe camera",onReady={url->
+        connection.start(BuildConfig.SHOWME_SERVICE_ORIGIN,settings.getString("installation_token","").orEmpty(),"ShowMe camera",
+            onInstallationToken={token->settings.edit().putString("installation_token",token).apply()},onReady={url->
             runOnUiThread {
                 if(destroyed){connection.stop();return@runOnUiThread}
                 invite=url;starting=false;startedAt=monotonicMs();renderer.action("clear");home.visibility=View.GONE
@@ -234,7 +230,6 @@ class ShowMeActivity : Activity() {
         io.execute {
             try {
                 state.begin();state.secure=false;state.internet=false
-                // Listen on all local interfaces; pick Wi-Fi first for the shared invitation.
                 val local=LocalServer(this,"0.0.0.0",0,state,voice)
                 local.start(5000,true)
                 if(destroyed){local.stop();state.end();return@execute}
@@ -272,29 +267,6 @@ class ShowMeActivity : Activity() {
         invite="";startedAt=0L;val old=server;server=null;io.execute{old?.stop()}
         notice("Call ended. Marks remain until you clear them.")
     }
-    private fun activationDialog(){
-        if(state.active){notice("End your current call before changing its service.");return}
-        val input=EditText(this).apply {hint="Paste your activation link";inputType=InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI;setPadding(d(20),d(12),d(20),d(12))}
-        AlertDialog.Builder(this).setTitle("Activate Internet calls").setMessage("One-time setup for this installation. Paste the activation link printed by your ShowMe deployment, or open that link on this phone. Your helper never needs this step.")
-            .setView(input).setPositiveButton("Continue"){_,_->parseActivation(input.text.toString())}
-            .setNeutralButton("Local Wi-Fi instead"){_,_->startCall(true)}.setNegativeButton("Cancel",null).show()
-    }
-    private fun receiveActivation(intent:Intent?){val uri=intent?.data?:return;if(uri.scheme=="showme"&&uri.host=="connect")parseActivation(uri.toString())}
-    private fun parseActivation(value:String){
-        try {
-            require(!state.active)
-            val uri=Uri.parse(value.trim())
-            val origin=if(uri.scheme=="showme")uri.getQueryParameter("server") ?: error("Missing service") else "${uri.scheme}://${uri.encodedAuthority}"
-            val endpoint=Uri.parse(origin)
-            require(endpoint.scheme=="https"&&!endpoint.host.isNullOrBlank()&&endpoint.userInfo==null&&endpoint.query==null&&endpoint.fragment==null)
-            require(endpoint.path.isNullOrEmpty()||endpoint.path=="/")
-            val key=Uri.parse("https://activation.invalid/?${uri.encodedFragment ?: ""}").getQueryParameter("key")?:error("Missing activation key")
-            require(key.matches(Regex("[A-Za-z0-9_-]{32,128}")))
-            AlertDialog.Builder(this).setTitle("Use this ShowMe service?").setMessage("${endpoint.host}\n\nUse only a service you trust. It will connect your calls and issue temporary relay credentials.")
-                .setNegativeButton("Cancel",null).setPositiveButton("Activate"){_,_->settings.edit().putString("origin",origin.trimEnd('/')).putString("key",key).apply();notice("Internet calls activated. Tap Start a call.")}.show()
-        }catch(_:Exception){notice("Invalid activation link. Copy the complete link, including the part after #.")}
-    }
-    override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);receiveActivation(intent)}
     private fun resumeAr(){
         if(renderer.resumed||checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED)return
         try {
