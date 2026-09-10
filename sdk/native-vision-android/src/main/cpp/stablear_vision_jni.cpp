@@ -1,0 +1,11 @@
+#include <jni.h>
+#include <cstdint>
+#include "stablear/vision_c.h"
+namespace { stablear_vision_tracker* ptr(jlong h){return h?reinterpret_cast<stablear_vision_tracker*>(static_cast<intptr_t>(h)):nullptr;} }
+extern "C" JNIEXPORT jlong JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_create(JNIEnv*,jobject){auto*p=stablear_vision_create();return static_cast<jlong>(reinterpret_cast<intptr_t>(p));}
+extern "C" JNIEXPORT void JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_destroy(JNIEnv*,jobject,jlong h){if(auto*p=ptr(h))stablear_vision_destroy(p);}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_addRoot(JNIEnv*e,jobject,jlong h,jlong id,jbyteArray gray,jint w,jint ht,jdouble x,jdouble y){auto*p=ptr(h);if(!p||!gray||e->GetArrayLength(gray)!=w*ht)return JNI_FALSE;jbyte*b=e->GetByteArrayElements(gray,nullptr);if(!b)return JNI_FALSE;int ok=stablear_vision_add_root(p,id,reinterpret_cast<uint8_t*>(b),w,ht,x,y);e->ReleaseByteArrayElements(gray,b,JNI_ABORT);return ok?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_beginFrame(JNIEnv*e,jobject,jlong h,jlong id,jbyteArray gray,jint w,jint ht){auto*p=ptr(h);if(!p||!gray||e->GetArrayLength(gray)!=w*ht)return JNI_FALSE;jbyte*b=e->GetByteArrayElements(gray,nullptr);if(!b)return JNI_FALSE;int ok=stablear_vision_begin_frame(p,id,reinterpret_cast<uint8_t*>(b),w,ht);e->ReleaseByteArrayElements(gray,b,JNI_ABORT);return ok?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jdoubleArray JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_track(JNIEnv*e,jobject,jlong h,jlong id,jboolean has,jdouble x,jdouble y){auto*p=ptr(h);if(!p)return nullptr;stablear_vision_match m{};if(!stablear_vision_track(p,id,has?1:0,x,y,&m))return nullptr;jdouble v[6]{m.x,m.y,(double)m.inliers,m.median_reprojection_px,m.forward_backward_px,(double)m.method};auto a=e->NewDoubleArray(6);if(a)e->SetDoubleArrayRegion(a,0,6,v);return a;}
+extern "C" JNIEXPORT void JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_remove(JNIEnv*,jobject,jlong h,jlong id){if(auto*p=ptr(h))stablear_vision_remove(p,id);}
+extern "C" JNIEXPORT void JNICALL Java_com_sirpaul_stablear_nativevision_NativeVision_clear(JNIEnv*,jobject,jlong h){if(auto*p=ptr(h))stablear_vision_clear(p);}
