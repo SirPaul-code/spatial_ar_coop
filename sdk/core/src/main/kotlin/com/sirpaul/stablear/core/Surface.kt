@@ -17,7 +17,7 @@ data class SurfaceFit(val depth: Double,val conditionalSigma: Double,val support
 object SurfaceFitter {
     /**
      * Conservative research fit. The clicked pixel must be surrounded by coherent metric supports;
-     * this is intentionally strict and remains the default SDK contract.
+     * this is intentionally strict and remains available as the conservative SDK contract.
      */
     fun fit(k: Intrinsics,click: V2,samples: List<DepthSample>,radiusPx: Double=max(12.0,k.width*.025)): SurfaceFit? {
         if(!k.contains(click) || !radiusPx.isFinite() || radiusPx<1) return null
@@ -45,7 +45,7 @@ object SurfaceFitter {
      * on one side. This fit permits a SMALL extrapolation from the nearest coherent metric cluster
      * instead of requiring the click to be enclosed. It never invents a fixed-distance plane:
      * there must still be >=4 measured supports, a close measured sample and a low-residual depth
-     * cluster. Competing depth layers are excluded by seeding from the closest measurement.
+     * cluster. Competing nearest depth layers remain fail-closed.
      */
     fun fitInteractive(k: Intrinsics,click: V2,samples: List<DepthSample>,
         radiusPx: Double=max(24.0,k.width*.04)): SurfaceFit? {
@@ -72,12 +72,12 @@ object SurfaceFitter {
         // Require several close supports from this same layer, not a remote cluster.
         if(points.take(4).last().let { (it.pixel-click).norm() } > radiusPx*.80) return null
 
-        // A genuine depth discontinuity may contain a second layer. That is fine only when the
-        // selected nearest layer itself has enough coherent evidence and clearly dominates the
-        // very local neighborhood.
-        val local=near.take(min(10,near.size))
-        val sameLocal=local.count { abs(it.z-seed)<=limit }
-        if(sameLocal<3) return null
+        // The nearest six measurements must have a clear local majority for the selected layer.
+        // A 3/3 foreground/background split at an exact discontinuity is intentionally rejected.
+        val veryLocal=near.take(min(6,near.size))
+        val sameLocal=veryLocal.count { abs(it.z-seed)<=limit }
+        val requiredLocal=max(3,ceil(veryLocal.size*.67).toInt())
+        if(sameLocal<requiredLocal) return null
 
         return fitPlane(click,radiusPx,points,seed,limit*1.5,maxResidualRatio=.025)
             ?: constantDepthFallback(points,seed,limit)
