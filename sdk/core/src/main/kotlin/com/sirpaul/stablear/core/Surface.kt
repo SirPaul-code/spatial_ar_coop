@@ -27,10 +27,7 @@ object SurfaceFitter {
         val strongCount get() = rawCount + cloudCount
     }
 
-    /**
-     * Conservative research fit. The clicked pixel must be surrounded by coherent metric supports;
-     * this is intentionally strict and remains available as the conservative SDK contract.
-     */
+    /** Conservative SDK fit: the clicked pixel must be enclosed by one coherent metric layer. */
     fun fit(k: Intrinsics,click: V2,samples: List<DepthSample>,radiusPx: Double=max(12.0,k.width*.025)): SurfaceFit? {
         if(!k.contains(click) || !radiusPx.isFinite() || radiusPx<1) return null
         val near=dedupe(samples.filter { it.confidence>=.5 && it.z in .15..8.0 &&
@@ -41,7 +38,6 @@ object SurfaceFitter {
         if(near.take(6).count { abs(it.z-seed)>2*limit }>=2) return null
         val points=near.filter { abs(it.z-seed)<limit }
         if(points.size<6 || points.size<near.size*.65) return null
-        // Refuse extrapolation: click must be enclosed angularly by the supports.
         val angles=points.map { atan2(it.pixel.y-click.y,it.pixel.x-click.x) }.sorted()
         val gaps=angles.zipWithNext { a,b -> b-a }+(angles.first()+2*PI-angles.last())
         if(gaps.max()>PI+.01) return null
@@ -49,13 +45,11 @@ object SurfaceFitter {
     }
 
     /**
-     * Interactive user placement. A thin foreground object must not lose to a larger background
-     * plane merely because the background contributes more depth pixels.
-     *
-     * We explicitly separate local metric samples into depth layers. The front-most plausible layer
-     * wins only when it has real nearby support (preferably RAW or ARCore point-cloud evidence).
-     * If foreground/background ownership is genuinely ambiguous we reject rather than silently pin
-     * to the background. No fixed-distance or monocular guessed plane is ever introduced here.
+     * Interactive user placement. Candidate layers and veto layers are intentionally different:
+     * >=4 coherent supports are required to CREATE a surface, while >=3 nearby supports from a
+     * competing separated depth are enough to VETO an ambiguous choice. This prevents a thin
+     * foreground/background boundary from disappearing merely because one side has only three
+     * samples in the exact frame.
      */
     fun fitInteractive(k: Intrinsics,click: V2,samples: List<DepthSample>,
         radiusPx: Double=max(24.0,k.width*.04)): SurfaceFit? {
@@ -68,25 +62,18 @@ object SurfaceFitter {
         if(near.size<4) return null
 
         val maxSnapPx=min(radiusPx*.60,max(14.0,k.width*.020))
-        val layers=depthLayers(near,click,maxSnapPx)
-            .filter { it.points.size>=4 && it.nearestPx<=maxSnapPx && it.closeCount>=3 }
+        val allLocalLayers=depthLayers(near,click,maxSnapPx)
+            .filter { it.nearestPx<=maxSnapPx && it.closeCount>=3 && it.points.size>=3 }
             .sortedBy { it.depth }
-        if(layers.isEmpty()) return null
+        val fitLayers=allLocalLayers.filter { it.points.size>=4 }
+        if(fitLayers.isEmpty()) return null
 
-        val chosen=chooseInteractiveLayer(layers,maxSnapPx) ?: return null
+        val chosen=chooseInteractiveLayer(fitLayers,allLocalLayers,maxSnapPx) ?: return null
         val seed=chosen.depth
         val limit=max(.035,seed*.035)
         val points=chosen.points.filter { abs(it.z-seed)<=limit*1.35 }
-            .sortedBy { (it.pixel-click).norm() }
-            .take(96)
+            .sortedBy { (it.pixel-click).norm() }.take(96)
         if(points.size<4) return null
-
-        // At an exact depth discontinuity, do not let a background layer win just because it is
-        // dense. Conversely, if two equally local strong layers compete and neither owns the click,
-        // fail closed so multi-view visual refinement can be requested instead of making up Z.
-        val competitors=layers.filter { it !== chosen && abs(it.depth-chosen.depth)>max(.06,chosen.depth*.06) }
-        val equallyLocal=competitors.filter { it.nearestPx<=chosen.nearestPx+3.0 && it.strongCount>=2 }
-        if(equallyLocal.isNotEmpty() && chosen.strongCount<2 && chosen.nearestPx>maxSnapPx*.35) return null
 
         return fitPlane(click,radiusPx,points,seed,limit*1.5,maxResidualRatio=.025)
             ?: constantDepthFallback(points,seed,limit*1.5)
@@ -132,9 +119,7 @@ object SurfaceFitter {
             val depth=median(bucket.map { it.z })
             val distances=bucket.map { (it.pixel-click).norm() }
             Layer(
-                points=bucket.toList(),
-                depth=depth,
-                nearestPx=distances.min(),
+                points=bucket.toList(), depth=depth, nearestPx=distances.min(),
                 closeCount=distances.count { it<=maxSnapPx*1.5 },
                 rawCount=bucket.count { it.evidence.origin==DepthOrigin.RAW },
                 cloudCount=bucket.count { it.evidence.origin==DepthOrigin.POINT_CLOUD },
@@ -143,26 +128,40 @@ object SurfaceFitter {
         }
     }
 
-    private fun chooseInteractiveLayer(layers: List<Layer>,maxSnapPx: Double): Layer? {
-        if(layers.isEmpty()) return null
-        if(layers.size==1) return layers.first()
+    private fun chooseInteractiveLayer(fitLayers: List<Layer>,allLocalLayers: List<Layer>,maxSnapPx: Double): Layer? {
+        if(fitLayers.isEmpty()) return null
 
-        // Physical visibility rule: when a nearer layer has convincing local RAW/point-cloud support,
-        // it occludes a farther plane. This is exactly the freestanding-PCB-in-front-of-monitor case.
-        val strongFront=layers.firstOrNull { layer ->
+        // Independent RAW/point-cloud evidence establishes foreground ownership. Among such layers,
+        // the nearest physical layer wins because it occludes every deeper candidate at this pixel.
+        val strongForeground=fitLayers.firstOrNull { layer ->
             layer.nearestPx<=maxSnapPx && layer.closeCount>=3 &&
                 (layer.cloudCount>=1 || layer.rawCount>=2 || layer.strongCount>=3)
         }
-        if(strongFront!=null) return strongFront
+        if(strongForeground!=null) return strongForeground
 
-        // If no layer has strong independent evidence, only accept the layer that actually owns the
-        // closest image neighborhood. A tie across separated depths is ambiguous and must be rejected.
-        val byLocal=layers.sortedWith(compareBy<Layer> { it.nearestPx }.thenByDescending { it.closeCount })
+        if(fitLayers.size==1) {
+            val only=fitLayers.first()
+            // Three close samples are not enough to fit a rival surface, but they ARE enough to
+            // prove that the click sits on a depth discontinuity. Do not silently ignore that veto.
+            val rival=allLocalLayers.any { other ->
+                other !== only && abs(other.depth-only.depth)>max(.06,min(other.depth,only.depth)*.06) &&
+                    other.nearestPx<=only.nearestPx+max(4.0,maxSnapPx*.18)
+            }
+            return if(rival) null else only
+        }
+
+        // Without independent foreground evidence, separated layers that are comparably close to
+        // the click are intrinsically ambiguous. Density is NOT ownership; a huge monitor must not
+        // win over a thin object merely because it has more smoothed pixels.
+        val byLocal=allLocalLayers.sortedBy { it.nearestPx }
         val first=byLocal[0]
-        val second=byLocal.getOrNull(1)
-        if(second!=null && abs(first.depth-second.depth)>max(.06,first.depth*.06) &&
-            abs(first.nearestPx-second.nearestPx)<=3.0 && abs(first.closeCount-second.closeCount)<=1) return null
-        return first
+        val separatedRival=byLocal.drop(1).firstOrNull { other ->
+            abs(other.depth-first.depth)>max(.06,min(other.depth,first.depth)*.06) &&
+                other.nearestPx<=first.nearestPx+max(4.0,maxSnapPx*.18)
+        }
+        if(separatedRival!=null) return null
+
+        return fitLayers.minBy { it.nearestPx }
     }
 
     private fun fitPlane(click: V2,radiusPx: Double,points: List<DepthSample>,seed: Double,
@@ -210,11 +209,6 @@ object SurfaceFitter {
             points.map { it.evidence }.toSet(),f.toList())
     }
 
-    /**
-     * Degenerate one-sided geometry can make a 3-parameter plane singular. A robust constant-depth
-     * estimate is allowed only for a very coherent measured cluster; it is still metric evidence,
-     * not a guessed distance.
-     */
     private fun constantDepthFallback(points: List<DepthSample>,seed: Double,limit: Double): SurfaceFit? {
         if(points.size<4) return null
         val depths=points.map { it.z }.sorted()
