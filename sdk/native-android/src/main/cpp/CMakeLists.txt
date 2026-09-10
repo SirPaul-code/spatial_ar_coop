@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(StableARAndroid LANGUAGES C CXX)
+set(STABLEAR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../../native ${CMAKE_CURRENT_BINARY_DIR}/stablear-native)
+add_library(stablear_jni SHARED stablear_jni.cpp)
+target_link_libraries(stablear_jni PRIVATE StableAR::stablear log)
+target_compile_features(stablear_jni PRIVATE cxx_std_20)
