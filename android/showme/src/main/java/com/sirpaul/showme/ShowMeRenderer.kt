@@ -4,12 +4,9 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import com.google.ar.core.*
 import com.sirpaul.spatialnomap.*
-import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.core.*
-import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
-import java.util.Base64
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,25 +26,33 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         Thread({ android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); task.run() }, "ShowMe-surface-verifier")
     }
     private val surfaceVerifier = StrokeSurfaceVerifier()
+    private val stableAr = StableArShowMeBridge(notice)
     private val verifierBusy = AtomicBoolean()
     private val actions = ConcurrentLinkedQueue<String>()
     private val repairs = ConcurrentLinkedQueue<Repair>()
-    private var lastCapture = 0L; private var nextFrameId = 0L; private var lastVerify = 0L; private var verifyIndex = 0
+    private var lastCapture = 0L; private var nextFrameId = 0L; private var verifyIndex = 0
     private var lastError = ""
     private var videoPipe: RtcVideoPipe? = null
+    private var observedShowEpoch = state.epoch
     private data class Drawing(val id: String, val tool: String, val color: String, val label: String,
-        var anchor: Anchor, var offsets: List<FloatArray>, val reference: StrokeSurfaceVerifier.Reference,
-        var verified: Boolean = false, var pending: List<FloatArray>? = null, var votes: Int = 0,
+        var anchor: Anchor?, val stableArAttachmentId: Long?, var offsets: List<FloatArray>,
+        val reference: StrokeSurfaceVerifier.Reference?, var verified: Boolean = false,
+        var pending: List<FloatArray>? = null, var votes: Int = 0,
         var lastVoteFrame: Long = -1L, var repairBudgetM: Float = 0f)
     private data class Repair(val id: String, val epoch: Int, val frameId: Long, val result: StrokeSurfaceVerifier.Result)
     private val drawings = LinkedHashMap<String, Drawing>()
 
     fun action(action: String) { actions.add(action) }
+    fun requestStableArEnabled(enabled: Boolean) { actions.add("stable:${if(enabled)1 else 0}") }
+    fun invalidateStableArFrames() { stableAr.invalidateExternalFramesAsync() }
     fun close() {
         verifying.execute { surfaceVerifier.clear() }; verifying.shutdown()
+        stableAr.closeWorkers()
     }
+    /** Called on GL owner thread (including the queued Activity destruction path). */
     fun releaseGlResources() {
         runCatching { videoPipe?.close() }; videoPipe = null
+        runCatching { stableAr.releaseOnOwnerThread() }
     }
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0.035f, 0.05f, 0.08f, 1f)
@@ -67,10 +72,13 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         lastDepthMs = 0f
         try {
             if (boundSession !== session) {
-                detachAll(); state.resetWorld()
+                detachAll()
+                state.resetWorld()
                 session.setCameraTextureName(background.textureId)
                 session.setDisplayGeometry(0, width, height)
                 boundSession = session
+                stableAr.onSession(session)
+                observedShowEpoch = state.epoch
             }
             val frame = session.update()
             background.draw(frame)
@@ -78,10 +86,26 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             val tracking = camera.trackingState == TrackingState.TRACKING
             state.tracking = tracking
             state.trackingMessage = if (tracking) "Surface tracking active" else "Scan slowly: ${camera.trackingFailureReason}"
+
+            // A new remote call/session epoch invalidates every browser-frame -> SDK sample mapping,
+            // while existing local marks may remain in the same ARCore world.
+            if (observedShowEpoch != state.epoch) {
+                stableAr.endRemoteSession()
+                observedShowEpoch = state.epoch
+            }
+            processSpatialLeases()
             while (true) {
                 val action = actions.poll() ?: break
-                when (action) { "clear" -> detachAll(); "undo" -> removeLast() }
+                when {
+                    action == "clear" -> detachAll()
+                    action == "undo" -> removeLast()
+                    action.startsWith("stable:") -> switchSpatialMode(action.endsWith("1"))
+                }
             }
+
+            val useStableAr = state.stableArEnabled && (state.hasHelper() || drawings.values.any { it.stableArAttachmentId != null })
+            stableAr.onFrame(frame, state.epoch, useStableAr)
+
             repeat(3) {
                 val command = state.poll() ?: return@repeat
                 if (command.answer.isDone) return@repeat
@@ -93,6 +117,7 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             if (!tracking) {
                 overlay.show(emptyList())
                 publishVideo(frame, camera, emptyList())
+                state.stableArDiagnostics = if(state.stableArEnabled) stableAr.diagnosticsJson() else "{}"
                 return
             }
             applyRepairs(session)
@@ -101,12 +126,39 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             val depthFrame = publishVideo(frame, camera, snapshot)
             if (depthFrame != null) captureIfDue(frame, camera, depthFrame)
             state.annotationCount = drawings.size
+            state.stableArDiagnostics = if(state.stableArEnabled) stableAr.diagnosticsJson() else "{}"
         } catch (t: Throwable) {
             if (t is com.google.ar.core.exceptions.SessionPausedException) return
             state.tracking = false
             val message = t.javaClass.simpleName + ": " + (t.message ?: "AR camera unavailable")
             if (message != lastError) { lastError = message; notice(message) }
         } finally { state.telemetry.frame((System.nanoTime()-workStart)/1_000_000f,lastDepthMs) }
+    }
+
+    private fun processSpatialLeases() {
+        repeat(8) {
+            val lease = state.pollSpatialLease() ?: return
+            if (lease.answer.isDone) return@repeat
+            val ok = runCatching {
+                when (lease.action) {
+                    SpatialLeaseAction.FREEZE -> state.stableArEnabled && stableAr.freeze(lease.frameId, lease.epoch, state.epoch)
+                    SpatialLeaseAction.UNFREEZE -> { if(state.stableArEnabled) stableAr.unfreeze(); true }
+                }
+            }.getOrDefault(false)
+            lease.answer.complete(ok)
+        }
+    }
+
+    private fun switchSpatialMode(enabled: Boolean) {
+        if (state.stableArEnabled == enabled) return
+        // Ownership cannot change under an existing mark: clear the comparison scene and bump the
+        // ShowMe epoch so a browser cannot submit geometry captured in the previous mode.
+        detachAll()
+        stableAr.resetWorld()
+        state.setSpatialMode(enabled)
+        state.resetWorld()
+        observedShowEpoch = state.epoch
+        notice(if(enabled) "Spatial attachment: StableAR" else "Spatial attachment: legacy verifier")
     }
 
     private fun applyCommand(session: Session, body: JSONObject, prepared: PreparedStroke?): JSONObject {
@@ -117,7 +169,8 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             "clear" -> { detachAll(); return JSONObject().put("ok", true).also { state.remember(requestId, it) } }
             "undo" -> { removeLast(); return JSONObject().put("ok", true).also { state.remember(requestId, it) } }
             "remove" -> {
-                drawings.remove(body.optString("id"))?.let { runCatching { it.anchor.detach() } }
+                drawings.remove(body.optString("id"))?.let(::releaseDrawing)
+                state.annotationCount = drawings.size
                 return JSONObject().put("ok", true).also { state.remember(requestId, it) }
             }
         }
@@ -132,35 +185,69 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         if (ready.frame.id != packet.id || ready.frame.epoch != state.epoch)
             return ShowMeSession.failure("WORLD_CHANGED", "The camera session changed. Try again.")
         val world = ready.world
-        // Use the stroke centroid, not the rightmost vertex of a circle, as its local origin.
-        val base = StrokeGeometry.center(world)
-        val anchor = session.createAnchor(Pose.makeTranslation(base))
         val id = java.util.UUID.randomUUID().toString()
-        val drawing = Drawing(id, body.getString("tool"), body.getString("color"),
-            body.optString("label").filter { !it.isISOControl() }.take(64), anchor,
-            world.map { p -> anchor.pose.inverse().transformPoint(p) },
-            StrokeSurfaceVerifier.Reference(id,packet.capture,ready.pixels))
+        val label = body.optString("label").filter { !it.isISOControl() }.take(64)
+        val drawing = if (state.stableArEnabled) {
+            val points = body.getJSONArray("points")
+            val normalized = ArrayList<DoubleArray>(points.length())
+            for (i in 0 until points.length()) {
+                val p = points.getJSONArray(i)
+                normalized += doubleArrayOf(p.getDouble(0), p.getDouble(1))
+            }
+            val root = StableArPlacementMath.normalizedRoot(normalized)
+                ?: return ShowMeSession.failure("INVALID_DRAWING", "Drawing coordinates are invalid.")
+            val placement = stableAr.place(packet.id, state.epoch, root)
+                ?: return ShowMeSession.failure("NO_SURFACE", "StableAR could not retain the exact surface under this historical frame. Resume live view and try again.")
+            val offsets = StableArPlacementMath.relativeOffsets(world)
+            if (offsets == null) {
+                stableAr.remove(placement.attachmentId)
+                return ShowMeSession.failure("NO_SURFACE", "The drawing geometry could not be retained.")
+            }
+            Drawing(id, body.getString("tool"), body.getString("color"), label, null,
+                placement.attachmentId, offsets, null)
+        } else {
+            // Legacy A/B path is intentionally kept intact and remains the only owner of its verifier.
+            val base = StrokeGeometry.center(world)
+            val anchor = session.createAnchor(Pose.makeTranslation(base))
+            Drawing(id, body.getString("tool"), body.getString("color"), label, anchor, null,
+                world.map { p -> anchor.pose.inverse().transformPoint(p) },
+                StrokeSurfaceVerifier.Reference(id,packet.capture,ready.pixels))
+        }
         drawings[id] = drawing
         state.annotationCount = drawings.size
-        notice(if (drawing.label.isBlank()) "New ${drawing.tool} anchored to the surface" else "Pinned: ${drawing.label}")
+        notice(if (drawing.label.isBlank()) "New ${drawing.tool} attached with ${if(drawing.stableArAttachmentId!=null)"StableAR" else "legacy tracking"}" else "Pinned: ${drawing.label}")
         return JSONObject().put("ok", true).put("id", id).put("frameId", packet.id)
+            .put("spatialMode", if(drawing.stableArAttachmentId!=null)"STABLE_AR" else "LEGACY")
             .put("annotations", projectStrokes(packet.capture, packet.rotation, snapshot()))
             .also { state.remember(requestId, it) }
     }
+
+    private fun releaseDrawing(d: Drawing) {
+        d.stableArAttachmentId?.let { stableAr.remove(it) }
+            ?: d.anchor?.let { runCatching { it.detach() } }
+    }
     private fun removeLast() {
         val id = drawings.keys.lastOrNull() ?: return
-        drawings.remove(id)?.let { runCatching { it.anchor.detach() } }
+        drawings.remove(id)?.let(::releaseDrawing)
         state.annotationCount = drawings.size
     }
     private fun detachAll() {
-        drawings.values.forEach { runCatching { it.anchor.detach() } }
+        drawings.values.forEach(::releaseDrawing)
         drawings.clear(); repairs.clear(); state.annotationCount = 0
         if (!verifying.isShutdown) verifying.execute { surfaceVerifier.clear() }
         overlay.show(emptyList())
     }
     private fun snapshot(): List<StrokeSnapshot> = drawings.values.mapNotNull { d ->
-        if (d.anchor.trackingState != TrackingState.TRACKING) null
-        else StrokeSnapshot(d.id, d.tool, d.color, d.label, d.offsets.map { d.anchor.pose.transformPoint(it) }, d.verified)
+        val stableId = d.stableArAttachmentId
+        if (stableId != null) {
+            val root = stableAr.worldPoint(stableId) ?: return@mapNotNull null
+            val points = d.offsets.map { o -> floatArrayOf(root[0]+o[0],root[1]+o[1],root[2]+o[2]) }
+            StrokeSnapshot(d.id,d.tool,d.color,d.label,points,stableAr.isGeometrySupported(stableId))
+        } else {
+            val anchor = d.anchor ?: return@mapNotNull null
+            if (anchor.trackingState != TrackingState.TRACKING) null
+            else StrokeSnapshot(d.id,d.tool,d.color,d.label,d.offsets.map { anchor.pose.transformPoint(it) },d.verified)
+        }
     }
     private fun showNativeOverlay(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>) {
         val k = camera.imageIntrinsics
@@ -193,6 +280,8 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             if (!pipe.isDue(frame.timestamp, System.nanoTime())) return null
             val id = ++nextFrameId
             val epoch = state.epoch
+            // This exact mapping is established BEFORE submitting the same exposure to WebRTC.
+            if (state.stableArEnabled) stableAr.bindVideoFrame(id, epoch, imageRotation, frame.timestamp)
             val start = System.nanoTime()
             val captured = VideoDepthFrame.capture(frame, camera, id, epoch, imageRotation, strokes,
                 pipe.videoWidth, pipe.videoHeight, pipe.contentHeight)
@@ -212,16 +301,18 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         return null
     }
 
-    /** One bulk luma copy; no chroma loops or 8,000-point reconstruction on the GL thread. */
+    /** Legacy verifier only. StableAR-controlled drawings never enter this correction system. */
     private fun captureIfDue(frame: Frame, camera: Camera, depthFrame: VideoDepthFrame) {
         val now = monotonicMs()
         if (!state.active || state.paused || drawings.isEmpty() || now-lastCapture < 1_200L ||
             !verifierBusy.compareAndSet(false,true)) return
-        val candidates=drawings.values.filter { it.anchor.trackingState==TrackingState.TRACKING && it.repairBudgetM<.15f }
+        val candidates=drawings.values.filter { it.stableArAttachmentId==null &&
+            it.anchor?.trackingState==TrackingState.TRACKING && it.reference!=null && it.repairBudgetM<.15f }
         if(candidates.isEmpty()){verifierBusy.set(false);return}
         val target=candidates[verifyIndex++%candidates.size]
-        val reference=target.reference
-        val expected=target.offsets.map { target.anchor.pose.transformPoint(it) }
+        val anchor=target.anchor ?: run {verifierBusy.set(false);return}
+        val reference=target.reference ?: run {verifierBusy.set(false);return}
+        val expected=target.offsets.map { anchor.pose.transformPoint(it) }
         val image=runCatching { frame.acquireCameraImage() }.getOrNull()
         if(image==null){verifierBusy.set(false);return}
         try {
@@ -268,9 +359,11 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             val repair=repairs.poll() ?: break
             if(repair.epoch!=state.epoch)continue
             val d=drawings[repair.id] ?: continue
-            if(repair.frameId==d.lastVoteFrame||d.anchor.trackingState!=TrackingState.TRACKING)continue
+            if(d.stableArAttachmentId!=null)continue
+            val anchor=d.anchor ?: continue
+            if(repair.frameId==d.lastVoteFrame||anchor.trackingState!=TrackingState.TRACKING)continue
             d.lastVoteFrame=repair.frameId
-            val current=d.offsets.map { d.anchor.pose.transformPoint(it) }
+            val current=d.offsets.map { anchor.pose.transformPoint(it) }
             val points=repair.result.points
             if(!StrokeGeometry.shapeCompatible(current,points))continue
             val delta=current.indices.maxOf { ShowMeGeometry.distance(current[it],points[it]) }
@@ -281,14 +374,14 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             else d.votes=1
             d.pending=points.map { it.copyOf() }
             if(d.votes<2)continue
-            // Apply a bounded consensus shape correction, including its orientation/extent.
+            // Legacy bounded consensus correction. Never applied to StableAR-owned marks.
             val blended=current.indices.map { i->FloatArray(3) { axis->current[i][axis]*.5f+points[i][axis]*.5f } }
             val base=StrokeGeometry.center(blended)
             val replacement=runCatching { session.createAnchor(Pose.makeTranslation(base)) }.getOrNull() ?: continue
             val old=d.anchor;d.anchor=replacement
             d.offsets=blended.map { replacement.pose.inverse().transformPoint(it) }
             d.verified=true;d.repairBudgetM+=delta*.5f;d.pending=null;d.votes=0
-            runCatching { old.detach() }
+            runCatching { old?.detach() }
         }
     }
 }
