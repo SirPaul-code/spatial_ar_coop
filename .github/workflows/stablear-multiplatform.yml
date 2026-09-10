@@ -1,0 +1,153 @@
+name: stablear-multiplatform
+on:
+  push:
+    branches: [stablear/multiplatform-sdk]
+    paths: ['sdk/**', '.github/workflows/stablear-multiplatform.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: stablear-multiplatform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: 38978da448b6610606e9145367b9b31328bb5cc0
+
+jobs:
+  scope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Branch and product isolation
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = refs/heads/stablear/multiplatform-sdk
+          git diff --name-only "$BASE_SHA" HEAD | tee changed.txt
+          if grep -Ev '^(sdk/|\.github/workflows/stablear-multiplatform\.yml$)' changed.txt; then
+            echo 'Multiplatform SDK branch modified protected product paths' >&2; exit 1
+          fi
+          git diff --exit-code "$BASE_SHA" HEAD -- android showme server README.md AGENTS.md .github/workflows/ci.yml .github/workflows/showme-ci.yml
+
+  native-linux:
+    needs: scope
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopencv-dev libopenxr-dev pkg-config
+          python3 -m pip install -r sdk/licensing/requirements.txt
+      - name: Native static contract
+        run: |
+          cmake -S sdk/native -B build/native-static -DSTABLEAR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/native-static --parallel
+          ctest --test-dir build/native-static --output-on-failure
+          ./build/native-static/stablear_contract | tee native-contract.txt
+      - name: Native shared and installed package consumer
+        run: |
+          cmake -S sdk/native -B build/native-shared -DSTABLEAR_BUILD_SHARED=ON -DSTABLEAR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/build/install"
+          cmake --build build/native-shared --parallel
+          ctest --test-dir build/native-shared --output-on-failure
+          cmake --install build/native-shared
+          cmake -S sdk/native/tests/package_consumer -B build/package-consumer -DCMAKE_PREFIX_PATH="$PWD/build/install"
+          cmake --build build/package-consumer --parallel
+          LD_LIBRARY_PATH="$PWD/build/install/lib" ./build/package-consumer/stablear_package_consumer
+          nm -D --defined-only build/native-shared/libstablear.so | awk '{print $3}' | grep '^stablear_' | sort | tee native-symbols.txt
+          test "$(wc -l < native-symbols.txt)" -ge 21
+      - name: Sanitizers and warnings-as-errors
+        run: |
+          cmake -S sdk/native -B build/native-sanitize -DSTABLEAR_BUILD_TESTS=ON -DCMAKE_CXX_FLAGS='-Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+          cmake --build build/native-sanitize --parallel
+          ctest --test-dir build/native-sanitize --output-on-failure
+      - name: Shared OpenCV tracker
+        run: |
+          cmake -S sdk/native-vision -B build/native-vision -DSTABLEAR_VISION_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/native-vision --parallel
+          ctest --test-dir build/native-vision --output-on-failure
+      - name: OpenXR adapter and coordinate contract
+        run: |
+          cmake -S sdk/openxr -B build/openxr -DSTABLEAR_OPENXR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/openxr --parallel
+          ctest --test-dir build/openxr --output-on-failure
+      - name: Entitlement issuer and private-repo export
+        run: |
+          python3 sdk/licensing/test_entitlement.py
+          python3 sdk/tools/export_multiplatform_sdk.py build/exported-sdk
+          test -f build/exported-sdk/native/CMakeLists.txt
+          test ! -e build/exported-sdk/showme
+          test ! -e build/exported-sdk/android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stablear-native-linux-${{ github.sha }}
+          path: |
+            build/native-shared/libstablear.so
+            build/native-static/libstablear.a
+            native-contract.txt
+            native-symbols.txt
+          retention-days: 14
+
+  android:
+    needs: scope
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.11.1' }
+      - uses: android-actions/setup-android@v3
+      - name: Android toolchain
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Build native AARs and retain Android reference
+        run: |
+          gradle -p sdk --no-daemon --stacktrace \
+            :native-android:assembleRelease :native-android:lintRelease \
+            :native-vision-android:assembleRelease :native-vision-android:lintRelease \
+            :core:check :arcore:assembleRelease :vision:assembleRelease :demo:assembleDebug
+          unzip -l sdk/native-android/build/outputs/aar/native-android-release.aar | tee native-android-aar.txt
+          unzip -l sdk/native-vision-android/build/outputs/aar/native-vision-android-release.aar | tee native-vision-aar.txt
+          grep -q 'jni/arm64-v8a/' native-android-aar.txt
+          grep -q 'jni/arm64-v8a/' native-vision-aar.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stablear-android-preview-${{ github.sha }}
+          path: |
+            sdk/native-android/build/outputs/aar/*.aar
+            sdk/native-vision-android/build/outputs/aar/*.aar
+            native-android-aar.txt
+            native-vision-aar.txt
+          retention-days: 14
+
+  apple:
+    needs: scope
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iOS device + simulator XCFramework
+        run: bash sdk/apple/scripts/build_xcframework.sh "$PWD/build/apple"
+      - name: Swift wrapper + ARKit typecheck
+        shell: bash
+        run: |
+          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos swiftc -warnings-as-errors -typecheck -target arm64-apple-ios15.0 -sdk "$SDKROOT" \
+            -I sdk/apple/Headers sdk/apple/Sources/StableARApple/StableARSession.swift \
+            sdk/apple/Sources/StableARApple/ARKitStableARAdapter.swift \
+            sdk/apple/Sources/StableARApple/StableAREntitlement.swift
+          test -d build/apple/StableARNative.xcframework
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stablear-apple-preview-${{ github.sha }}
+          path: build/apple/StableARNative.xcframework
+          retention-days: 14
+
+  unity-abi:
+    needs: scope
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.0.x' }
+      - name: Compile managed binding and verify LP64 ABI layout
+        run: dotnet run --project sdk/unity/abi-contract/StableARAbi.csproj -c Release

@@ -4,4 +4,4 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name="StableAR"
-include(":core",":arcore",":vision",":demo")
+include(":core",":arcore",":vision",":demo",":native-android",":native-vision-android")

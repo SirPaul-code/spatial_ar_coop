@@ -4,4 +4,4 @@ plugins {
     id("org.jetbrains.kotlin.android") version "1.9.24" apply false
     id("org.jetbrains.kotlin.jvm") version "1.9.24" apply false
 }
-allprojects { group="com.sirpaul.stablear"; version="0.1.0-research" }
+allprojects { group="com.sirpaul.stablear"; version="0.2.0-research" }
