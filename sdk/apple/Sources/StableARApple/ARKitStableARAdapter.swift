@@ -32,10 +32,34 @@ public final class ARKitStableARAdapter {
     public func close(){check();native.close();store.clear()}
 
     private func depth(_ frame:ARFrame,imageWidth:Int,imageHeight:Int,timestampNs:Int64)->[stablear_depth_sample]{
-        let data=frame.sceneDepth ?? frame.smoothedSceneDepth;guard let d=data else{return []};let pb=d.depthMap,cb=d.confidenceMap;CVPixelBufferLockBaseAddress(pb,.readOnly);CVPixelBufferLockBaseAddress(cb,.readOnly);defer{CVPixelBufferUnlockBaseAddress(cb,.readOnly);CVPixelBufferUnlockBaseAddress(pb,.readOnly)}
-        let w=CVPixelBufferGetWidth(pb),h=CVPixelBufferGetHeight(pb),dr=CVPixelBufferGetBytesPerRow(pb),cr=CVPixelBufferGetBytesPerRow(cb);guard let db=CVPixelBufferGetBaseAddress(pb),let conf=CVPixelBufferGetBaseAddress(cb)else{return []};let step=max(1,Int(ceil(sqrt(Double(w*h)/8000.0))));var out:[stablear_depth_sample]=[];out.reserveCapacity(8000);let origin:Int32=(frame.sceneDepth != nil) ? 3:1
-        for y in stride(from:step/2,to:h,by:step){let dz=db.advanced(by:y*dr).assumingMemoryBound(to:Float32.self);let cz=conf.advanced(by:y*cr).assumingMemoryBound(to:UInt8.self);for x in stride(from:step/2,to:w,by:step){let z=Double(dz[x]);let c=min(1.0,Double(Int(cz[x])+1)/3.0);if(!z.isFinite||z<0.15||z>8||c<0.5){continue};let px=(Double(x)+0.5)*Double(imageWidth)/Double(w),py=(Double(y)+0.5)*Double(imageHeight)/Double(h);out.append(stablear_depth_sample(pixel:stablear_v2(x:px,y:py),z:z,confidence:c,origin:origin,source_timestamp_ns:timestampNs))}}
+        guard let d=frame.sceneDepth ?? frame.smoothedSceneDepth else{return []}
+        let pb=d.depthMap
+        let cb=d.confidenceMap
+        CVPixelBufferLockBaseAddress(pb,.readOnly)
+        if let cb { CVPixelBufferLockBaseAddress(cb,.readOnly) }
+        defer {
+            if let cb { CVPixelBufferUnlockBaseAddress(cb,.readOnly) }
+            CVPixelBufferUnlockBaseAddress(pb,.readOnly)
+        }
+        let w=CVPixelBufferGetWidth(pb),h=CVPixelBufferGetHeight(pb),dr=CVPixelBufferGetBytesPerRow(pb)
+        guard let db=CVPixelBufferGetBaseAddress(pb) else{return []}
+        let cr=cb.map{CVPixelBufferGetBytesPerRow($0)} ?? 0
+        let confBase=cb.flatMap{CVPixelBufferGetBaseAddress($0)}
+        let step=max(1,Int(ceil(sqrt(Double(w*h)/8000.0))))
+        var out:[stablear_depth_sample]=[];out.reserveCapacity(8000)
+        let origin:Int32=(frame.sceneDepth != nil) ? 3:1
+        for y in stride(from:step/2,to:h,by:step){
+            let dz=db.advanced(by:y*dr).assumingMemoryBound(to:Float32.self)
+            let cz=confBase?.advanced(by:y*cr).assumingMemoryBound(to:UInt8.self)
+            for x in stride(from:step/2,to:w,by:step){
+                let z=Double(dz[x])
+                let c=cz.map{min(1.0,Double(Int($0[x])+1)/3.0)} ?? 0.5
+                if(!z.isFinite||z<0.15||z>8||c<0.5){continue}
+                let px=(Double(x)+0.5)*Double(imageWidth)/Double(w),py=(Double(y)+0.5)*Double(imageHeight)/Double(h)
+                out.append(stablear_depth_sample(pixel:stablear_v2(x:px,y:py),z:z,confidence:c,origin:origin,source_timestamp_ns:timestampNs))
+            }
+        }
         return out
     }
-    private func luma(_ pb:CVPixelBuffer)->([UInt8],Int,Int)?{CVPixelBufferLockBaseAddress(pb,.readOnly);defer{CVPixelBufferUnlockBaseAddress(pb,.readOnly)};let w=CVPixelBufferGetWidthOfPlane(pb,0),h=CVPixelBufferGetHeightOfPlane(pb,0),stride=CVPixelBufferGetBytesPerRowOfPlane(pb,0);guard let base=CVPixelBufferGetBaseAddressOfPlane(pb,0)else{return nil};var out=[UInt8](repeating:0,count:w*h);for y in 0..<h{out.withUnsafeMutableBytes{dst in memcpy(dst.baseAddress!.advanced(by:y*w),base.advanced(by:y*stride),w)}};return(out,w,h)}
+    private func luma(_ pb:CVPixelBuffer)->([UInt8],Int,Int)?{CVPixelBufferLockBaseAddress(pb,.readOnly);defer{CVPixelBufferUnlockBaseAddress(pb,.readOnly)};let w=CVPixelBufferGetWidthOfPlane(pb,0),h=CVPixelBufferGetHeightOfPlane(pb,0),stride=CVPixelBufferGetBytesPerRowOfPlane(pb,0);guard let base=CVPixelBufferGetBaseAddressOfPlane(pb,0)else{return nil};var out=[UInt8](repeating:0,count:w*h);for y in 0..<h{out.withUnsafeMutableBytes{dst in _=memcpy(dst.baseAddress!.advanced(by:y*w),base.advanced(by:y*stride),w)}};return(out,w,h)}
 }

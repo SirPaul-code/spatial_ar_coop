@@ -100,17 +100,42 @@ jobs:
       - uses: android-actions/setup-android@v3
       - name: Android toolchain
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
-      - name: Build native AARs and retain Android reference
+      - name: Build native core AAR
+        shell: bash
         run: |
-          gradle -p sdk --no-daemon --stacktrace \
-            :native-android:assembleRelease :native-android:lintRelease \
-            :native-vision-android:assembleRelease :native-vision-android:lintRelease \
-            :core:check :arcore:assembleRelease :vision:assembleRelease :demo:assembleDebug
+          set -o pipefail
+          gradle -p sdk --no-daemon --stacktrace :native-android:assembleRelease :native-android:lintRelease 2>&1 | tee native-android-build.log
+      - name: Build native OpenCV vision AAR
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p sdk --no-daemon --stacktrace :native-vision-android:assembleRelease :native-vision-android:lintRelease 2>&1 | tee native-vision-android-build.log
+      - name: Retain original Android reference buildability
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p sdk --no-daemon --stacktrace :core:check :arcore:assembleRelease :vision:assembleRelease :demo:assembleDebug 2>&1 | tee android-reference-build.log
+      - name: Inspect native AARs
+        run: |
           unzip -l sdk/native-android/build/outputs/aar/native-android-release.aar | tee native-android-aar.txt
           unzip -l sdk/native-vision-android/build/outputs/aar/native-vision-android-release.aar | tee native-vision-aar.txt
           grep -q 'jni/arm64-v8a/' native-android-aar.txt
           grep -q 'jni/arm64-v8a/' native-vision-aar.txt
+      - name: Android diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stablear-android-diagnostics-${{ github.sha }}
+          path: |
+            *android-build.log
+            sdk/native-android/build/reports/
+            sdk/native-vision-android/build/reports/
+            sdk/native-android/.cxx/
+            sdk/native-vision-android/.cxx/
+          if-no-files-found: warn
+          retention-days: 7
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: stablear-android-preview-${{ github.sha }}
           path: |

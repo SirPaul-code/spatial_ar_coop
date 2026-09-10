@@ -8,9 +8,12 @@ if(NOT TARGET StableAR::stablear)
   add_subdirectory(../native stablear-native EXCLUDE_FROM_ALL)
 endif()
 
-# Desktop packages normally expose OpenCV_LIBS. Android Prefab packages may expose
-# opencv_java4/OpenCV::opencv_java4 depending on the package producer.
-if(TARGET OpenCV::opencv_java4)
+# Desktop OpenCV normally exposes OpenCV_LIBS. Android Prefab generated from the
+# official org.opencv:opencv AAR exposes package `opencv`, module `opencv_java4`,
+# hence target opencv::opencv_java4. Keep the other names for local/custom builds.
+if(TARGET opencv::opencv_java4)
+  set(STABLEAR_OPENCV_LIBS opencv::opencv_java4)
+elseif(TARGET OpenCV::opencv_java4)
   set(STABLEAR_OPENCV_LIBS OpenCV::opencv_java4)
 elseif(TARGET opencv_java4)
   set(STABLEAR_OPENCV_LIBS opencv_java4)
