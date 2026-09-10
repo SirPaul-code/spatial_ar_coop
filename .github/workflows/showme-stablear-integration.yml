@@ -21,12 +21,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Guard unrelated Spatial Sync and known-good SDK source
+      - name: Guard unrelated Spatial Sync and research SDK branch
         shell: bash
         run: |
           set -euo pipefail
           git diff --exit-code e5fe5e30627382578cc12b8065d496a385dd350a -- android/app .github/workflows/ci.yml
-          git diff --exit-code 38978da448b6610606e9145367b9b31328bb5cc0 -- sdk
+          git fetch origin research_sdk:refs/remotes/origin/research_sdk
+          test "$(git rev-parse origin/research_sdk)" = "38978da448b6610606e9145367b9b31328bb5cc0"
 
       - uses: actions/setup-node@v4
         with:
@@ -91,7 +92,7 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "ShowMe - StableAR integration test" \
             --prerelease \
-            --notes "StableAR physical-test build. StableAR is the sole initial depth authority for pin annotations; legacy ShowMe depth no longer gates or offsets StableAR pins. Includes startup OpenCV fix and exact-frame StableAR integration. Test prerelease only; not Google Play production signing."
+            --notes "StableAR physical-test build. Pin depth is owned by StableAR, with strict placement first and a bounded evidence-based edge-aware fit for sparse real-world ARCore depth. No guessed fixed-distance plane. Includes exact-frame WebRTC integration and startup OpenCV fix. Test prerelease only; not Google Play production signing."
 
       - name: Upload integration diagnostics and APK
         if: always()
