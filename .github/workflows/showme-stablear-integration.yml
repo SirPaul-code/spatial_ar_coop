@@ -29,6 +29,17 @@ jobs:
           git fetch origin research_sdk:refs/remotes/origin/research_sdk
           test "$(git rev-parse origin/research_sdk)" = "38978da448b6610606e9145367b9b31328bb5cc0"
 
+      - name: Guard production StableAR placement wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRIDGE=android/showme/src/main/java/com/sirpaul/showme/StableArShowMeBridge.kt
+          PIPE=android/showme/src/main/java/com/sirpaul/showme/RtcVideoPipe.kt
+          grep -Fq 'sdk.placeInteractive(sample, sensorPixel)' "$BRIDGE"
+          ! grep -Fq 'sdk.place(sample, sensorPixel)' "$BRIDGE"
+          grep -Fq 'ShowMeGeometry.uprightToRaw' "$BRIDGE"
+          grep -Fq 'ShowMeGeometry.uprightToRaw' "$PIPE"
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
