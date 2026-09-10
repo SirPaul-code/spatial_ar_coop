@@ -9,6 +9,7 @@ import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.os.*
 import android.provider.Settings
@@ -19,311 +20,323 @@ import com.google.ar.core.*
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.MultiFormatWriter
 import org.opencv.android.OpenCVLoader
+import org.opencv.core.Core
 import java.net.Inet4Address
 import java.net.NetworkInterface
-import java.security.KeyStore
+import java.util.Locale
 import java.util.concurrent.Executors
 
+/** User-facing call controls. Hosting setup is a one-time activation, not call UI. */
 class ShowMeActivity : Activity() {
     private val state = ShowMeSession()
     private lateinit var renderer: ShowMeRenderer
-    private lateinit var overlay: ShowMeOverlay
     private lateinit var gl: GLSurfaceView
     private lateinit var voice: RtcVoice
     private lateinit var root: FrameLayout
-    private lateinit var home: LinearLayout
+    private lateinit var layout: LinearLayout
+    private lateinit var home: ScrollView
     private lateinit var statusText: TextView
-    private lateinit var presence: TextView
     private lateinit var detail: TextView
-    private lateinit var toast: TextView
+    private lateinit var noticeText: TextView
+    private lateinit var micButton: TextView
     private lateinit var pauseButton: TextView
-    private lateinit var voiceButton: TextView
+    private lateinit var shareButton: TextView
+    private lateinit var startButton: TextView
     private val handler = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
+    private val settings by lazy { getSharedPreferences("showme-service", MODE_PRIVATE) }
     private var ar: Session? = null
     private var server: LocalServer? = null
-    private var tls: LocalTls? = null
-    private var importedTls: LocalTls? = null
+    private var remote: RemoteHostConnection? = null
     private var invite = ""
     private var startedAt = 0L
     private var installRequested = false
-    private var starting = false
-    private var pendingSecure: Boolean? = null
+    @Volatile private var starting = false
+    private var pendingLocal: Boolean? = null
     private var resumeSharing = false
+    private var foreground = false
     private var destroyed = false
-    private val mint = 0xff8ff1c6.toInt()
-    private val dark = 0xff0b1220.toInt()
-    private val panel = 0xe9152031.toInt()
-    private val muted = 0xffadbbce.toInt()
+    private var micMuted = false
+    private var pendingApproval: Pair<String,String>? = null
+    private val ink = 0xff15191c.toInt()
+    private val paper = 0xfff5f4ef.toInt()
+    private val accent = 0xffa7ebc9.toInt()
+    private val grey = 0xffa9afb2.toInt()
     private val tick = object : Runnable {
         override fun run() {
             if (destroyed) return
-            statusText.text = when { !state.active -> "CAMERA READY"; state.paused -> "VIDEO PAUSED"; !state.tracking -> "SCANNING"; else -> "LIVE / AR" }
-            presence.text = if (state.hasHelper()) "${state.helperName} is connected" else if (state.active) "Waiting for your helper" else "Show someone exactly where"
-            val seconds = if (startedAt == 0L) 0 else (monotonicMs() - startedAt) / 1000
-            detail.text = if (state.active) "%02d:%02d  /  %d annotations  /  %s".format(seconds / 60, seconds % 60, state.annotationCount,
-                "WebRTC %.0f fps".format(state.captureFps)) else "${state.annotationCount} annotations / ${BuildConfig.VERSION_NAME}"
-            pauseButton.text = if (state.paused) "Resume video" else "Pause video"
-            voiceButton.text = if (state.voiceEnabled) "Voice on" else "Enable voice"
+            val elapsed = if (startedAt == 0L) 0L else (monotonicMs() - startedAt) / 1000
+            statusText.text = when {
+                !state.active -> "Camera"
+                state.paused -> "Camera paused"
+                state.hasHelper() -> state.helperName.ifBlank { "Connected" }
+                else -> "Waiting for helper"
+            }
+            detail.text = if (state.active) String.format(Locale.US, "%02d:%02d  \u00b7  %d marks  \u00b7  %.0f fps", elapsed/60,elapsed%60,state.annotationCount,state.captureFps)
+                else "${state.annotationCount} marks"
+            micButton.text = if (micMuted || !state.voiceEnabled) "Unmute" else "Mute"
+            pauseButton.text = if (state.paused) "Resume" else "Pause"
+            shareButton.text = if (state.active) "Invite" else "New call"
+            startButton.isEnabled = !starting
             if (state.active && !state.authorized(state.token)) endSession()
             if (state.active && state.videoState == "CONNECTED" && !state.hasHelper()) voice.disconnect()
-            handler.postDelayed(this, 500L)
+            handler.postDelayed(this, 750L)
         }
     }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setDecorFitsSystemWindows(false)
-        voice = RtcVoice(this, state)
-        state.hostName = Build.MODEL
-        root = FrameLayout(this).apply { setBackgroundColor(dark) }
-        overlay = ShowMeOverlay(this)
-        renderer = ShowMeRenderer(state, overlay, ::notice, voice)
-        gl = GLSurfaceView(this).apply {
-            setEGLContextClientVersion(2)
-            preserveEGLContextOnPause = true
-            setRenderer(renderer)
-        }
-        root.addView(gl, FrameLayout.LayoutParams(-1, -1))
-        root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
-        buildChrome()
+        voice = RtcVoice(this,state)
+        val api = SessionApi(state,voice)
+        voice.controlHandler = api::handle
+        state.hostName = "ShowMe camera"
+        root = FrameLayout(this).apply { setBackgroundColor(ink) }
+        layout = LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setBackgroundColor(ink) }
+        root.addView(layout,FrameLayout.LayoutParams(-1,-1))
+        buildCallUi()
         buildHome()
         setContentView(root)
-        if (!OpenCVLoader.initLocal()) notice("Computer vision could not initialize on this device.")
-        handler.post(tick)
-    }
-    private fun buildChrome() {
-        val top = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(d(20), d(20), d(20), d(16)); background = rounded(panel, 24) }
-        val heading = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        heading.addView(label("ShowMe", 27f, Color.WHITE, true), LinearLayout.LayoutParams(0, -2, 1f))
-        statusText = label("CAMERA READY", 10f, mint, true).apply { setPadding(d(12), d(9), d(12), d(9)); background = rounded(0xff213b39.toInt(), 20) }
-        heading.addView(statusText)
-        top.addView(heading)
-        presence = label("Show someone exactly where", 14f, Color.WHITE).apply { setPadding(0, d(10), 0, d(4)) }
-        detail = label("Local camera assistance", 10f, muted)
-        top.addView(presence); top.addView(detail)
-        val topParams = FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { setMargins(d(14), d(44), d(14), 0) }
-        root.addView(top, topParams)
-
-        val bottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(d(12), d(12), d(12), d(12)); background = rounded(panel, 24) }
-        val actions = LinearLayout(this)
-        actions.addView(button("Invite", true) { inviteDialog() }, LinearLayout.LayoutParams(0, d(48), 1f))
-        actions.addView(button("Undo") { renderer.action("undo") }, LinearLayout.LayoutParams(0, d(48), 1f).apply { marginStart = d(7) })
-        actions.addView(button("Clear") { AlertDialog.Builder(this).setTitle("Clear annotations?").setMessage("Remove all current drawings from the physical scene.")
-            .setNegativeButton("Cancel", null).setPositiveButton("Clear") { _, _ -> renderer.action("clear") }.show() }, LinearLayout.LayoutParams(0, d(48), 1f).apply { marginStart = d(7) })
-        bottom.addView(actions)
-        val second = LinearLayout(this).apply { setPadding(0, d(8), 0, 0) }
-        pauseButton = button("Pause video") {
-            if (!state.active) { startLocal(false); return@button }
-            state.paused = !state.paused
-            if (state.paused) { state.frames.clear(); state.videoFrames.clear() }
-        }
-        voiceButton = button("Enable voice") { toggleVoice() }
-        second.addView(pauseButton, LinearLayout.LayoutParams(0, d(42), 1f))
-        second.addView(voiceButton, LinearLayout.LayoutParams(0, d(42), 1f))
-        second.addView(button("End") { if (state.active) AlertDialog.Builder(this).setTitle("End this session?").setMessage("The invite link will stop working. Your local annotations remain until cleared.")
-            .setNegativeButton("Keep sharing", null).setPositiveButton("End session") { _, _ -> endSession() }.show() }, LinearLayout.LayoutParams(0, d(42), 0.65f))
-        bottom.addView(second)
-        root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(d(14), 0, d(14), d(28)) })
-        toast = label("", 13f, Color.WHITE).apply { visibility = View.GONE; gravity = Gravity.CENTER; setPadding(d(18), d(12), d(18), d(12)); background = rounded(0xf0203045.toInt(), 16) }
-        root.addView(toast, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(d(24), 0, d(24), d(162)) })
+        // A background verifier must not fan out onto every CPU core used by video.
+        if (OpenCVLoader.initLocal()) Core.setNumThreads(1) else notice("Computer vision could not start on this device.")
         root.setOnApplyWindowInsetsListener { _, insets ->
-            val safe = insets.getInsets(WindowInsets.Type.systemBars())
-            topParams.topMargin = safe.top + d(12); top.layoutParams = topParams
-            (bottom.layoutParams as FrameLayout.LayoutParams).also { it.bottomMargin = safe.bottom + d(12); bottom.layoutParams = it }
+            val safe=insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            layout.setPadding(safe.left,safe.top,safe.right,safe.bottom)
+            home.setPadding(safe.left,safe.top,safe.right,safe.bottom)
             insets
         }
+        root.requestApplyInsets()
+        handler.post(tick)
+        receiveActivation(intent)
+    }
+    private fun buildCallUi() {
+        val header=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL; setPadding(d(18),d(8),d(10),d(8)) }
+        val heading=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
+        statusText=label("Camera",17f,Color.WHITE,true)
+        detail=label("Ready",11f,grey).apply { setPadding(0,d(4),0,0) }
+        heading.addView(statusText);heading.addView(detail)
+        header.addView(heading,LinearLayout.LayoutParams(0,-2,1f))
+        header.addView(button("More") { callMenu() },LinearLayout.LayoutParams(d(64),d(48)))
+        layout.addView(header,LinearLayout.LayoutParams(-1,-2))
+        val cameraArea=FrameLayout(this)
+        val overlay=ShowMeOverlay(this)
+        renderer=ShowMeRenderer(state,overlay,::notice,voice)
+        gl=GLSurfaceView(this).apply { setEGLContextClientVersion(2);preserveEGLContextOnPause=true;setRenderer(renderer) }
+        cameraArea.addView(gl,FrameLayout.LayoutParams(-1,-1))
+        cameraArea.addView(overlay,FrameLayout.LayoutParams(-1,-1))
+        noticeText=label("",13f,Color.WHITE).apply {
+            setPadding(d(14),d(10),d(14),d(10));background=rounded(0xeb252c30.toInt(),6);visibility=View.GONE
+        }
+        cameraArea.addView(noticeText,FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM).apply { setMargins(d(12),0,d(12),d(12)) })
+        layout.addView(cameraArea,LinearLayout.LayoutParams(-1,0,1f))
+        val controls=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(d(12),d(8),d(12),d(10)) }
+        val editing=LinearLayout(this)
+        shareButton=button("Invite",true) { if(state.active)inviteDialog() else startCall(false) }
+        addEqual(editing,shareButton)
+        addEqual(editing,button("Undo") { renderer.action("undo") })
+        addEqual(editing,button("Clear") { AlertDialog.Builder(this).setTitle("Remove all marks?")
+            .setNegativeButton("Cancel",null).setPositiveButton("Remove") { _,_->renderer.action("clear") }.show() })
+        controls.addView(editing)
+        val callControls=LinearLayout(this).apply { setPadding(0,d(6),0,0) }
+        micButton=button("Mute") { toggleMic() }
+        pauseButton=button("Pause") {
+            if(state.active){state.paused=!state.paused;voice.setMuted(micMuted||state.paused)
+                if(state.paused){state.frames.clear();state.videoFrames.clear()}}
+        }
+        addEqual(callControls,micButton);addEqual(callControls,pauseButton)
+        addEqual(callControls,button("End call",false,0xfff3aaa1.toInt()) {
+            if(state.active)AlertDialog.Builder(this).setTitle("End this call?").setMessage("The invitation stops working. Your marks remain in this camera session.")
+                .setNegativeButton("Keep call",null).setPositiveButton("End call") { _,_->endSession() }.show()
+            else home.visibility=View.VISIBLE
+        })
+        controls.addView(callControls);layout.addView(controls,LinearLayout.LayoutParams(-1,-2))
     }
     private fun buildHome() {
-        home = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL
-            setPadding(d(30), d(40), d(30), d(40)); background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(dark, 0xff16372f.toInt(), dark))
-        }
-        home.addView(label("ShowMe", 34f, mint, true))
-        home.addView(label("A little direction.\nRight where it matters.", 35f, Color.WHITE, true).apply { setPadding(0, d(35), 0, d(18)) })
-        home.addView(label("Share your camera. A helper opens a link and pins, draws or points into your world. The guidance stays on the surface as you move.", 16f, muted).apply { setLineSpacing(d(4).toFloat(), 1f) })
-        home.addView(label("01  START A SESSION\n02  SHARE THE LINK\n03  FOLLOW THE GUIDANCE", 11f, mint, true).apply { setPadding(0, d(28), 0, d(25)); setLineSpacing(d(9).toFloat(), 1f) })
-        home.addView(button("Start video call", true) { startLocal(false) }, LinearLayout.LayoutParams(-1, d(56)))
-        home.addView(button("Secure session / voice setup") { secureOptions() }, LinearLayout.LayoutParams(-1, d(48)).apply { topMargin = d(10) })
-        home.addView(label("LIVE VIDEO CALL  /  No account or cloud server\nBoth devices must be on the same Wi-Fi or hotspot. Ordinary HTTP is for trusted local networks; two-way browser voice needs trusted HTTPS.", 11f, muted).apply { setPadding(0, d(20), 0, 0); setLineSpacing(d(3).toFloat(), 1f) })
-        root.addView(home, FrameLayout.LayoutParams(-1, -1))
+        home=ScrollView(this).apply { isFillViewport=true;setBackgroundColor(paper) }
+        val content=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(d(28),d(24),d(28),d(24)) }
+        val top=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL }
+        top.addView(label("ShowMe",25f,ink,true),LinearLayout.LayoutParams(0,-2,1f))
+        top.addView(button("Settings",false,ink) { settingsMenu() })
+        content.addView(top)
+        content.addView(View(this),LinearLayout.LayoutParams(1,0,1f))
+        content.addView(label("Show the problem.\nGet a hand.",34f,ink,true).apply { setPadding(0,d(52),0,d(20)) })
+        content.addView(label("Let someone see through your camera, talk you through it, and mark the exact place to look.",16f,0xff596064.toInt()).apply { setLineSpacing(d(4).toFloat(),1f) })
+        content.addView(label("They open a link. You keep the camera.",13f,0xff596064.toInt()).apply { setPadding(0,d(30),0,d(36)) })
+        startButton=button("Start a call",true) { startCall(false) }
+        content.addView(startButton,LinearLayout.LayoutParams(-1,d(56)))
+        content.addView(label("Your microphone and camera are shared only during a call.",11f,0xff747a7c.toInt()).apply { setPadding(0,d(16),0,d(24));gravity=Gravity.CENTER })
+        content.addView(View(this),LinearLayout.LayoutParams(1,0,1f))
+        content.addView(label("SHOWME  /  ${BuildConfig.VERSION_NAME}",10f,0xff85898a.toInt()))
+        home.addView(content,FrameLayout.LayoutParams(-1,-1));root.addView(home,FrameLayout.LayoutParams(-1,-1))
     }
-    private fun secureOptions() {
-        AlertDialog.Builder(this).setTitle("Local HTTPS and voice").setMessage(
-            "Quick local mode works immediately for video and drawing. Browsers require trusted HTTPS for the helper's microphone.\n\nSecure mode creates a private session certificate. Your browser may show a certificate warning or require explicit trust before allowing voice. For managed testing you can import a trusted PKCS12 certificate. No browser security settings are disabled.")
-            .setPositiveButton("Start local HTTPS") { _, _ -> startLocal(true) }
-            .setNeutralButton("Import .p12") { _, _ -> startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { type = "*/*"; addCategory(Intent.CATEGORY_OPENABLE) }, 73) }
-            .setNegativeButton("Cancel", null).show()
+    private fun addEqual(row:LinearLayout,view:View){row.addView(view,LinearLayout.LayoutParams(0,d(46),1f).apply{setMargins(d(3),0,d(3),0)})}
+    private fun settingsMenu() {
+        val configured=settings.getString("origin","").orEmpty().isNotBlank()
+        AlertDialog.Builder(this).setTitle("ShowMe").setItems(arrayOf(if(configured)"Replace service activation" else "Activate Internet calls","Use local Wi-Fi","About this build")) { _,which->
+            when(which){0->activationDialog();1->startCall(true);2->AlertDialog.Builder(this).setTitle("ShowMe")
+                .setMessage("${BuildConfig.VERSION_NAME}\n\nInternet calls use encrypted WebRTC media, with relay fallback. Surface marks stay in this AR camera session. This build still needs physical-device acceptance testing.")
+                .setPositiveButton("Done",null).show()}
+        }.show()
     }
-    private fun startLocal(secure: Boolean) {
-        if (starting || state.active) { if (state.active) inviteDialog(); return }
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            pendingSecure = secure; requestPermissions(arrayOf(Manifest.permission.CAMERA), 71); return
-        }
+    private fun callMenu() {
+        AlertDialog.Builder(this).setTitle("Call").setItems(arrayOf("Copy invitation","Connection details","Return to start")){_,which->
+            when(which){0->copyInvite();1->AlertDialog.Builder(this).setTitle("Connection details")
+                .setMessage("${if(state.internet)"Internet" else "Local Wi-Fi"}\nWebRTC: ${state.videoState}\nCapture: %.1f fps\n%s".format(Locale.US,state.captureFps,state.telemetry.snapshot().toString(2)))
+                .setPositiveButton("Done",null).show();2->{if(state.active)endSession();home.visibility=View.VISIBLE}}
+        }.show()
+    }
+    private fun startCall(local:Boolean) {
+        if(starting)return
+        if(state.active){inviteDialog();return}
+        if(!local&&settings.getString("origin","").isNullOrBlank()){activationDialog();return}
+        pendingLocal=local
+        val permissions=listOf(Manifest.permission.CAMERA,Manifest.permission.RECORD_AUDIO)
+            .filter { checkSelfPermission(it)!=PackageManager.PERMISSION_GRANTED }
+        if(permissions.isNotEmpty()) {requestPermissions(permissions.toTypedArray(),71);return}
+        continueStart(local)
+    }
+    private fun continueStart(local:Boolean) {
+        if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){notice("Camera permission is needed to share your view.");return}
         resumeAr()
-        if (ar == null || !renderer.resumed) { pendingSecure = secure; notice("Finish AR camera setup, then start the session."); return }
-        val addresses = localAddresses()
-        if (addresses.isEmpty()) {
-            AlertDialog.Builder(this).setTitle("Connect to Wi-Fi or a hotspot").setMessage("ShowMe hosts this session on your phone. Connect both devices to the same Wi-Fi, or enable a phone hotspot and connect the helper to it.")
-                .setPositiveButton("Network settings") { _, _ -> startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)) }.setNegativeButton("Cancel", null).show()
-            return
-        }
-        if (addresses.size == 1) launchServer(addresses.first(), secure)
-        else AlertDialog.Builder(this).setTitle("Choose the local network address").setItems(addresses.toTypedArray()) { _, index -> launchServer(addresses[index], secure) }.show()
+        if(ar==null||!renderer.resumed){pendingLocal=local;notice("Finish camera setup, then tap Start a call.");return}
+        pendingLocal=null
+        state.voiceEnabled=checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED
+        micMuted=!state.voiceEnabled;voice.setMuted(micMuted)
+        starting=true
+        if(local){launchLocal();return}
+        notice("Starting your call...")
+        val connection=RemoteHostConnection(state,voice,{id,name->runOnUiThread { requestApproval(id,name) }},{text->notice(text)})
+        remote=connection
+        connection.start(settings.getString("origin","")!!,settings.getString("key","")!!,"ShowMe camera",onReady={url->
+            runOnUiThread {
+                if(destroyed){connection.stop();return@runOnUiThread}
+                invite=url;starting=false;startedAt=monotonicMs();renderer.action("clear");home.visibility=View.GONE
+                state.paused=!foreground;inviteDialog()
+            }
+        },onFailure={message->runOnUiThread {starting=false;connection.stop(false);remote=null;notice(message)}})
     }
-    private fun launchServer(address: String, secure: Boolean) {
-        starting = true; notice("Preparing your private session...")
+    private fun requestApproval(id:String,name:String) {
+        if(destroyed||!state.active)return
+        if(!foreground){pendingApproval=id to name;return}
+        AlertDialog.Builder(this).setTitle("Let $name join?").setMessage("They will see your camera, hear you when unmuted, and add marks to your view.")
+            .setNegativeButton("Decline") {_,_->remote?.approve(id,false)}.setPositiveButton("Allow") {_,_->remote?.approve(id,true)}
+            .setOnCancelListener {remote?.approve(id,false)}.show()
+    }
+    private fun launchLocal() {
+        val addresses=runCatching {NetworkInterface.getNetworkInterfaces().toList().filter {it.isUp&&!it.isLoopback}
+            .filterNot {it.name.startsWith("rmnet")||it.name.startsWith("tun")||it.name.startsWith("ccmni")}
+            .sortedBy {if(it.name.contains("wlan")||it.name.startsWith("ap"))0 else 1}
+            .flatMap {it.inetAddresses.toList()}.filterIsInstance<Inet4Address>().filter {it.isSiteLocalAddress}
+            .mapNotNull {it.hostAddress}.distinct()}.getOrDefault(emptyList())
+        if(addresses.isEmpty()){starting=false;AlertDialog.Builder(this).setTitle("Connect to Wi-Fi")
+            .setMessage("For local mode, both devices must be on the same Wi-Fi or hotspot.").setPositiveButton("Settings"){_,_->startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))}
+            .setNegativeButton("Cancel",null).show();return}
         io.execute {
             try {
-                val identity = if (secure) importedTls ?: LocalTls.create(address) else null
-                state.begin(); state.secure = secure
-                val local = LocalServer(this, address, 0, state, voice, identity)
-                local.start(5000, true)
-                if (destroyed) { local.stop(); state.end(); return@execute }
-                server = local; tls = identity
-                invite = "${if (secure) "https" else "http"}://$address:${local.listeningPort}/#${state.token}"
-                startedAt = monotonicMs()
-                runOnUiThread { renderer.action("clear"); home.visibility = View.GONE; inviteDialog() }
-            } catch (t: Throwable) {
-                state.end(); notice("Could not start the local session: ${t.message ?: t.javaClass.simpleName}")
-            } finally { starting = false }
+                state.begin();state.secure=false;state.internet=false
+                // Listen on all local interfaces; pick Wi-Fi first for the shared invitation.
+                val local=LocalServer(this,"0.0.0.0",0,state,voice)
+                local.start(5000,true)
+                if(destroyed){local.stop();state.end();return@execute}
+                server=local
+                runOnUiThread {invite="http://${addresses.first()}:${local.listeningPort}/#${state.token}";startedAt=monotonicMs()
+                    home.visibility=View.GONE;renderer.action("clear");state.paused=!foreground;inviteDialog()}
+            }catch(e:Exception){state.end();notice(e.message?:"Could not start local sharing.")}
+            finally{starting=false}
         }
     }
     private fun inviteDialog() {
-        if (invite.isBlank() || !state.active) { startLocal(false); return }
-        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(d(24), d(12), d(24), d(8)) }
-        val qr = MultiFormatWriter().encode(invite, BarcodeFormat.QR_CODE, 480, 480)
-        val bitmap = Bitmap.createBitmap(480, 480, Bitmap.Config.ARGB_8888)
-        val pixels = IntArray(480 * 480) { index -> if (qr[index % 480, index / 480]) dark else Color.WHITE }
-        bitmap.setPixels(pixels, 0, 480, 0, 0, 480, 480)
-        column.addView(ImageView(this).apply { setImageBitmap(bitmap) }, LinearLayout.LayoutParams(d(220), d(220)).apply { gravity = Gravity.CENTER_HORIZONTAL })
-        column.addView(label("The helper only needs a browser.\nUse the same Wi-Fi or hotspot.", 14f, Color.WHITE).apply { gravity = Gravity.CENTER; setPadding(0, d(15), 0, d(12)) })
-        column.addView(label(invite, 11f, muted).apply { setTextIsSelectable(true) })
-        if (state.secure) column.addView(label("Local certificate SHA-256:\n${tls?.fingerprint}\nTrust only the certificate matching this fingerprint. Microphone availability is checked by the browser.", 10f, muted).apply { setPadding(0, d(14), 0, 0); setTextIsSelectable(true) })
-        AlertDialog.Builder(this).setTitle("Invite your helper").setView(column)
-            .setPositiveButton("Share link") { _, _ -> shareInvite() }
-            .setNeutralButton("Copy") { _, _ -> getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("ShowMe invite", invite)); notice("Invite copied") }
-            .setNegativeButton("Done", null).show()
+        if(invite.isBlank()||!state.active)return
+        val column=LinearLayout(this).apply {orientation=LinearLayout.VERTICAL;setPadding(d(22),d(12),d(22),d(8))}
+        val qr=MultiFormatWriter().encode(invite,BarcodeFormat.QR_CODE,360,360)
+        val bitmap=Bitmap.createBitmap(360,360,Bitmap.Config.ARGB_8888)
+        val pixels=IntArray(360*360){i->if(qr[i%360,i/360])Color.BLACK else Color.WHITE}
+        bitmap.setPixels(pixels,0,360,0,0,360,360)
+        column.addView(ImageView(this).apply {setImageBitmap(bitmap)},LinearLayout.LayoutParams(d(190),d(190)).apply {gravity=Gravity.CENTER_HORIZONTAL})
+        column.addView(label(if(state.internet)"Open in any browser. You approve who joins." else "Open on the same Wi-Fi or hotspot. Browser microphone needs Internet mode.",13f,Color.WHITE)
+            .apply {setPadding(0,d(18),0,d(12));gravity=Gravity.CENTER})
+        AlertDialog.Builder(this).setTitle("Invite someone").setView(column).setPositiveButton("Share link"){_,_->shareInvite()}
+            .setNeutralButton("Copy link"){_,_->copyInvite()}.setNegativeButton("Done",null).show()
     }
-    private fun shareInvite() {
-        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "Join me on ShowMe")
-            putExtra(Intent.EXTRA_TEXT, "Help me with ShowMe. Open this link while connected to the same Wi-Fi or hotspot:\n$invite")
-        }, "Invite with"))
+    private fun copyInvite(){if(invite.isBlank())return;getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("ShowMe",invite));notice("Invitation copied")}
+    private fun shareInvite(){if(invite.isBlank())return;startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+        type="text/plain";putExtra(Intent.EXTRA_SUBJECT,"Join my ShowMe call");putExtra(Intent.EXTRA_TEXT,"Join my ShowMe call${if(state.internet)"" else " on the same Wi-Fi"}:\n$invite")
+    },"Share invitation"))}
+    private fun toggleMic(){
+        if(!state.active)return
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO),72);return}
+        micMuted=!micMuted;state.voiceEnabled=true;voice.setMuted(micMuted)
     }
-    private fun toggleVoice() {
-        if (!state.active) { notice("Start a session first"); return }
-        if (state.voiceEnabled) { state.voiceEnabled = false; voice.setMuted(true); return }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 72); return
-        }
-        state.voiceEnabled = true; voice.setMuted(false)
-        notice("Voice enabled. The helper can now connect audio in the browser.")
+    private fun endSession(){
+        remote?.stop();remote=null;state.end();voice.disconnect();state.voiceEnabled=false
+        invite="";startedAt=0L;val old=server;server=null;io.execute{old?.stop()}
+        notice("Call ended. Marks remain until you clear them.")
     }
-    private fun endSession() {
-        state.end(); voice.disconnect(); state.voiceEnabled = false
-        invite = ""; startedAt = 0L
-        val old = server; server = null
-        io.execute { old?.stop() }
-        notice("Sharing ended. Local annotations are still available.")
+    private fun activationDialog(){
+        if(state.active){notice("End your current call before changing its service.");return}
+        val input=EditText(this).apply {hint="Paste your activation link";inputType=InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI;setPadding(d(20),d(12),d(20),d(12))}
+        AlertDialog.Builder(this).setTitle("Activate Internet calls").setMessage("One-time setup for this installation. Paste the activation link printed by your ShowMe deployment, or open that link on this phone. Your helper never needs this step.")
+            .setView(input).setPositiveButton("Continue"){_,_->parseActivation(input.text.toString())}
+            .setNeutralButton("Local Wi-Fi instead"){_,_->startCall(true)}.setNegativeButton("Cancel",null).show()
     }
-    private fun localAddresses(): List<String> = runCatching {
-        NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp && !it.isLoopback }
-            .filterNot { it.name.startsWith("rmnet") || it.name.startsWith("tun") || it.name.startsWith("ccmni") }
-            .sortedBy { if (it.name.contains("wlan") || it.name.startsWith("ap") || it.name.contains("wifi")) 0 else 1 }
-            .flatMap { it.inetAddresses.toList() }.filterIsInstance<Inet4Address>()
-            .filter { it.isSiteLocalAddress && !it.isLoopbackAddress }.mapNotNull { it.hostAddress }.distinct()
-    }.getOrDefault(emptyList())
-    private fun resumeAr() {
-        if (renderer.resumed || checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+    private fun receiveActivation(intent:Intent?){val uri=intent?.data?:return;if(uri.scheme=="showme"&&uri.host=="connect")parseActivation(uri.toString())}
+    private fun parseActivation(value:String){
         try {
-            if (ArCoreApk.getInstance().requestInstall(this, !installRequested) == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
-                installRequested = true; return
+            require(!state.active)
+            val uri=Uri.parse(value.trim())
+            val origin=if(uri.scheme=="showme")uri.getQueryParameter("server") ?: error("Missing service") else "${uri.scheme}://${uri.encodedAuthority}"
+            val endpoint=Uri.parse(origin)
+            require(endpoint.scheme=="https"&&!endpoint.host.isNullOrBlank()&&endpoint.userInfo==null&&endpoint.query==null&&endpoint.fragment==null)
+            require(endpoint.path.isNullOrEmpty()||endpoint.path=="/")
+            val key=Uri.parse("https://activation.invalid/?${uri.encodedFragment ?: ""}").getQueryParameter("key")?:error("Missing activation key")
+            require(key.matches(Regex("[A-Za-z0-9_-]{32,128}")))
+            AlertDialog.Builder(this).setTitle("Use this ShowMe service?").setMessage("${endpoint.host}\n\nUse only a service you trust. It will connect your calls and issue temporary relay credentials.")
+                .setNegativeButton("Cancel",null).setPositiveButton("Activate"){_,_->settings.edit().putString("origin",origin.trimEnd('/')).putString("key",key).apply();notice("Internet calls activated. Tap Start a call.")}.show()
+        }catch(_:Exception){notice("Invalid activation link. Copy the complete link, including the part after #.")}
+    }
+    override fun onNewIntent(intent:Intent){super.onNewIntent(intent);setIntent(intent);receiveActivation(intent)}
+    private fun resumeAr(){
+        if(renderer.resumed||checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED)return
+        try {
+            if(ArCoreApk.getInstance().requestInstall(this,!installRequested)==ArCoreApk.InstallStatus.INSTALL_REQUESTED){installRequested=true;return}
+            val session=ar?:Session(this).also { created->
+                val configs=created.getSupportedCameraConfigs(CameraConfigFilter(created).setTargetFps(java.util.EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30)))
+                val camera=configs.filter{it.imageSize.width<=1280&&it.imageSize.height<=1280}.maxByOrNull{it.imageSize.width*it.imageSize.height}
+                    ?:configs.minByOrNull{it.imageSize.width*it.imageSize.height}
+                if(camera!=null)created.cameraConfig=camera
+                created.configure(Config(created).apply {focusMode=Config.FocusMode.AUTO;depthMode=if(created.isDepthModeSupported(Config.DepthMode.AUTOMATIC))Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED;cloudAnchorMode=Config.CloudAnchorMode.DISABLED})
+                renderer.imageRotation=getSystemService(CameraManager::class.java).getCameraCharacteristics(created.cameraConfig.cameraId).get(CameraCharacteristics.SENSOR_ORIENTATION)?:90
+                ar=created
             }
-            val session = ar ?: Session(this).also { created ->
-                val camera = created.getSupportedCameraConfigs(CameraConfigFilter(created).setTargetFps(java.util.EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30))).filter {
-                    it.imageSize.width <= 1920 && it.imageSize.height <= 1920
-                }.maxByOrNull { it.imageSize.width * it.imageSize.height }
-                if (camera != null) created.cameraConfig = camera
-                val config = Config(created).apply {
-                    focusMode = Config.FocusMode.AUTO
-                    depthMode = if (created.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) Config.DepthMode.AUTOMATIC else Config.DepthMode.DISABLED
-                    cloudAnchorMode = Config.CloudAnchorMode.DISABLED
-                }
-                created.configure(config)
-                if (config.depthMode == Config.DepthMode.DISABLED) notice("Depth is unavailable; only sufficiently mapped surfaces can accept drawings.")
-                val manager = getSystemService(CameraManager::class.java)
-                renderer.imageRotation = manager.getCameraCharacteristics(created.cameraConfig.cameraId).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-                ar = created
-            }
-            session.resume(); renderer.arSession = session; renderer.resumed = true; gl.onResume()
-        } catch (t: Throwable) { notice("AR camera setup: ${t.message ?: t.javaClass.simpleName}") }
+            session.resume();renderer.arSession=session;renderer.resumed=true;gl.onResume()
+        }catch(e:Exception){notice("Camera setup: ${e.message?:e.javaClass.simpleName}")}
     }
-    override fun onResume() {
-        super.onResume(); resumeAr()
-        if (resumeSharing && state.active) { state.paused = false; voice.setMuted(!state.voiceEnabled) }
-        resumeSharing = false
+    override fun onResume(){super.onResume();foreground=true;resumeAr()
+        if(resumeSharing&&state.active){state.paused=false;voice.setMuted(micMuted)};resumeSharing=false
+        pendingApproval?.let{pendingApproval=null;requestApproval(it.first,it.second)}
     }
-    override fun onPause() {
-        resumeSharing = state.active && !state.paused
-        if (state.active) { state.paused = true; state.frames.clear(); state.videoFrames.clear(); voice.setMuted(true); voice.disconnect() }
-        renderer.resumed = false; gl.onPause(); runCatching { ar?.pause() }
-        super.onPause()
+    override fun onPause(){
+        foreground=false;resumeSharing=state.active&&!state.paused
+        if(state.active){state.paused=true;state.frames.clear();state.videoFrames.clear();voice.setMuted(true)}
+        renderer.resumed=false;gl.onPause();runCatching{ar?.pause()};super.onPause()
     }
-    override fun onDestroy() {
-        destroyed = true; handler.removeCallbacksAndMessages(null)
-        state.end(); server?.stop(); voice.close(); gl.queueEvent { renderer.releaseGlResources() }; renderer.close()
-        runCatching { ar?.close() }; io.shutdownNow()
-        super.onDestroy()
+    override fun onDestroy(){destroyed=true;handler.removeCallbacksAndMessages(null);remote?.stop();state.end();server?.stop()
+        gl.queueEvent {renderer.releaseGlResources()};voice.close();renderer.close();runCatching{ar?.close()};io.shutdown();super.onDestroy()}
+    override fun onRequestPermissionsResult(code:Int,permissions:Array<out String>,results:IntArray){
+        super.onRequestPermissionsResult(code,permissions,results)
+        if(code==71){val local=pendingLocal?:false;pendingLocal=null;continueStart(local)}
+        if(code==72&&checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED){micMuted=false;state.voiceEnabled=true;voice.setMuted(false);voice.disconnect();notice("Microphone enabled. Reconnecting audio.")}
     }
-    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, results: IntArray) {
-        super.onRequestPermissionsResult(code, permissions, results)
-        if (results.firstOrNull() != PackageManager.PERMISSION_GRANTED) { notice("Permission was not granted. You can enable it in Android settings."); return }
-        if (code == 71) { resumeAr(); val secure = pendingSecure ?: false; pendingSecure = null; startLocal(secure) }
-        if (code == 72 && state.active) toggleVoice()
+    private fun notice(message:String){if(destroyed)return;runOnUiThread {
+        if(!::noticeText.isInitialized)return@runOnUiThread
+        if(home.visibility==View.VISIBLE)Toast.makeText(this,message,Toast.LENGTH_LONG).show()
+        noticeText.text=message;noticeText.visibility=View.VISIBLE;handler.postDelayed({if(noticeText.text.toString()==message)noticeText.visibility=View.GONE},4500)
+    }}
+    private fun label(value:String,size:Float,color:Int,bold:Boolean=false)=TextView(this).apply {text=value;textSize=size;setTextColor(color);typeface=Typeface.create(if(bold)"sans-serif-medium" else "sans-serif",Typeface.NORMAL)}
+    private fun button(value:String,primary:Boolean=false,color:Int=Color.WHITE,action:()->Unit)=label(value,13f,if(primary)ink else color,true).apply {
+        gravity=Gravity.CENTER;setPadding(d(10),d(10),d(10),d(10));minHeight=d(44);background=rounded(if(primary)accent else Color.TRANSPARENT,6)
+        isClickable=true;isFocusable=true;contentDescription=value;setOnClickListener {performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);action()}
     }
-    @Deprecated("Android legacy activity result bridge")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != 73 || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-        val password = EditText(this).apply { hint = "Certificate password"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
-        AlertDialog.Builder(this).setTitle("Import trusted PKCS12").setView(password)
-            .setNegativeButton("Cancel", null).setPositiveButton("Import") { _, _ ->
-                io.execute {
-                    try {
-                        val bytes = contentResolver.openInputStream(uri)!!.use { input ->
-                            val out = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
-                            while (true) { val n = input.read(buffer); if (n < 0) break; require(out.size() + n <= 1_048_576); out.write(buffer, 0, n) }; out.toByteArray()
-                        }
-                        val pass = password.text.toString().toCharArray()
-                        val store = KeyStore.getInstance("PKCS12"); store.load(bytes.inputStream(), pass)
-                        importedTls = LocalTls.fromStore(store, pass); pass.fill('\u0000')
-                        notice("Certificate loaded for this app session. Start a secure session next.")
-                    } catch (_: Exception) { notice("Certificate import failed. Check the file and password.") }
-                }
-            }.show()
-    }
-    private fun notice(message: String) {
-        if (destroyed) return
-        runOnUiThread {
-            if (home.visibility == View.VISIBLE) Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-            toast.text = message; toast.visibility = View.VISIBLE
-            handler.postDelayed({ if (toast.text.toString() == message) toast.visibility = View.GONE }, 5000L)
-        }
-    }
-    private fun label(text: String, size: Float, color: Int, bold: Boolean = false): TextView = TextView(this).apply {
-        this.text = text; textSize = size; setTextColor(color)
-        typeface = Typeface.create(if (bold) "sans-serif-medium" else "sans-serif", Typeface.NORMAL)
-    }
-    private fun button(text: String, primary: Boolean = false, action: () -> Unit): TextView = label(text, 13f, if (primary) dark else Color.WHITE, true).apply {
-        gravity = Gravity.CENTER; setPadding(d(10), d(10), d(10), d(10)); minHeight = d(44)
-        background = rounded(if (primary) mint else 0xff223046.toInt(), 14)
-        isClickable = true; isFocusable = true; contentDescription = text
-        setOnClickListener { performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK); action() }
-    }
-    private fun rounded(color: Int, radius: Int) = GradientDrawable().apply { setColor(color); cornerRadius = d(radius).toFloat() }
-    private fun d(value: Int) = (value * resources.displayMetrics.density).toInt()
+    private fun rounded(color:Int,radius:Int)=GradientDrawable().apply{setColor(color);cornerRadius=d(radius).toFloat()}
+    private fun d(value:Int)=(value*resources.displayMetrics.density).toInt()
 }

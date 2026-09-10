@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class LocalServer(context: Context, address: String, port: Int, private val state: ShowMeSession,
     private val voice: RtcVoice, private val tls: LocalTls? = null) : NanoHTTPD(address, port) {
     private val assets = context.applicationContext.assets
+    private val api=SessionApi(state,voice)
     private val inFlight = AtomicInteger()
     private var mutationWindow = 0L
     private var mutationCount = 0
@@ -34,6 +35,8 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
                     "/geometry.mjs" -> "geometry.mjs"
                     "/live-video.mjs" -> "live-video.mjs"
                     "/style.css" -> "style.css"
+                    "/remote-session.mjs" -> "remote-session.mjs"
+                    "/control-rpc.mjs" -> "control-rpc.mjs"
                     else -> return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
                 }
                 val mime = when {
@@ -59,6 +62,7 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
             if (!state.heartbeat(viewer)) return json(ShowMeSession.failure("REJOIN", "Reconnect to the session."), Response.Status.CONFLICT)
             if (request.method == Method.GET) return when (path) {
                 "/api/state" -> json(state.info())
+                "/api/ice" -> json(JSONObject().put("ok",true).put("iceServers",org.json.JSONArray()))
                 "/api/frame" -> json(ShowMeSession.failure("VIDEO_REQUIRED", "Use the WebRTC video connection."), Response.Status.GONE)
                 "/api/certificate" -> {
                     val cert = tls?.certificate ?: return json(ShowMeSession.failure("NO_TLS", "This session uses local HTTP."))
@@ -71,36 +75,7 @@ class LocalServer(context: Context, address: String, port: Int, private val stat
             if (request.method != Method.POST) return json(ShowMeSession.failure("METHOD", "POST required"), Response.Status.METHOD_NOT_ALLOWED)
             val body = body(request)
             return when (path) {
-                "/api/freeze" -> {
-                    val id = body.optLong("frameId", -1L)
-                    val epoch = body.optInt("epoch", -1)
-                    val observed = state.videoFrames.get(id)
-                    if (observed == null || epoch != state.epoch || observed.epoch != epoch || state.paused || !state.tracking)
-                        return json(ShowMeSession.failure("STALE_FRAME", "The video frame is no longer placeable. Resume live view and try again."))
-                    val jpeg = java.util.Base64.getDecoder().decode(body.optString("jpeg"))
-                    val packet = observed.materialize(jpeg)
-                    if (!state.active || state.paused || state.epoch != epoch)
-                        return json(ShowMeSession.failure("WORLD_CHANGED", "The camera session changed. Please resume live video."))
-                    state.frames.add(packet)
-                    val ok = state.frames.pin(packet.id)
-                    json(if (ok) packet.metadata().put("ok", true) else ShowMeSession.failure("STALE_FRAME", "Resume live view and retry."))
-                }
-                "/api/resume" -> { state.frames.unpin(); json(JSONObject().put("ok", true)) }
-                "/api/draw" -> {
-                    if (!allowMutation()) return json(ShowMeSession.failure("RATE_LIMIT", "Please wait a moment before drawing again."))
-                    val action = body.optString("action", "draw")
-                    if (action !in setOf("draw", "undo", "clear", "remove")) return json(ShowMeSession.failure("INVALID_ACTION", "Unknown action"))
-                    if (!body.optString("requestId").matches(Regex("[A-Za-z0-9-]{8,80}"))) return json(ShowMeSession.failure("INVALID_ID", "Invalid request id"))
-                    if (action == "draw") ShowMeSession.validateDraw(body)?.let {
-                        return json(ShowMeSession.failure("INVALID_DRAWING", it))
-                    }
-                    val answer = state.submit(body)
-                    try { json(answer.get(4, TimeUnit.SECONDS)) } catch (_: java.util.concurrent.TimeoutException) {
-                        val error = ShowMeSession.failure("CAMERA_PAUSED", "The camera owner must keep ShowMe open. Please retry.")
-                        // Cancel timed-out work so it cannot create a ghost drawing after resuming.
-                        answer.complete(error); json(error)
-                    }
-                }
+                "/api/freeze", "/api/resume", "/api/draw" -> json(api.handle(path,body))
                 "/api/call", "/api/voice" -> {
                     val sdp = body.optString("sdp")
                     if (sdp.length !in 20..60_000 || !sdp.startsWith("v=0")) return json(ShowMeSession.failure("INVALID_SDP", "Invalid audio offer"))

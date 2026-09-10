@@ -1,5 +1,6 @@
 import {fitRect, pointInRect, shapePoints, decodeEnvelope} from './geometry.mjs';
 import {LiveVideoCall} from './live-video.mjs';
+import {RemoteSession} from './remote-session.mjs';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries(['joinDialog','join','joinError','name','connection','statusDot','hostTitle','modeBadge',
@@ -11,6 +12,9 @@ function uuid() {
   return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
 }
 const viewerId=uuid();
+const roomMatch=location.pathname.match(/^\/r\/([A-Za-z0-9_-]{24})$/);
+const remote=roomMatch?new RemoteSession({roomId:roomMatch[1],token,viewerId,getControl:()=>live.control,
+  onStatus:text=>{connection(text);if(joining)ui.joinError.textContent=text;},onEnded:message=>endLocal(message)}):null;
 let joined=false, stopped=false, joining=false, serverState={}, frame=null, currentBitmap=null;
 let tool='pin', color='#8ff1c6', annotations=[], drawing=null, submitting=false;
 let frozen=false, manualFreeze=false, freezeAt=0, freezePromise=null;
@@ -27,6 +31,7 @@ function connection(text,live=false) {
   ui.connection.textContent=text; ui.statusDot.classList.toggle('live',live);
 }
 async function api(path,body,options={}) {
+  if(remote)return remote.request(path,body,options);
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),options.timeout??7000);
   try {
@@ -74,7 +79,7 @@ const live=new LiveVideoCall({
     renderInk();
     if(performance.now()-lastListAt>500){updateList();lastListAt=performance.now();}
     lastFrameAt=performance.now();frameErrorCount=0;
-    ui.gestureHint.textContent=frame?'Point or draw. Video freezes only while placing guidance.':'Live video / waiting for frame identity';
+    ui.gestureHint.textContent=frame?'Point or draw on their view.':'Live video / matching surface data';
   },
   onMetadata(m) {
     if(!frozen&&!drawing&&!submitting&&frame?.id===m.id&&frame.epoch===m.epoch){annotations=m.annotations??[];renderInk();}
@@ -94,7 +99,8 @@ const live=new LiveVideoCall({
   onStats(stats) {
     if(!joined||frozen)return;
     const fps=stats.receivedFps??stats.displayFps;
-    ui.frameInfo.textContent=`WebRTC / ${Math.round(fps)} fps / ${ui.scene.width} x ${ui.scene.height} / ${(stats.codec??'video').replace('video/','')}`;
+    ui.frameInfo.textContent=`${Math.round(fps)} fps \u00b7 ${stats.relay?'Relay':'Direct'}${Number.isFinite(stats.rttMs)?` \u00b7 ${Math.round(stats.rttMs)} ms`:''}`;
+    ui.frameInfo.title=`${ui.scene.width} x ${ui.scene.height} / ${stats.codec??'WebRTC'} / receive jitter ${Math.round(stats.jitterMs??0)} ms`;
   },
   onAudio(stream) {
     ui.remoteAudio.srcObject=stream;
@@ -104,7 +110,7 @@ const live=new LiveVideoCall({
 async function startVideo(useMicrophone=false){
   if(!joined||stopped||live.connecting||serverState.paused)return;
   retryCount++;
-  try{await live.connect({microphone:useMicrophone});}
+  try{await live.connect({microphone:useMicrophone});if(live.microphone){audioMuted=false;ui.voice.textContent='Mute';ui.voiceState.textContent='On';}}
   catch(error){if(retryCount>=3||useMicrophone)reportError(error);}
 }
 function strokePath(ctx,points,w,h) {
@@ -172,21 +178,20 @@ async function pollState(generation){
     serverState=await api('/api/state');
     if(serverState.active===false){endLocal('The owner ended this session.');return;}
     ui.hostTitle.textContent=`${serverState.hostName||'Your helper'}’s view`;
-    ui.modeBadge.textContent=serverState.secure?'LOCAL HTTPS':'LOCAL WI-FI';
+    ui.modeBadge.textContent=remote?'PRIVATE CALL':'LOCAL WI-FI';
     if(live.connected)connection(serverState.paused?'Camera paused':serverState.tracking?'Connected / live':'Live / scanning surface',!serverState.paused);
     ui.cameraPaused.hidden=!serverState.paused;
     if(!serverState.paused&&serverState.videoState==='READY'&&!live.connecting)startVideo(false);
     ui.count.textContent=String(serverState.annotations??0);
-    if(frame&&serverState.epoch!==frame.epoch){
+    if(frame&&Number.isInteger(serverState.epoch)&&serverState.epoch!==frame.epoch){
       drawing=null;annotations=[];frame=null;frozen=false;live.frozen=false;manualFreeze=false;freezePromise=null;
       renderInk();updateFreezeUi();ui.imageWrap.hidden=true;ui.empty.hidden=false;
       toast('The camera session changed. Waiting for a fresh view.');
     }
     if(frozen&&performance.now()-freezeAt>55000&&!submitting){await resumeLive();toast('Frozen frame expired. Live view resumed to keep placement reliable.');}
     if(!live.microphone&&!audioConnecting){
-      ui.voiceHint.textContent=!isSecureContext?'This local HTTP link supports video and drawing. Browser microphone access needs trusted HTTPS. You can try listen-only audio, or use a separate call.':
-        !serverState.voiceEnabled?'Ask the camera owner to tap Enable voice.':'Connect your microphone for a direct, two-way conversation.';
-      ui.voice.textContent=!isSecureContext?'Listen to owner':'Connect voice';
+      ui.voiceHint.textContent=!isSecureContext?'Microphone needs Internet mode. You can still listen here.':'Enable your microphone to talk. Video works without microphone access.';
+      ui.voice.textContent=!isSecureContext?'Play audio':'Enable microphone';
     }
   }catch(error){if(error.code==='SESSION_ENDED'){reportError(error);return;}connection('Connection interrupted');}
   finally{if(joined&&generation===loopGeneration)stateTimer=setTimeout(()=>pollState(generation),1000);}
@@ -198,8 +203,8 @@ async function join(){
   try{
     serverState=await api('/api/join',{viewerId,name:ui.name.value.trim()||'Helper'});
     joined=true;stopped=false;loopGeneration++;
-    ui.joinDialog.close();connection('Connected',true);
-    const generation=loopGeneration;startVideo(false);pollState(generation);
+    ui.joinError.textContent='';ui.joinDialog.close();connection('Connected',true);
+    const generation=loopGeneration;startVideo(!!remote&&isSecureContext);pollState(generation);
   }catch(error){ui.joinError.textContent=error.name==='AbortError'?'Cannot reach the phone. Check that both devices are on the same Wi-Fi or hotspot.':error.message;}
   finally{joining=false;ui.join.disabled=false;}
 }
@@ -269,7 +274,7 @@ ui.ink.addEventListener('pointerup',async event=>{
       tool:active.tool,color:active.color,label:ui.label.value.trim(),points:shapePoints(active.tool,active.start,active.end,active.samples)});
     if(Array.isArray(result.annotations))annotations=result.annotations;
     serverState.annotations=Math.max(serverState.annotations??0,annotations.length);
-    toast('Attached to their world. The drawing stays on the surface.');
+    toast('Mark attached.');
     updateList();
   }catch(error){reportError(error);}
   finally{
@@ -308,26 +313,15 @@ async function stopVoice(notify=true){
 }
 async function connectVoice(){
   if(!joined||audioConnecting)return;
-  if(live.microphone){
-    audioMuted=!audioMuted;live.setMuted(audioMuted);
-    ui.voice.textContent=audioMuted?'Unmute microphone':'Mute microphone';
-    ui.voiceState.textContent=audioMuted?'Muted':'Connected';
-    if(ui.remoteAudio.srcObject)ui.remoteAudio.play().catch(()=>{});
-    return;
-  }
   audioConnecting=true;ui.voice.disabled=true;
   try{
-    if(!isSecureContext||!navigator.mediaDevices?.getUserMedia){
-      if(!serverState.voiceEnabled){toast('Ask the camera owner to enable Voice. Your browser microphone needs trusted HTTPS.');return;}
-      await startVideo(false);
-      ui.voiceState.textContent='Listen-only';ui.voice.textContent='Play call audio';
-    }else{
-      await startVideo(true);
-      ui.voiceState.textContent=live.microphone?'Connected':'Off';
-      ui.voice.textContent=live.microphone?'Mute microphone':'Connect voice';
-    }
-    if(ui.remoteAudio.srcObject)await ui.remoteAudio.play();
-  }catch(error){reportError(error);}
+    await ui.remoteAudio.play().catch(()=>{});
+    if(!isSecureContext){toast('Listen-only on local Wi-Fi. Use an Internet invitation for two-way voice.');return;}
+    if(!live.microphone){await live.enableMicrophone();audioMuted=false;}
+    else{audioMuted=!audioMuted;live.microphone.getAudioTracks().forEach(t=>t.enabled=!audioMuted);}
+    ui.voice.textContent=audioMuted?'Unmute':'Mute';ui.voiceState.textContent=audioMuted?'Muted':'On';
+    ui.voiceHint.textContent='Your camera is not shared.';
+  }catch(error){toast(error.message||'Could not enable microphone.');}
   finally{audioConnecting=false;ui.voice.disabled=false;}
 }
 ui.voice.addEventListener('click',connectVoice);
@@ -355,6 +349,7 @@ ui.leave.addEventListener('click',async()=>{
 ui.join.addEventListener('click',join);
 ui.name.addEventListener('keydown',event=>{if(event.key==='Enter')join();});
 ui.joinDialog.addEventListener('cancel',event=>event.preventDefault());
-window.addEventListener('pagehide',()=>{live.disconnect();});
+window.addEventListener('pagehide',()=>{live.disconnect();remote?.close();});
+if(remote)$('joinNote').textContent='The camera owner will approve your request. Your camera stays off.';
 ui.joinDialog.showModal();
 if(!token)ui.joinError.textContent='Open the invitation link shared by the camera owner. This page alone cannot join a session.';

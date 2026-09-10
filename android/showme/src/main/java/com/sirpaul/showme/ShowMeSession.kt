@@ -69,8 +69,9 @@ class FrameHistory(private val clock: () -> Long = ::monotonicMs) {
 
 class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     val frames = FrameHistory(clock)
+    val telemetry = FrameTelemetry()
     val videoFrames = VideoDepthHistory(clock)
-    data class Command(val body: JSONObject, val answer: CompletableFuture<JSONObject>)
+    data class Command(val body: JSONObject, val answer: CompletableFuture<JSONObject>, val prepared: PreparedStroke? = null)
     private val commands = ArrayDeque<Command>()
     private val random = SecureRandom()
     @Volatile var active = false
@@ -90,6 +91,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     @Volatile var videoState = "STARTING"
     @Volatile var captureFps = 0f
     @Volatile var secure = false
+    @Volatile var internet = false
     @Volatile var hostName = "Camera owner"
     private var helperId = ""
     private var helperSeenMs = 0L
@@ -131,6 +133,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         if (!active || clock() >= expiresMs || id != helperId || id.isBlank()) return false
         helperSeenMs = clock(); return true
     }
+    @Synchronized fun touchHelper() { if(helperId.isNotBlank()&&active)helperSeenMs=clock() }
     @Synchronized fun leave(id: String) {
         if (id == helperId) { helperId = ""; helperName = ""; helperSeenMs = 0L; frames.unpin() }
     }
@@ -139,7 +142,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         .put("tracking", tracking).put("trackingMessage", trackingMessage).put("epoch", epoch)
         .put("hostName", hostName).put("helper", if (hasHelper()) helperName else "")
         .put("annotations", annotationCount).put("voiceEnabled", voiceEnabled).put("voiceState", voiceState)
-        .put("secure", secure).put("version", BuildConfig.VERSION_NAME)
+        .put("secure", secure).put("internet",internet).put("version", BuildConfig.VERSION_NAME).put("timing",telemetry.snapshot())
         .put("videoTransport", "WEBRTC").put("videoState", videoState).put("captureFps", captureFps.toDouble()).put("targetFps", 30)
     @Synchronized fun previous(id: String): JSONObject? = applied[id]
     @Synchronized fun remember(id: String, result: JSONObject) {
@@ -147,12 +150,12 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         while (applied.size > 256) applied.remove(applied.keys.first())
     }
     /** Admission and draining share the same lock; session end cannot race a queue counter. */
-    @Synchronized fun submit(body: JSONObject): CompletableFuture<JSONObject> {
+    @Synchronized fun submit(body: JSONObject, prepared: PreparedStroke? = null): CompletableFuture<JSONObject> {
         val result = CompletableFuture<JSONObject>()
         if (!active || clock() >= expiresMs || commands.size >= 32) {
             result.complete(failure("BUSY", "Session is unavailable. Please retry.")); return result
         }
-        commands.addLast(Command(body, result)); return result
+        commands.addLast(Command(body, result, prepared)); return result
     }
     @Synchronized fun poll(): Command? = commands.pollFirst()
 

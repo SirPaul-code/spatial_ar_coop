@@ -25,26 +25,26 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
     private val background = CameraBackgroundRenderer()
     private var boundSession: Session? = null
     private var width = 1; private var height = 1
-    private val encoding = Executors.newSingleThreadExecutor()
-    private val encoderBusy = AtomicBoolean()
-    private val verifying = Executors.newSingleThreadExecutor()
+    private val verifying = Executors.newSingleThreadExecutor { task ->
+        Thread({ android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); task.run() }, "ShowMe-surface-verifier")
+    }
+    private val surfaceVerifier = StrokeSurfaceVerifier()
     private val verifierBusy = AtomicBoolean()
     private val actions = ConcurrentLinkedQueue<String>()
     private val repairs = ConcurrentLinkedQueue<Repair>()
     private var lastCapture = 0L; private var nextFrameId = 0L; private var lastVerify = 0L; private var verifyIndex = 0
     private var lastError = ""
     private var videoPipe: RtcVideoPipe? = null
-    private val verificationFrame = java.util.concurrent.atomic.AtomicReference<FramePacket?>(null)
     private data class Drawing(val id: String, val tool: String, val color: String, val label: String,
-        var anchor: Anchor, val offsets: List<FloatArray>, val reference: SurfaceTargetReference,
-        var verified: Boolean = false, var pending: FloatArray? = null, var votes: Int = 0,
+        var anchor: Anchor, var offsets: List<FloatArray>, val reference: StrokeSurfaceVerifier.Reference,
+        var verified: Boolean = false, var pending: List<FloatArray>? = null, var votes: Int = 0,
         var lastVoteFrame: Long = -1L, var repairBudgetM: Float = 0f)
-    private data class Repair(val id: String, val epoch: Int, val frameId: Long, val result: SurfaceTargetResolver.Result)
+    private data class Repair(val id: String, val epoch: Int, val frameId: Long, val result: StrokeSurfaceVerifier.Result)
     private val drawings = LinkedHashMap<String, Drawing>()
 
     fun action(action: String) { actions.add(action) }
     fun close() {
-        encoding.shutdownNow(); verifying.shutdownNow()
+        verifying.execute { surfaceVerifier.clear() }; verifying.shutdown()
     }
     fun releaseGlResources() {
         runCatching { videoPipe?.close() }; videoPipe = null
@@ -63,6 +63,8 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         if (!resumed) return
         val session = arSession ?: return
+        val workStart = System.nanoTime()
+        lastDepthMs = 0f
         try {
             if (boundSession !== session) {
                 detachAll(); state.resetWorld()
@@ -83,7 +85,7 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             repeat(3) {
                 val command = state.poll() ?: return@repeat
                 if (command.answer.isDone) return@repeat
-                val result = runCatching { applyCommand(session, command.body) }.getOrElse {
+                val result = runCatching { applyCommand(session, command.body, command.prepared) }.getOrElse {
                     ShowMeSession.failure("PLACEMENT_FAILED", "Could not attach this drawing. Scan the surface and retry.")
                 }
                 command.answer.complete(result)
@@ -96,18 +98,18 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
             applyRepairs(session)
             val snapshot = snapshot()
             showNativeOverlay(frame, camera, snapshot)
-            publishVideo(frame, camera, snapshot)
-            captureIfDue(frame, camera, snapshot)
+            val depthFrame = publishVideo(frame, camera, snapshot)
+            if (depthFrame != null) captureIfDue(frame, camera, depthFrame)
             state.annotationCount = drawings.size
         } catch (t: Throwable) {
             if (t is com.google.ar.core.exceptions.SessionPausedException) return
             state.tracking = false
             val message = t.javaClass.simpleName + ": " + (t.message ?: "AR camera unavailable")
             if (message != lastError) { lastError = message; notice(message) }
-        }
+        } finally { state.telemetry.frame((System.nanoTime()-workStart)/1_000_000f,lastDepthMs) }
     }
 
-    private fun applyCommand(session: Session, body: JSONObject): JSONObject {
+    private fun applyCommand(session: Session, body: JSONObject, prepared: PreparedStroke?): JSONObject {
         if (!state.active) return ShowMeSession.failure("SESSION_ENDED", "The session has ended.")
         val requestId = body.optString("requestId")
         state.previous(requestId)?.let { return it }
@@ -126,28 +128,18 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         if (body.optInt("epoch", -1) != state.epoch || packet.epoch != state.epoch)
             return ShowMeSession.failure("WORLD_CHANGED", "The camera session changed. Resume live view and try again.")
         if (drawings.size >= 48) return ShowMeSession.failure("LIMIT", "Remove a drawing before adding another (48 per session).")
-        val pixels = body.getJSONArray("points")
-        val world = ArrayList<FloatArray>()
-        var firstPixel: FloatArray? = null
-        for (i in 0 until pixels.length()) {
-            val xy = pixels.getJSONArray(i)
-            val raw = ShowMeGeometry.uprightToRaw(xy.getDouble(0).toFloat(), xy.getDouble(1).toFloat(), packet.rotation)
-            val u = (raw[0] * packet.capture.intrinsics.width).coerceIn(0f, packet.capture.intrinsics.width - 1f)
-            val v = (raw[1] * packet.capture.intrinsics.height).coerceIn(0f, packet.capture.intrinsics.height - 1f)
-            val point = ShowMeGeometry.pointAt(packet.capture, u, v)
-                ?: return ShowMeSession.failure("NO_SURFACE", "No reliable depth under this drawing. Ask the camera owner to move slightly around the surface, then retry.")
-            if (firstPixel == null) firstPixel = floatArrayOf(u, v)
-            if (world.isNotEmpty() && ShowMeGeometry.distance(world.first(), point) > 2.5f)
-                return ShowMeSession.failure("SURFACE_GAP", "This drawing crosses unrelated surfaces. Draw a smaller shape on one surface.")
-            world.add(point)
-        }
-        val base = world.first()
+        val ready = prepared ?: return ShowMeSession.failure("NO_SURFACE", "This drawing has no verified historical surface.")
+        if (ready.frame.id != packet.id || ready.frame.epoch != state.epoch)
+            return ShowMeSession.failure("WORLD_CHANGED", "The camera session changed. Try again.")
+        val world = ready.world
+        // Use the stroke centroid, not the rightmost vertex of a circle, as its local origin.
+        val base = StrokeGeometry.center(world)
         val anchor = session.createAnchor(Pose.makeTranslation(base))
         val id = java.util.UUID.randomUUID().toString()
         val drawing = Drawing(id, body.getString("tool"), body.getString("color"),
             body.optString("label").filter { !it.isISOControl() }.take(64), anchor,
-            world.map { p -> FloatArray(3) { p[it] - base[it] } },
-            SurfaceTargetReference(packet.capture, firstPixel!!))
+            world.map { p -> anchor.pose.inverse().transformPoint(p) },
+            StrokeSurfaceVerifier.Reference(id,packet.capture,ready.pixels))
         drawings[id] = drawing
         state.annotationCount = drawings.size
         notice(if (drawing.label.isBlank()) "New ${drawing.tool} anchored to the surface" else "Pinned: ${drawing.label}")
@@ -162,8 +154,8 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
     }
     private fun detachAll() {
         drawings.values.forEach { runCatching { it.anchor.detach() } }
-        drawings.clear(); repairs.clear(); verificationFrame.set(null); state.annotationCount = 0
-        SurfaceTargetResolver.clearLearnedReferences()
+        drawings.clear(); repairs.clear(); state.annotationCount = 0
+        if (!verifying.isShutdown) verifying.execute { surfaceVerifier.clear() }
         overlay.show(emptyList())
     }
     private fun snapshot(): List<StrokeSnapshot> = drawings.values.mapNotNull { d ->
@@ -190,129 +182,110 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
         overlay.show(screen)
     }
 
-    private fun publishVideo(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>) {
-        if (!state.active || state.paused) return
+    private var lastDepthMs = 0f
+    private fun publishVideo(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>): VideoDepthFrame? {
+        if (!state.active || state.paused) return null
         try {
             val dims = camera.imageIntrinsics.imageDimensions
             val pipe = videoPipe ?: RtcVideoPipe(call, dims[0], dims[1], imageRotation).also { videoPipe = it }
-            if (!state.hasHelper() || !pipe.isDue(frame.timestamp, System.nanoTime())) return
+            if (!state.hasHelper() || !pipe.isDue(frame.timestamp, System.nanoTime())) return null
             val id = ++nextFrameId
             val epoch = state.epoch
+            val start = System.nanoTime()
             val captured = VideoDepthFrame.capture(frame, camera, id, epoch, imageRotation, strokes,
                 pipe.videoWidth, pipe.videoHeight, pipe.contentHeight)
+            lastDepthMs = (System.nanoTime()-start)/1_000_000f
             if (state.active && !state.paused && state.epoch == epoch) {
                 state.videoFrames.add(captured)
-                call.publishMetadata(captured.metadata())
+                // JSON projection/serialization and SCTP sends do not run on the AR thread.
+                call.publishFrame(captured)
                 pipe.draw(frame, camera, background.textureId, id, epoch)
+                return captured
             }
         } catch (t: Throwable) {
             state.videoState = "CAPTURE_ERROR"
             val error = "Video capture: ${t.javaClass.simpleName}: ${t.message.orEmpty()}"
             if (error != lastError) { lastError = error; notice(error) }
         }
+        return null
     }
 
-    private fun captureIfDue(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>) {
+    /** One bulk luma copy; no chroma loops or 8,000-point reconstruction on the GL thread. */
+    private fun captureIfDue(frame: Frame, camera: Camera, depthFrame: VideoDepthFrame) {
         val now = monotonicMs()
-        if (!state.active || state.paused || drawings.isEmpty() || now - lastCapture < 1_000L || !encoderBusy.compareAndSet(false, true)) return
-        val image = runCatching { frame.acquireCameraImage() }.getOrNull()
-        if (image == null) { encoderBusy.set(false); return }
+        if (!state.active || state.paused || drawings.isEmpty() || now-lastCapture < 1_200L ||
+            !verifierBusy.compareAndSet(false,true)) return
+        val candidates=drawings.values.filter { it.anchor.trackingState==TrackingState.TRACKING && it.repairBudgetM<.15f }
+        if(candidates.isEmpty()){verifierBusy.set(false);return}
+        val target=candidates[verifyIndex++%candidates.size]
+        val reference=target.reference
+        val expected=target.offsets.map { target.anchor.pose.transformPoint(it) }
+        val image=runCatching { frame.acquireCameraImage() }.getOrNull()
+        if(image==null){verifierBusy.set(false);return}
         try {
-            val w = image.width; val h = image.height
-            val nv21 = ByteArray(w * h * 3 / 2)
-            val y = image.planes[0]; val u = image.planes[1]; val v = image.planes[2]
-            val yb = y.buffer.duplicate(); val ub = u.buffer.duplicate(); val vb = v.buffer.duplicate()
-            val y0 = yb.position(); val u0 = ub.position(); val v0 = vb.position()
-            var at = 0
-            for (row in 0 until h) for (col in 0 until w) nv21[at++] = yb.get(y0 + row * y.rowStride + col * y.pixelStride)
-            for (row in 0 until h / 2) for (col in 0 until w / 2) {
-                nv21[at++] = vb.get(v0 + row * v.rowStride + col * v.pixelStride)
-                nv21[at++] = ub.get(u0 + row * u.rowStride + col * u.pixelStride)
+            val w=image.width;val h=image.height
+            // A verifier image and its depth/pose must refer to the same exposure.
+            if (image.timestamp != frame.timestamp || w != depthFrame.intrinsics.width || h != depthFrame.intrinsics.height) {
+                image.close();verifierBusy.set(false);return
+            }
+            val start=System.nanoTime()
+            val plane=image.planes[0];val buffer=plane.buffer.duplicate();val base=buffer.position()
+            val luma=ByteArray(w*h)
+            for(y in 0 until h) {
+                if(plane.pixelStride==1){buffer.position(base+y*plane.rowStride);buffer.get(luma,y*w,w)}
+                else for(x in 0 until w)luma[y*w+x]=buffer.get(base+y*plane.rowStride+x*plane.pixelStride)
             }
             image.close()
-            val scale = min(1f, 960f / max(w, h))
-            val outW = max(2, (w * scale).toInt()); val outH = max(2, (h * scale).toInt())
-            val sx = outW.toFloat() / w; val sy = outH.toFloat() / h
-            val intr = camera.imageIntrinsics
-            val intrinsics = IntrinsicsPacket(intr.focalLength[0] * sx, intr.focalLength[1] * sy,
-                intr.principalPoint[0] * sx, intr.principalPoint[1] * sy, outW, outH)
-            val pose = PosePacket(camera.pose.translation.copyOf(), camera.pose.rotationQuaternion.copyOf())
-            val supports = MetricSupportSampler.sample(frame, camera, 8000).map {
-                floatArrayOf(it[0] * sx, it[1] * sy, it[2], it[3], it[4])
-            }
-            val stamp = frame.timestamp; val epoch = state.epoch; val rotation = imageRotation
-            val id = ++nextFrameId
-            lastCapture = now
-            encoding.execute {
-                val src = Mat(h + h / 2, w, CvType.CV_8UC1)
-                val bgr = Mat(); val resized = Mat(); val jpeg = MatOfByte()
-                val parameters = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, 88)
+            state.telemetry.copy((System.nanoTime()-start)/1_000_000f)
+            lastCapture=now
+            verifying.execute {
+                val source=Mat(h,w,CvType.CV_8UC1);val gray=Mat()
                 try {
-                    src.put(0, 0, nv21)
-                    Imgproc.cvtColor(src, bgr, Imgproc.COLOR_YUV2BGR_NV21)
-                    Imgproc.resize(bgr, resized, Size(outW.toDouble(), outH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-                    if (Imgcodecs.imencode(".jpg", resized, jpeg, parameters)) {
-                        val bytes = jpeg.toArray()
-                        val captured = CapturedFrame(stamp, pose, intrinsics, Base64.getEncoder().encodeToString(bytes), supports)
-                        if (state.active && !state.paused && state.epoch == epoch) {
-                            verificationFrame.set(FramePacket(id, epoch, captured, bytes, rotation, now, strokes))
-                        }
-                    }
-                } catch (t: Throwable) {
-                    notice("Camera sharing: ${t.javaClass.simpleName}")
-                } finally {
-                    src.release(); bgr.release(); resized.release(); jpeg.release(); parameters.release()
-                    encoderBusy.set(false)
-                }
+                    source.put(0,0,luma)
+                    val scale=min(1.0,960.0/max(w,h))
+                    val outW=(w*scale).roundToInt();val outH=(h*scale).roundToInt()
+                    Imgproc.resize(source,gray,Size(outW.toDouble(),outH.toDouble()),0.0,0.0,Imgproc.INTER_AREA)
+                    val pixels=ByteArray(outW*outH);gray.get(0,0,pixels)
+                    val sx=outW.toFloat()/w;val sy=outH.toFloat()/h;val k=depthFrame.intrinsics
+                    // Expensive depth sampling stays entirely on this background worker.
+                    val metric=depthFrame.supports().map { floatArrayOf(it[0]*sx,it[1]*sy,it[2],it[3],it[4]) }
+                    val captured=CapturedFrame(depthFrame.id,depthFrame.pose,
+                        IntrinsicsPacket(k.fx*sx,k.fy*sy,k.cx*sx,k.cy*sy,outW,outH),"",metric)
+                    val result=surfaceVerifier.verify(reference,captured,pixels,expected)
+                    if(result!=null&&state.active&&state.epoch==depthFrame.epoch)
+                        repairs.add(Repair(reference.id,depthFrame.epoch,depthFrame.id,result))
+                } catch (_: Exception) {
+                    // An optional texture check must never interrupt live media or replace a good anchor.
+                } finally {source.release();gray.release();verifierBusy.set(false)}
             }
-        } catch (t: Throwable) {
-            runCatching { image.close() }; encoderBusy.set(false)
-        }
-        scheduleVerification()
+        } catch (_: Exception) {runCatching { image.close() };verifierBusy.set(false)}
     }
 
-    private fun scheduleVerification() {
-        val now = monotonicMs()
-        if (drawings.isEmpty() || now - lastVerify < 900L || !verifierBusy.compareAndSet(false, true)) return
-        val packet = verificationFrame.get()?.takeIf { it.epoch == state.epoch && now - it.capturedMs < 2500L }
-        if (packet == null) { verifierBusy.set(false); return }
-        val candidates = drawings.values.filter { it.anchor.trackingState == TrackingState.TRACKING && it.repairBudgetM < 0.15f }
-        if (candidates.isEmpty()) { verifierBusy.set(false); return }
-        val target = candidates[verifyIndex++ % candidates.size]
-        val id = target.id; val reference = target.reference; val expected = target.anchor.pose.translation.copyOf()
-        lastVerify = now
-        verifying.execute {
-            try {
-                val coarse = SurfaceTargetResolver.resolve(reference, packet.capture, expected) ?: return@execute
-                val refined = runCatching { SurfaceEdgeSnapRefiner.refine(reference, packet.capture, coarse, expected) }.getOrNull() ?: coarse
-                if (refined.confidence >= 0.30f && refined.visualInliers >= 9 && refined.medianReprojectionPx <= 2.0f &&
-                    refined.depthSupports >= 4 && ShowMeGeometry.distance(expected, refined.pointWorld) <= 0.08f) {
-                    repairs.add(Repair(id, packet.epoch, packet.id, refined))
-                }
-            } catch (_: Throwable) {
-                // The optional verifier cannot interrupt the camera, networking or existing anchors.
-            } finally { verifierBusy.set(false) }
-        }
-    }
     private fun applyRepairs(session: Session) {
         while (true) {
-            val repair = repairs.poll() ?: break
-            if (repair.epoch != state.epoch) continue
-            val d = drawings[repair.id] ?: continue
-            if (repair.frameId == d.lastVoteFrame || d.anchor.trackingState != TrackingState.TRACKING) continue
-            d.lastVoteFrame = repair.frameId
-            val point = repair.result.pointWorld
-            val delta = ShowMeGeometry.distance(d.anchor.pose.translation, point)
-            if (delta > 0.08f || d.repairBudgetM + delta > 0.15f) continue
-            if (delta < 0.006f) { d.verified = true; continue }
-            val previous = d.pending
-            if (previous != null && ShowMeGeometry.distance(previous, point) < 0.025f) d.votes += 1
-            else d.votes = 1
-            d.pending = point.copyOf()
-            if (d.votes < 2) continue
-            val replacement = runCatching { session.createAnchor(Pose(point, d.anchor.pose.rotationQuaternion)) }.getOrNull() ?: continue
-            val old = d.anchor; d.anchor = replacement; d.verified = true
-            d.repairBudgetM += delta; d.pending = null; d.votes = 0
+            val repair=repairs.poll() ?: break
+            if(repair.epoch!=state.epoch)continue
+            val d=drawings[repair.id] ?: continue
+            if(repair.frameId==d.lastVoteFrame||d.anchor.trackingState!=TrackingState.TRACKING)continue
+            d.lastVoteFrame=repair.frameId
+            val current=d.offsets.map { d.anchor.pose.transformPoint(it) }
+            val points=repair.result.points
+            if(!StrokeGeometry.shapeCompatible(current,points))continue
+            val delta=current.indices.maxOf { ShowMeGeometry.distance(current[it],points[it]) }
+            if(delta>.06f||d.repairBudgetM+delta>.15f)continue
+            if(delta<.004f){d.verified=true;d.pending=null;d.votes=0;continue}
+            val previous=d.pending
+            if(previous!=null&&previous.size==points.size&&points.indices.all { ShowMeGeometry.distance(previous[it],points[it])<.018f })d.votes++
+            else d.votes=1
+            d.pending=points.map { it.copyOf() }
+            if(d.votes<2)continue
+            // Apply a bounded consensus shape correction, including its orientation/extent.
+            val blended=current.indices.map { i->FloatArray(3) { axis->current[i][axis]*.5f+points[i][axis]*.5f } }
+            val base=StrokeGeometry.center(blended)
+            val replacement=runCatching { session.createAnchor(Pose.makeTranslation(base)) }.getOrNull() ?: continue
+            val old=d.anchor;d.anchor=replacement
+            d.offsets=blended.map { replacement.pose.inverse().transformPoint(it) }
+            d.verified=true;d.repairBudgetM+=delta*.5f;d.pending=null;d.votes=0
             runCatching { old.detach() }
         }
     }

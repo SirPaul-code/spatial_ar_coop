@@ -10,9 +10,15 @@
     <application android:theme="@style/ShowMeTheme" android:label="ShowMe" android:icon="@drawable/ic_showme"
         android:allowBackup="false" android:supportsRtl="true" android:usesCleartextTraffic="true">
         <meta-data android:name="com.google.ar.core" android:value="required" />
-        <activity android:name=".ShowMeActivity" android:exported="true" android:screenOrientation="portrait"
+        <activity android:name=".ShowMeActivity" android:exported="true" android:launchMode="singleTop" android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|keyboardHidden" android:windowSoftInputMode="adjustResize">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="showme" android:host="connect" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>

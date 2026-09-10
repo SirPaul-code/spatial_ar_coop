@@ -23,7 +23,7 @@ const server=createServer(async(req,res)=>{
     if(url.pathname==='/producer'){res.writeHead(200,{'content-type':'text/html'});res.end('<!doctype html><canvas id="source" width="480" height="672"></canvas>');return;}
     if(!url.pathname.startsWith('/api/')){
       const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
-      if(!['index.html','app.js','geometry.mjs','live-video.mjs','style.css'].includes(name)){res.writeHead(404);res.end();return;}
+      if(!['index.html','app.js','geometry.mjs','live-video.mjs','control-rpc.mjs','remote-session.mjs','style.css'].includes(name)){res.writeHead(404);res.end();return;}
       const body=await readFile(web+name);res.writeHead(200,{'content-type':name.endsWith('.css')?'text/css':name.endsWith('.html')?'text/html':'text/javascript'});res.end(body);return;
     }
     if(req.headers.authorization!==`Bearer ${token}`){json({ok:false,code:'SESSION_ENDED',message:'Invalid invitation'},401);return;}
@@ -32,6 +32,7 @@ const server=createServer(async(req,res)=>{
     const state={ok:true,active:true,paused:false,tracking:true,trackingMessage:'Surface tracking active',epoch:3,hostName:'Test camera',annotations:annotations.length,voiceEnabled:true,secure:false};
     if(url.pathname==='/api/join'||url.pathname==='/api/state'){json(state);return;}
     if(url.pathname==='/api/frame'){legacyPolls++;json({ok:false,message:'Legacy JPEG video forbidden'},410);return;}
+    if(url.pathname==='/api/ice'){json({ok:true,iceServers:[]});return;}
     if(url.pathname==='/api/call'){
       callCount++;
       const answer=await producer.evaluate(offer=>window.source.answer(offer),body.sdp);
@@ -84,7 +85,7 @@ try{
       const pc=new RTCPeerConnection({iceServers:[]});s.pc=pc;
       pc.addTrack(stream.getVideoTracks()[0],stream);
       pc.addTrack(dest.stream.getAudioTracks()[0],dest.stream);
-      pc.ondatachannel=e=>{s.channel=e.channel;};
+      pc.ondatachannel=e=>{if(e.channel.label==='showme-frames')s.channel=e.channel;};
       await pc.setRemoteDescription({type:'offer',sdp:offer});
       await pc.setLocalDescription(await pc.createAnswer());
       await new Promise(resolve=>{
@@ -117,7 +118,7 @@ try{
   await page.locator('#name').fill('Alex');await page.locator('#join').click();
   await page.locator('#imageWrap').waitFor({state:'visible',timeout:25000});
   await page.waitForFunction(()=>document.querySelector('#gestureHint').textContent.startsWith('Point or draw'),{},{timeout:15000});
-  await page.waitForFunction(()=>document.querySelector('#frameInfo').textContent.startsWith('WebRTC'),{},{timeout:10000});
+  await page.waitForFunction(()=>document.querySelector('#frameInfo').textContent.includes('fps'),{},{timeout:10000});
   const fpsText=await page.locator('#frameInfo').textContent();console.log('Received real browser WebRTC:',fpsText);
   assert.ok(!fpsText.includes('NaN'));
   const canvas=page.locator('#ink');let bounds=await canvas.boundingBox();
@@ -137,11 +138,11 @@ try{
   await page.screenshot({path:artifacts+'desktop-guidance.png',fullPage:true});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
   await page.locator('#clear').click();await waitUntil(()=>annotations.length===0);
-  const previousCalls=callCount;await page.locator('#reconnect').click();await waitUntil(()=>callCount>previousCalls,'renegotiated video');
+  const previousCalls=callCount;await page.locator('.more-controls summary').click();await page.locator('#reconnect').click();await waitUntil(()=>callCount>previousCalls,'renegotiated video');
   await page.waitForFunction(()=>document.querySelector('#gestureHint').textContent.startsWith('Point or draw'),{},{timeout:15000});
-  await page.locator('#voice').click();await page.waitForFunction(()=>document.querySelector('#voice').textContent.includes('Mute microphone'),{},{timeout:20000});
+  await page.locator('#voice').click();await page.waitForFunction(()=>document.querySelector('#voice').textContent==='Mute',{},{timeout:20000});
   assert.ok(await page.locator('#remoteAudio').evaluate(a=>a.srcObject?.getAudioTracks().length>0),'call includes received audio');
-  await page.locator('#voice').click();assert.equal(await page.locator('#voiceState').textContent(),'Muted');
+  await page.locator('#voice').click();await page.waitForFunction(()=>document.querySelector('#voiceState').textContent==='Muted',{},{timeout:10000});
   await desktop.close();
   const mobile=await browser.newContext({viewport:{width:393,height:852},isMobile:true,hasTouch:true,deviceScaleFactor:2});
   const phone=await mobile.newPage();phone.on('pageerror',e=>errors.push(e));

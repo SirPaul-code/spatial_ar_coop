@@ -31,9 +31,15 @@ data class VideoDepthFrame(
     val intrinsics: IntrinsicsPacket, val rotation: Int, val raw: DepthRaster?, val full: DepthRaster?,
     val textureToImage: FloatArray, val cloud: List<FloatArray>, val strokes: List<StrokeSnapshot>,
     val videoWidth: Int, val videoHeight: Int, val contentHeight: Int,
+    val cameraTimestampNs: Long = 0L,
 ) {
     fun metadata(): JSONObject = JSONObject().put("id", id).put("epoch", epoch)
         .put("width", intrinsics.width).put("height", intrinsics.height).put("rotation", rotation)
+        .put("cameraTimestampNs",cameraTimestampNs.toString())
+        .put("intrinsics",JSONObject().put("fx",intrinsics.fx.toDouble()).put("fy",intrinsics.fy.toDouble())
+            .put("cx",intrinsics.cx.toDouble()).put("cy",intrinsics.cy.toDouble()))
+        .put("pose",JSONObject().put("t",org.json.JSONArray(pose.t.toList())).put("q",org.json.JSONArray(pose.q.toList())))
+        .put("pixelSpace","raw-camera").put("displayRotation",0)
         .put("videoWidth", videoWidth).put("videoHeight", videoHeight).put("contentHeight", contentHeight)
         .put("depthAvailable", raw != null || full != null || cloud.isNotEmpty())
         .put("annotations", projectStrokes(CapturedFrame(id, pose, intrinsics, "", emptyList()), rotation, strokes))
@@ -41,6 +47,9 @@ data class VideoDepthFrame(
     /** Reconstruct an exact historical camera reference from the presented video image. */
     fun materialize(uprightJpeg: ByteArray): FramePacket {
         require(uprightJpeg.size in 20..1_500_000)
+        val bounds=android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds=true }
+        android.graphics.BitmapFactory.decodeByteArray(uprightJpeg,0,uprightJpeg.size,bounds)
+        require(bounds.outWidth in 160..1920 && bounds.outHeight in 160..1920) { "Frozen image dimensions are invalid" }
         val encoded = MatOfByte(*uprightJpeg)
         val image = Imgcodecs.imdecode(encoded, Imgcodecs.IMREAD_COLOR)
         val unrotated = Mat(); val scaled = Mat(); val output = MatOfByte()
@@ -65,7 +74,7 @@ data class VideoDepthFrame(
             val k = IntrinsicsPacket(intrinsics.fx * sx, intrinsics.fy * sy, intrinsics.cx * sx, intrinsics.cy * sy, w, h)
             val points = supports().map { floatArrayOf(it[0] * sx, it[1] * sy, it[2], it[3], it[4]) }
             val jpeg = output.toArray()
-            val captured = CapturedFrame(id, pose, k, Base64.getEncoder().encodeToString(jpeg), points)
+            val captured = CapturedFrame(if(cameraTimestampNs>0L)cameraTimestampNs else id, pose, k, Base64.getEncoder().encodeToString(jpeg), points)
             return FramePacket(id, epoch, captured, jpeg, rotation, capturedMs, strokes)
         } finally {
             encoded.release(); image.release(); unrotated.release(); scaled.release(); output.release(); params.release()
@@ -136,7 +145,7 @@ data class VideoDepthFrame(
                 }
             }
             return VideoDepthFrame(id, epoch, monotonicMs(), PosePacket(camera.pose.translation.copyOf(), camera.pose.rotationQuaternion.copyOf()),
-                intr, rotation, raw, full, affine, cloud, strokes, videoWidth, videoHeight, contentHeight)
+                intr, rotation, raw, full, affine, cloud, strokes, videoWidth, videoHeight, contentHeight, frame.timestamp)
         }
         private fun copyRaster(image: Image, confidence: Image?): DepthRaster {
             val w = image.width; val h = image.height
@@ -161,13 +170,15 @@ data class VideoDepthFrame(
     }
 }
 
-/** About four seconds at 30 fps, plus one explicit freeze. No growing video queue. */
+/** Bounded by 180 frames, six seconds and 48 MiB. No growing video queue. */
 class VideoDepthHistory(private val clock: () -> Long = ::monotonicMs) {
     private val frames = LinkedHashMap<Long, VideoDepthFrame>()
+    private var bytes=0L
+    private fun weight(f:VideoDepthFrame):Long = (f.raw?.mm?.size?:0)*2L+(f.raw?.confidence?.size?:0)+(f.full?.mm?.size?:0)*2L+f.cloud.size*20L
     @Synchronized fun add(frame: VideoDepthFrame) {
-        frames[frame.id] = frame
-        while (frames.size > 120) frames.remove(frames.keys.first())
+        frames.put(frame.id,frame)?.let { bytes-=weight(it) };bytes+=weight(frame)
+        while (frames.size > 180 || bytes>48L*1024*1024) frames.remove(frames.keys.first())?.let { bytes-=weight(it) }
     }
-    @Synchronized fun get(id: Long): VideoDepthFrame? = frames[id]?.takeIf { clock()-it.capturedMs in 0L..4000L }
-    @Synchronized fun clear() { frames.clear() }
+    @Synchronized fun get(id: Long): VideoDepthFrame? = frames[id]?.takeIf { clock()-it.capturedMs in 0L..6000L }
+    @Synchronized fun clear() { frames.clear();bytes=0L }
 }

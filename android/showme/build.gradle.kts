@@ -40,7 +40,7 @@ android {
         minSdk = 33
         targetSdk = 36
         versionCode = 100000 + runNumber * 10 + runAttempt
-        versionName = "0.2.0-webrtc.$runNumber.$runAttempt"
+        versionName = "0.3.0-internet.$runNumber.$runAttempt"
         // Commodity phones used for the physical trial are ARM64.
         ndk { abiFilters += "arm64-v8a" }
     }
@@ -76,6 +76,7 @@ tasks.configureEach {
     if (name.startsWith("compile") && name.endsWith("Kotlin")) dependsOn(prepareSpatialSources)
 }
 dependencies {
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.ar:core:1.56.0")
     implementation("org.opencv:opencv:4.12.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")

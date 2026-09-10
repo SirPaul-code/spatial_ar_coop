@@ -1,6 +1,6 @@
 # ShowMe branch handoff
 
-This branch is `showme/remote-assistance`. Read `docs/SHOWME.md` first, then `docs/CURRENT_RUNTIME.md`. `docs/AGENT_CONTEXT.md` documents the original Spatial Sync pipeline/history and is not the ShowMe product specification.
+This branch is `showme/remote-assistance`. Read `docs/CURRENT_RUNTIME.md`, `docs/SHOWME.md`, then `showme/server/README.md`. `docs/AGENT_CONTEXT.md` documents the original Spatial Sync pipeline/history and is not the ShowMe product specification.
 
 ## Boundaries
 
@@ -15,7 +15,11 @@ This branch is `showme/remote-assistance`. Read `docs/SHOWME.md` first, then `do
 - Invalid/expired frame, missing depth, discontinuity, lost tracking or world reset must reject the drawing. Never invent a fixed-distance plane to make a demo look successful.
 - Drawings remain 3D geometry attached to local ARCore anchors. Browser overlay geometry must originate from those anchors, not a permanent screen-space sketch.
 - Optional visual/depth/edge verification runs separately from GL/networking and has bounded correction limits. It is not evidence of guaranteed centimetre accuracy.
-- Local HTTP supports video and drawing on a trusted LAN. Browser microphone capture requires trusted HTTPS. Do not remove browser security checks or claim a self-signed certificate is universally trusted.
+- Internet calls use an activated HTTPS Worker service, WSS signaling and direct WebRTC with TURN fallback. Owner approval is required. Never embed the owner activation key or long-lived TURN secret in APK/browser/Git.
+- Local Wi-Fi is secondary. Normal UI must not contain certificate imports or require disabling browser security.
+- Do not put full-frame YUV conversion, SIFT, 8,000-point expansion or metadata JSON on the GL thread. Whole-stroke texture/depth checks are bounded, off-thread and fail closed.
+- Keep the original frozen image reference immutable; do not claim the protected legacy multi-view resolver is the active whole-stroke verifier.
+- Server code is not a deployed endpoint. Never claim deployment or physical validation from CI alone.
 - Session tokens are ephemeral bearer capabilities. No analytics, cloud image uploads or silent audio capture.
 - All user-visible UI is English. Native/browser permission prompts are explicit.
 - Never claim hardware validation from CI alone. Inspect final CI and release assets before claiming APK availability.

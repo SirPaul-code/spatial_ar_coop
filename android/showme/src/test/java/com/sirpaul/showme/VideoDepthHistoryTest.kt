@@ -14,9 +14,9 @@ class VideoDepthHistoryTest {
     }
     @Test fun historyIsBoundedAndExpiresInsteadOfUsingAnotherFramesDepth() {
         var time=1000L;val history=VideoDepthHistory{time}
-        for(id in 1..121)history.add(frame(id.toLong(),time))
-        assertNull(history.get(1L));assertNotNull(history.get(121L))
-        time+=4001L;assertNull(history.get(121L))
+        for(id in 1..181)history.add(frame(id.toLong(),time))
+        assertNull(history.get(1L));assertNotNull(history.get(181L))
+        time+=6001L;assertNull(history.get(181L))
     }
     @Test fun resettingHistoryCannotLeaveOldVideoIdentitiesPlaceable() {
         val history=VideoDepthHistory{1000L};history.add(frame(11L,1000L));history.clear()
@@ -35,4 +35,19 @@ class VideoDepthHistoryTest {
         assertEquals(2f-(v-240f)/500f*2f,support[3],.0001f)
         assertEquals(1f,support[4],.0001f)
     }
+    @Test fun metadataIncludesTheExposurePoseIntrinsicsAndDisplayMapping() {
+        val f=frame(27L,1000L).copy(cameraTimestampNs=1234567890123L)
+        val m=f.metadata()
+        assertEquals("1234567890123",m.getString("cameraTimestampNs"))
+        assertEquals(500.0,m.getJSONObject("intrinsics").getDouble("fx"),.0001)
+        assertEquals(1.0,m.getJSONObject("pose").getJSONArray("t").getDouble(0),.0001)
+        assertEquals(90,m.getInt("rotation"));assertEquals(3,m.getInt("epoch"))
+    }
+    @Test fun largeDepthFramesAreBoundedByMemoryNotOnlyCount() {
+        val history=VideoDepthHistory{1000L}
+        val raster=DepthRaster(512,512,ShortArray(512*512),ByteArray(512*512))
+        for(i in 1L..100L)history.add(frame(i,1000L).copy(raw=raster,full=raster))
+        assertNull(history.get(1L));assertNotNull(history.get(100L))
+    }
+
 }

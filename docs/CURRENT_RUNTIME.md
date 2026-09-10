@@ -1,37 +1,21 @@
-# Current branch: ShowMe remote assistance
+# ShowMe continuation checkpoint
 
-Working branch: `showme/remote-assistance`.
+Branch: `showme/remote-assistance`.
+Read `docs/SHOWME.md` and `showme/server/README.md` first.
 
-Read `docs/SHOWME.md` for the authoritative current implementation, limitations, build instructions, security contract and physical acceptance tests.
+This iteration follows the 0.2 WebRTC runtime `b5d43189095911fc56bacab4381678cf4db5efe2` after real reports of periodic video stalls and slightly displaced PCB annotations.
 
-## Protected source baseline
+Implemented changes:
+- Remove full YUV conversion and metric support expansion from the per-second GL verifier path; copy only luma rows, do ROI verification on a separate single-thread worker.
+- Cache root surface descriptors; verify/correct all vertices of a gesture, centroid-based anchors, bounded multi-observation corrections.
+- Move metadata projection/JSON off GL; replace 128 footer clears/frame with one tiny texture draw; GPU-backed browser presentation with only footer-row readback.
+- Preserve exact frame ID/full epoch/camera timestamp/K/pose/rotation/depth association. Never infer an arbitrary latest pose for a frozen image.
+- Add bounded frame and GL/depth/copy timing telemetry.
+- Add Cloudflare Workers/SQLite Durable Object invitation/approval/signaling service, short-lived TURN credentials, Android outbound WSS host, browser HTTPS invite routing and WebRTC control RPC for images/drawings.
+- Clean native/browser layouts, remove TLS/certificate/IP administration from ordinary call UI. Native Internet service activation happens once; local Wi-Fi is secondary.
 
-ShowMe was forked from `a5970e9be7fef9434dbf2e681274dc56c9462fe4` on `fresh/no-map-runtime-poc` (vehicle identity convergence and precision surface snap). The original `android/app/**` files remain unchanged. The new `:showme` module uses selected existing geometry/depth/surface algorithms through generated-source reuse without altering the native two-phone alignment/transport runtime.
+Protected: original `android/app/**` and `.github/workflows/ci.yml` remain unchanged; release is `showme-latest`, app ID `com.sirpaul.showme`.
 
-The `outdoor/gnss-global` branch is a separate experiment and is not modified by this branch.
+Deployment status: code/configuration and setup scripts are supplied, **not an already deployed Cloudflare account service**. The user must deploy and configure their own Worker/TURN keys, then activate the Android app with the printed private link. No login/monetization is implemented yet.
 
-## Current live-video implementation
-
-The 0.2 implementation replaces 7-fps JPEG live polling with shared-EGL ARCore camera capture and a real WebRTC video/audio/data connection. Target: 30 fps, up to 720 x 1280 visible camera pixels (orientation/aspect dependent). Receiver UI reports actual WebRTC FPS/codec; hardware performance is not assumed from the target.
-
-Precise gestures use a CRC-coded identity embedded in the video frame's cropped-out footer plus that frame's compact native depth history. JPEG is only an on-demand frozen reference and a low-rate verifier input. The browser does not fetch `/api/frame` for live video. Preserve the exact-ID/epoch checks; never substitute the latest depth when an ID is missing.
-
-New files: `RtcVideoPipe.kt`, `VideoFrameStamp.kt`, `VideoDepthHistory.kt`, `live-video.mjs`, and new geometry/history/media integration tests. `RtcVoice` now owns a unified media connection rather than audio only. The original Spatial Sync runtime remains unchanged.
-
-## New product flow
-
-Android camera owner -> generated local invite link / Android share sheet / QR -> browser helper -> exact-frame pin/arrow/freehand/circle -> historical metric surface reconstruction -> local ARCore anchor -> native and browser world-projected annotations.
-
-Only the owner's AR world is involved. No cross-device AR alignment, Cloud Anchor, login or external server is required for the local preview.
-
-Local HTTP mode provides camera view and annotations. Optional local HTTPS and native/browser WebRTC audio are implemented, but browser microphone availability requires trusted HTTPS and user permission. Self-signed trust is a testing step, not a guarantee of one-click public calling.
-
-Release channel is `showme-latest`; package is `com.sirpaul.showme`. Never overwrite Spatial Sync's `latest-dev` while publishing ShowMe.
-
-## Verification status
-
-Code is implemented and includes Kotlin/Node geometry/session tests and Chromium desktop/mobile protocol/UI smoke tests. Check the final GitHub Actions run and release assets for the exact commit being tested. Physical AR placement, real mobile browsers, hotspot behavior and native/browser voice are not certified by those automated tests; use the acceptance procedure in `SHOWME.md`.
-
-Do not claim internet reachability, login, billing, durable cross-session anchors, centimetre guarantees or an automotive/safety certification. Those are not delivered by the local preview.
-
-Older `docs/AGENT_CONTEXT.md` remains valuable for the original spatial pipeline, but its branch/checkpoint and two-phone UI descriptions are historical in this ShowMe branch.
+Validation: inspect current final CI and exact release SHA. Node/JUnit/Chromium/Miniflare tests do not measure Android GPU/camera timing or centimetre placement and do not substitute for a real mobile-data-to-PC TURN test. Do not repeat the earlier overclaim that a synthetic 30-fps browser result guarantees a 30-fps phone call.

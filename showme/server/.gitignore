@@ -1,0 +1,7 @@
+node_modules/
+public/
+.wrangler/
+.dry-run/
+.dev.vars
+.env*
+*.local

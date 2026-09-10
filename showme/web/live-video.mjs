@@ -1,3 +1,4 @@
+import {ControlRpc} from './control-rpc.mjs';
 /**
  * Live video is a real RTP media track. A small CRC-coded footer is part of the
  * encoded image and cropped from presentation. The frame ID cannot run ahead of
@@ -47,9 +48,10 @@ export class LiveVideoCall {
     this.video.setAttribute('aria-hidden','true');
     Object.assign(this.video.style,{position:'fixed',width:'1px',height:'1px',opacity:'.01',pointerEvents:'none',left:'0',top:'0'});
     document.body.append(this.video);
-    this.buffer=document.createElement('canvas');this.ctx=this.buffer.getContext('2d',{willReadFrequently:true});
+    this.buffer=document.createElement('canvas');this.ctx=this.buffer.getContext('2d',{alpha:false});
+    this.footer=document.createElement('canvas');this.footer.height=2;this.footerCtx=this.footer.getContext('2d',{willReadFrequently:true});
     this.meta=new Map();this.frozen=false;this.serial=0;this.pc=null;this.microphone=null;
-    this.layout=null;this.connecting=false;this.videoCallback=null;this.statsTimer=0;
+    this.control=null;this.audioSender=null;this.iceServers=[];this.layout=null;this.connecting=false;this.videoCallback=null;this.statsTimer=0;
     this.framesSinceStats=0;this.lastStatsAt=performance.now();this.remoteAudio=null;
   }
   get connected(){return this.pc?.connectionState==='connected';}
@@ -58,20 +60,23 @@ export class LiveVideoCall {
     if(typeof RTCPeerConnection==='undefined')throw new Error('This browser cannot receive WebRTC video. Use a current browser.');
     this.disconnect();this.connecting=true;const serial=this.serial;
     try{
-      const pc=new RTCPeerConnection({iceServers:[]});this.pc=pc;
+      const configuration=await this.api('/api/ice').catch(error=>{if(location.pathname.startsWith('/r/'))throw error;return {iceServers:[]};});
+      const pc=new RTCPeerConnection({iceServers:configuration.iceServers??[]});this.pc=pc;
       const video=pc.addTransceiver('video',{direction:'recvonly'});
-      const audio=pc.addTransceiver('audio',{direction:'sendrecv'});
+      const audio=pc.addTransceiver('audio',{direction:'sendrecv'});this.audioSender=audio.sender;
+      this.control=new ControlRpc(pc.createDataChannel('showme-control',{ordered:true}));
       // Prefer a standard hardware-friendly codec; retain alternatives for negotiation.
       if(video.setCodecPreferences&&globalThis.RTCRtpReceiver?.getCapabilities){
         const codecs=RTCRtpReceiver.getCapabilities('video')?.codecs??[];
         const ordered=[...codecs.filter(c=>c.mimeType.toLowerCase()==='video/h264'),...codecs.filter(c=>c.mimeType.toLowerCase()!=='video/h264')];
         if(ordered.length)video.setCodecPreferences(ordered);
       }
-      if(microphone){
-        if(!isSecureContext||!navigator.mediaDevices?.getUserMedia)throw new Error('Browser microphone capture requires trusted HTTPS. Camera video does not.');
-        this.microphone=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false});
-        if(serial!==this.serial){this.microphone.getTracks().forEach(t=>t.stop());return;}
-        await audio.sender.replaceTrack(this.microphone.getAudioTracks()[0]);
+      if(microphone&&isSecureContext&&navigator.mediaDevices?.getUserMedia){
+        try {
+          this.microphone=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false});
+          if(serial!==this.serial){this.microphone.getTracks().forEach(t=>t.stop());return;}
+          await audio.sender.replaceTrack(this.microphone.getAudioTracks()[0]);
+        }catch{this.onStatus('MICROPHONE_DENIED');}
       }
       const channel=pc.createDataChannel('showme-frames',{ordered:false,maxRetransmits:0});
       channel.onmessage=event=>{
@@ -101,7 +106,7 @@ export class LiveVideoCall {
         if(pc.iceGatheringState==='complete'){resolve();return;}
         const done=()=>{clearTimeout(timer);pc.removeEventListener('icegatheringstatechange',change);resolve();};
         const change=()=>{if(pc.iceGatheringState==='complete')done();};
-        const timer=setTimeout(done,4500);pc.addEventListener('icegatheringstatechange',change);
+        const timer=setTimeout(done,5000);pc.addEventListener('icegatheringstatechange',change);
       });
       if(serial!==this.serial)return;
       const response=await this.api('/api/call',{sdp:pc.localDescription.sdp},{timeout:15000});
@@ -132,7 +137,11 @@ export class LiveVideoCall {
     const content=Math.round(h*l.contentHeight/l.videoHeight),footer=h-content;
     const y1=Math.min(h-1,Math.floor(content+footer*.25)),y2=Math.min(h-1,Math.floor(content+footer*.75));
     let stamp=null;
-    try{stamp=decodeStampRows(this.ctx.getImageData(0,y1,w,1).data,this.ctx.getImageData(0,y2,w,1).data,w);}catch{}
+    // Keep full video GPU-backed. Read back only two footer rows from that same immutable copy.
+    if(this.footer.width!==w)this.footer.width=w;
+    this.footerCtx.drawImage(this.buffer,0,y1,w,1,0,0,w,1);
+    this.footerCtx.drawImage(this.buffer,0,y2,w,1,0,1,w,1);
+    try{const pixels=this.footerCtx.getImageData(0,0,w,2).data;stamp=decodeStampRows(pixels.subarray(0,w*4),pixels.subarray(w*4),w);}catch{}
     const m=stamp?this.meta.get(stamp.id):null;
     const meta=m&&((m.epoch&255)===stamp.epoch)?m:null;
     this.framesSinceStats++;
@@ -142,14 +151,23 @@ export class LiveVideoCall {
     if(serial!==this.serial||!this.pc)return;
     try{
       const stats=await this.pc.getStats();if(serial!==this.serial)return;
-      let incoming=null;
+      let incoming=null,pair=null;
       stats.forEach(report=>{if(report.type==='inbound-rtp'&&(report.kind==='video'||report.mediaType==='video'))incoming=report;});
+      stats.forEach(report=>{if(report.type==='transport'&&report.selectedCandidatePairId)pair=stats.get(report.selectedCandidatePairId);});
+      const relay=pair&&[stats.get(pair.localCandidateId)?.candidateType,stats.get(pair.remoteCandidateId)?.candidateType].includes('relay');
       const now=performance.now(),displayFps=this.framesSinceStats*1000/(now-this.lastStatsAt);
       this.framesSinceStats=0;this.lastStatsAt=now;
       this.onStats({displayFps,receivedFps:incoming?.framesPerSecond??null,width:incoming?.frameWidth,height:incoming?.frameHeight,
-        packetsLost:incoming?.packetsLost??0,framesDropped:incoming?.framesDropped??0,
+        packetsLost:incoming?.packetsLost??0,framesDropped:incoming?.framesDropped??0,rttMs:(pair?.currentRoundTripTime??0)*1000,relay:!!relay,
+        jitterMs:(incoming?.jitter??0)*1000,freezeCount:incoming?.freezeCount??0,
         codec:incoming?.codecId?stats.get(incoming.codecId)?.mimeType:null});
     }catch{}
+  }
+  async enableMicrophone(){
+    if(!this.pc||!this.audioSender)throw new Error('Connect the call first.');
+    if(!isSecureContext||!navigator.mediaDevices?.getUserMedia)throw new Error('Microphone requires the HTTPS invitation.');
+    if(!this.microphone)this.microphone=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false});
+    await this.audioSender.replaceTrack(this.microphone.getAudioTracks()[0]);this.setMuted(false);
   }
   setMuted(muted){this.microphone?.getAudioTracks().forEach(track=>{track.enabled=!muted;});}
   disconnect(){
@@ -158,7 +176,7 @@ export class LiveVideoCall {
       if(this.video.cancelVideoFrameCallback)this.video.cancelVideoFrameCallback(this.videoCallback);else cancelAnimationFrame(this.videoCallback);
       this.videoCallback=null;
     }
-    this.pc?.close();this.pc=null;this.microphone?.getTracks().forEach(track=>track.stop());this.microphone=null;
+    this.control?.close();this.control=null;this.audioSender=null;this.pc?.close();this.pc=null;this.microphone?.getTracks().forEach(track=>track.stop());this.microphone=null;
     this.video.srcObject=null;this.meta.clear();this.frozen=false;this.layout=null;
   }
 }

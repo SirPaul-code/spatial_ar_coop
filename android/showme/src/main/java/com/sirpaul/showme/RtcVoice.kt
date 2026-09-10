@@ -6,6 +6,10 @@ import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import org.json.JSONObject
+import org.json.JSONArray
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import org.webrtc.*
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
@@ -19,6 +23,18 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
     private val audioManager = app.getSystemService(AudioManager::class.java)
     private val worker = Executors.newSingleThreadExecutor()
     private val videoLock = Any()
+    private val metadataWorker=Executors.newSingleThreadExecutor()
+    private val latestFrame=AtomicReference<VideoDepthFrame?>(null)
+    private val metadataBusy=AtomicBoolean()
+    private val controlWorker=java.util.concurrent.ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,
+        java.util.concurrent.ArrayBlockingQueue<Runnable>(8), java.util.concurrent.ThreadPoolExecutor.DiscardPolicy())
+    private val answerTimer=ScheduledThreadPoolExecutor(1)
+    private val fragments=ControlFragments()
+    @Volatile private var control:DataChannel?=null
+    @Volatile var controlHandler:((String,JSONObject)->JSONObject)?=null
+    private var controlLastAt=0L
+    private var controlCount=0
+    fun isReady():Boolean=videoSource!=null&&!closed
     private var factory: PeerConnectionFactory? = null
     private var module: JavaAudioDeviceModule? = null
     private var audioSource: AudioSource? = null
@@ -28,7 +44,7 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
     @Volatile private var peer: PeerConnection? = null
     @Volatile private var metadata: DataChannel? = null
     private var pending: CompletableFuture<String>? = null
-    private var generation = 0
+    @Volatile private var generation = 0
     private var previousMode = AudioManager.MODE_NORMAL
     @Volatile private var muted = false
     @Volatile private var closed = false
@@ -70,6 +86,20 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
             if(now-fpsStart>=1000L) { state.captureFps=frameCount*1000f/(now-fpsStart); fpsStart=now; frameCount=0 }
         }
     }
+    fun publishFrame(frame:VideoDepthFrame) {
+        if(closed)return
+        latestFrame.set(frame)
+        if(!metadataBusy.compareAndSet(false,true))return
+        metadataWorker.execute {
+            try {
+                // Coalesce rather than queue metadata for every captured frame.
+                while(!closed) {
+                    val next=latestFrame.getAndSet(null) ?: break
+                    publishMetadata(next.metadata())
+                }
+            }finally{metadataBusy.set(false)}
+        }
+    }
     fun publishMetadata(value: JSONObject) {
         val channel=metadata ?: return
         if(channel.state()!=DataChannel.State.OPEN || channel.bufferedAmount()>128_000L) return
@@ -78,7 +108,7 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
         if(bytes.size>60_000) { value.remove("annotations"); bytes=value.toString().toByteArray(Charsets.UTF_8) }
         runCatching { channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes),false)) }
     }
-    fun answer(offer: String): CompletableFuture<String> {
+    fun answer(offer: String, iceServers: JSONArray = JSONArray()): CompletableFuture<String> {
         val future=CompletableFuture<String>()
         if(closed) { future.completeExceptionally(IllegalStateException("Session closed")); return future }
         worker.execute {
@@ -87,7 +117,14 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
                 disposePeer()
                 val callGeneration=generation
                 pending=future
-                val config=PeerConnection.RTCConfiguration(emptyList()).apply { sdpSemantics=PeerConnection.SdpSemantics.UNIFIED_PLAN }
+                val ice=(0 until iceServers.length()).mapNotNull { i->
+                    val entry=iceServers.optJSONObject(i) ?: return@mapNotNull null
+                    val urls=entry.optJSONArray("urls")?.let { list->(0 until list.length()).map { list.getString(it) } }
+                        ?: listOf(entry.optString("urls"))
+                    if(urls.isEmpty()||urls.any { !it.matches(Regex("^(stun|turn|turns):.+")) })return@mapNotNull null
+                    PeerConnection.IceServer.builder(urls).setUsername(entry.optString("username")).setPassword(entry.optString("credential")).createIceServer()
+                }
+                val config=PeerConnection.RTCConfiguration(ice).apply { sdpSemantics=PeerConnection.SdpSemantics.UNIFIED_PLAN }
                 val connection=currentFactory.createPeerConnection(config,object : PeerConnection.Observer {
                     override fun onSignalingChange(value: PeerConnection.SignalingState?) = Unit
                     override fun onIceConnectionChange(value: PeerConnection.IceConnectionState?) = Unit
@@ -106,14 +143,15 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
                     override fun onRemoveStream(stream: MediaStream?) = Unit
                     override fun onDataChannel(channel: DataChannel?) {
                         if(callGeneration==generation && channel?.label()=="showme-frames")metadata=channel
+                        if(callGeneration==generation && channel?.label()=="showme-control")attachControl(channel,callGeneration)
                     }
                     override fun onRenegotiationNeeded() = Unit
                 }) ?: error("Could not create WebRTC call")
                 peer=connection
                 val sender=connection.addTrack(videoTrack,listOf("showme"))
                 sender.parameters.let { parameters ->
-                    parameters.degradationPreference=RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
-                    parameters.encodings.forEach { it.maxFramerate=30; it.maxBitrateBps=6_000_000; it.minBitrateBps=800_000 }
+                    parameters.degradationPreference=RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+                    parameters.encodings.forEach { it.maxFramerate=30; it.maxBitrateBps=4_000_000; it.minBitrateBps=350_000 }
                     sender.setParameters(parameters)
                 }
                 if(state.voiceEnabled && app.checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED) {
@@ -136,6 +174,7 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
                                 connection.setLocalDescription(object : DescriptionObserver() {
                                     override fun onSetSuccess() {
                                         if(connection.iceGatheringState()==PeerConnection.IceGatheringState.COMPLETE)finishAnswer(callGeneration)
+                                        else answerTimer.schedule({ finishAnswer(callGeneration) },5,TimeUnit.SECONDS)
                                     }
                                     override fun onSetFailure(error: String?) { future.completeExceptionally(IllegalStateException(error)) }
                                 },sdp)
@@ -148,6 +187,40 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
             }catch(t: Throwable) { state.videoState="FAILED"; future.completeExceptionally(t) }
         }
         return future
+    }
+    private fun attachControl(channel:DataChannel,expected:Int) {
+        control=channel
+        channel.registerObserver(object:DataChannel.Observer {
+            override fun onBufferedAmountChange(previous:Long)=Unit
+            override fun onStateChange()=Unit
+            override fun onMessage(buffer:DataChannel.Buffer) {
+                if(expected!=generation||buffer.binary||buffer.data.remaining()>48_000)return
+                val bytes=ByteArray(buffer.data.remaining());buffer.data.get(bytes)
+                // Reassembly is strictly bounded before any expensive image decoding is enqueued.
+                val text=runCatching { fragments.accept(String(bytes,Charsets.UTF_8)) }.getOrNull() ?: return
+                val message=runCatching { JSONObject(text) }.getOrNull() ?: return
+                val id=message.optString("id")
+                if(!id.matches(Regex("[A-Za-z0-9-]{8,80}")))return
+                val now=monotonicMs()
+                synchronized(fragments) {
+                    if(now-controlLastAt>1000L){controlLastAt=now;controlCount=0}
+                    if(++controlCount>12)return
+                }
+                controlWorker.execute {
+                    if(expected!=generation)return@execute
+                    val response=try{controlHandler?.invoke(message.optString("path"),message.optJSONObject("body")?:JSONObject())
+                        ?: ShowMeSession.failure("NOT_READY","Camera session is not ready.")}
+                    catch(_:Exception){ShowMeSession.failure("INVALID_REQUEST","This request could not be processed.")}
+                    val payload=JSONObject().put("id",id).put("result",response).toString()
+                    val deadline=monotonicMs()+10_000L
+                    for(part in ControlFragments.split(id,payload)) {
+                        while(channel.state()==DataChannel.State.OPEN&&channel.bufferedAmount()>128_000L&&monotonicMs()<deadline)Thread.sleep(4)
+                        if(expected!=generation||channel.state()!=DataChannel.State.OPEN||monotonicMs()>=deadline)break
+                        if(!channel.send(DataChannel.Buffer(ByteBuffer.wrap(part.toByteArray(Charsets.UTF_8)),false)))break
+                    }
+                }
+            }
+        })
     }
     private fun finishAnswer(expected: Int) {
         if(expected!=generation)return
@@ -164,7 +237,7 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
     private fun disposePeer() {
         generation++
         pending?.completeExceptionally(IllegalStateException("Call replaced")); pending=null
-        metadata=null
+        metadata=null;control?.unregisterObserver();control=null;fragments.clear();latestFrame.set(null)
         peer?.close(); peer?.dispose(); peer=null
         audioTrack?.dispose(); audioTrack=null; audioSource?.dispose(); audioSource=null
         audioManager.clearCommunicationDevice()
@@ -180,7 +253,7 @@ class RtcVoice(context: Context, private val state: ShowMeSession) {
         if(closed)return
         closed=true
         worker.execute { disposePeer(); synchronized(videoLock) { disposeFactory() } }
-        worker.shutdown()
+        worker.shutdown();metadataWorker.shutdown();controlWorker.shutdown();answerTimer.shutdownNow()
     }
     private open class DescriptionObserver : SdpObserver {
         override fun onCreateSuccess(sdp: SessionDescription?) = Unit

@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "showme-calls",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "ShowMeRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShowMeRoom"] }],
+  "vars": {
+    "MAX_ROOMS_PER_DAY": "20",
+    "SESSION_SECONDS": "1800"
+  },
+  "observability": { "enabled": false }
+}
