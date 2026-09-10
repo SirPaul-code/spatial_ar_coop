@@ -8,5 +8,5 @@ for(const file of ['index.html','style.css','app.js','geometry.mjs','live-video.
   try{await access(path.join(web,file));await copyFile(path.join(web,file),path.join(output,file));}
   catch(error){throw new Error(`Missing ../web/${file}. Keep the web and server folders together.`,{cause:error});}
 }
-for(const file of ['setup.html','setup.mjs','welcome.html'])await copyFile(path.join(root,'static',file),path.join(output,file));
-console.log('Browser and activation assets prepared. No camera files are uploaded.');
+await copyFile(path.join(root,'static','welcome.html'),path.join(output,'welcome.html'));
+console.log('Browser assets prepared. No activation page or camera files are uploaded.');
