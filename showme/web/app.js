@@ -209,9 +209,12 @@ function updateFreezeUi(){
   ui.gestureHint.textContent=submitting?'Attaching your guidance to the physical surface…':frozen?'Frozen image. Draw on a clear, mapped surface.':'Choose a tool, then point into their view.';
 }
 function holdFrame(manual=false){
-  if(!frame||!joined||performance.now()-lastFrameAt>3000)return Promise.reject(new Error('Wait for a current, identifiable video frame first.'));
+  if(!frame||!joined)return Promise.reject(new Error('Wait for a current, identifiable video frame first.'));
+  // An already frozen frame has its own bounded server lease. Live-frame freshness
+  // only gates NEW freezes; otherwise drawing stops working after three seconds.
+  if(frozen){if(manual)manualFreeze=true;return freezePromise||Promise.resolve();}
+  if(performance.now()-lastFrameAt>3000)return Promise.reject(new Error('Wait for a current, identifiable video frame first.'));
   if(manual)manualFreeze=true;
-  if(frozen)return freezePromise||Promise.resolve();
   frozen=true;live.frozen=true;freezeAt=performance.now();updateFreezeUi();
   // The screenshot is exactly the already displayed video frame, without the ink overlay.
   const jpeg=ui.scene.toDataURL('image/jpeg',.90).split(',')[1];

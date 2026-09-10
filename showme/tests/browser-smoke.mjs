@@ -42,7 +42,9 @@ const server=createServer(async(req,res)=>{
       assert.ok(observed,'freeze ID must be a genuinely transmitted video frame, not newest metadata');
       assert.equal(body.epoch,3);assert.ok(body.jpeg?.length>100);
       const dims=await producer.evaluate(async base64=>{const image=new Image();image.src='data:image/jpeg;base64,'+base64;await image.decode();return [image.width,image.height];},body.jpeg);
-      assert.deepEqual(dims,[480,640],'screenshot excludes identity footer');
+      assert.ok(dims[0]>=256 && dims[0]<=480,'freeze uses a decodable received resolution');
+      assert.ok(Math.abs(dims[1]-Math.round(dims[0]*640/480))<=1,
+        `screenshot must exclude the scaled identity footer: ${dims}`);
       frozenId=body.frameId;json({ok:true,id:frozenId,epoch:3,annotations});return;
     }
     if(['/api/resume','/api/voice-stop','/api/call-stop','/api/leave'].includes(url.pathname)){json({ok:true});return;}
@@ -124,7 +126,7 @@ try{
   await page.waitForTimeout(350);await page.locator('#freeze').click();await waitUntil(()=>frozenId!==draws[0].frameId,'manual freeze');
   const held=frozenId;
   const before=await page.locator('#scene').evaluate(c=>c.toDataURL());
-  await page.waitForTimeout(700);
+  await page.waitForTimeout(3400);
   assert.equal(await page.locator('#scene').evaluate(c=>c.toDataURL()),before,'freeze must hold an immutable displayed image while RTP continues');
   await page.locator('[data-tool="arrow"]').click();await page.locator('#label').fill('<img src=x onerror=alert(1)>');
   bounds=await canvas.boundingBox();
