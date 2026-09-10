@@ -29,7 +29,7 @@ jobs:
           if compgen -G "showme/.bootstrap/fix-*.b64" > /dev/null; then
             cat showme/.bootstrap/fix-*.b64 > /tmp/showme-fix.b64
             base64 -d /tmp/showme-fix.b64 | gzip -d > /tmp/showme-fix.patch
-            echo "b6c63a1c2a4e213d652a18fe1f7e7c50616ad71793a25146e4e117c42914a76a  /tmp/showme-fix.patch" | sha256sum -c -
+            echo "2108e89509c169a3ed4f1e895a6a7dd220f634ee0f474811f3ad997eb510cf62  /tmp/showme-fix.patch" | sha256sum -c -
             git apply --check /tmp/showme-fix.patch
             git apply /tmp/showme-fix.patch
           fi
