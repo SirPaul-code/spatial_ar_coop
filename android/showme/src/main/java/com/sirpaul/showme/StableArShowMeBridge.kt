@@ -7,7 +7,6 @@ import com.sirpaul.stablear.arcore.ArCoreAdapter
 import com.sirpaul.stablear.arcore.CameraSample
 import com.sirpaul.stablear.arcore.ObservationContext
 import com.sirpaul.stablear.core.LockState
-import com.sirpaul.stablear.core.PresentedImage
 import com.sirpaul.stablear.core.V2
 import com.sirpaul.stablear.core.V3
 import com.sirpaul.stablear.core.VisualObservation
@@ -15,6 +14,7 @@ import com.sirpaul.stablear.vision.ImageMatch
 import com.sirpaul.stablear.vision.LocalSurfaceTracker
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -28,6 +28,10 @@ import kotlin.math.roundToLong
  * ARCoreAdapter is created and touched only by the GL owner thread. OpenCV receives copied
  * immutable grayscale/context values on one bounded worker. A ShowMe video frame ID is never
  * treated as a StableAR FrameRef ID; the explicit registry below is the only handoff.
+ *
+ * IMPORTANT: the pixel transform used here is the same ShowMeGeometry.uprightToRaw() function
+ * used by RtcVideoPipe when it renders the camera into the WebRTC frame. There is deliberately no
+ * second rotation/crop implementation at the StableAR boundary.
  */
 class StableArShowMeBridge(private val notice: (String) -> Unit) {
     data class Placement(
@@ -35,9 +39,10 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
         val rootWorld: FloatArray,
         val sourceVideoFrameId: Long,
         val initialDepthM: Double,
+        val mode: String,
     )
 
-    private data class FrameValue(val sample: CameraSample, val presented: PresentedImage)
+    private data class FrameValue(val sample: CameraSample, val clockwiseRotation: Int)
     private data class TrackResult(
         val lifecycle: Long,
         val showMeEpoch: Int,
@@ -50,6 +55,7 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
         val sourceVideoFrameId: Long,
         val sourceCapturedNs: Long,
         val initialDepthM: Double,
+        val placementMode: String,
         var acceptedCorrections: Int = 0,
         var rejectedCorrections: Int = 0,
         var visualFailures: Int = 0,
@@ -158,11 +164,11 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
     fun bindVideoFrame(videoFrameId: Long, showMeEpoch: Int, clockwiseRotation: Int, sourceTimestampNs: Long): Boolean {
         owner()
         val sample = lastSample ?: return false
+        if (clockwiseRotation !in setOf(0, 90, 180, 270)) return false
         if (showMeEpoch != lastShowMeEpoch || sourceTimestampNs != lastCameraTimestampNs ||
             sample.ref.cameraTimestampNs != sourceTimestampNs) return false
-        val presented = runCatching { PresentedImage.upright(sample.ref.intrinsics, clockwiseRotation) }.getOrNull() ?: return false
         registry.bind(StableVideoBinding(videoFrameId, showMeEpoch, sample.ref.id, sample.ref.cameraTimestampNs,
-            sample.ref.capturedNs, FrameValue(sample, presented)))
+            sample.ref.capturedNs, FrameValue(sample, clockwiseRotation)))
         return true
     }
 
@@ -194,22 +200,58 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
         frozenSourceRefId = null
     }
 
+    /**
+     * The production placement path. It cannot call the conservative SDK-only place() method.
+     * Browser normalized coordinates are converted with the exact same rotation mapping used by
+     * RtcVideoPipe, then handed to the interactive StableAR depth/layer resolver.
+     */
     fun place(videoFrameId: Long, showMeEpoch: Int, normalizedRoot: DoubleArray): Placement? {
         owner()
-        if (normalizedRoot.size != 2 || normalizedRoot.any { !it.isFinite() || it !in 0.0..1.0 }) return null
-        val sdk = adapter ?: return null
-        val binding = registry.resolve(videoFrameId, showMeEpoch) ?: return null
-        val sample = binding.value.sample
-        // The SDK ledger is authoritative too. If its exact frame has expired, fail closed.
-        if (sdk.history.get(binding.sourceFrameId) != sample.ref) return null
-        val sensorPixel = binding.value.presented.sensorPixel(V2(normalizedRoot[0], normalizedRoot[1]), sample.ref.intrinsics) ?: return null
-        val placed = sdk.place(sample, sensorPixel) ?: return null
-        val world = sdk.worldPoint(placed.attachment.id) ?: run {
-            sdk.remove(placed.attachment.id)
+        if (normalizedRoot.size != 2 || normalizedRoot.any { !it.isFinite() || it !in 0.0..1.0 }) {
+            notice("StableAR placement rejected: invalid browser coordinates")
             return null
         }
-        diagnostics[placed.attachment.id] = Diagnostic(placed.attachment.id, videoFrameId,
-            sample.ref.capturedNs, placed.fit.depth)
+        val sdk = adapter ?: run {
+            notice("StableAR placement rejected: AR session is not ready")
+            return null
+        }
+        val binding = registry.resolve(videoFrameId, showMeEpoch) ?: run {
+            notice("StableAR placement rejected: exact video frame is no longer retained")
+            return null
+        }
+        val sample = binding.value.sample
+        if (sdk.history.get(binding.sourceFrameId) != sample.ref) {
+            notice("StableAR placement rejected: exact AR frame lease expired")
+            return null
+        }
+
+        // RtcVideoPipe uses ShowMeGeometry.uprightToRaw() before ARCore's IMAGE_PIXELS -> texture
+        // transform. Reuse that SAME mapping here, so the pixel helper clicked is the pixel fitted.
+        val raw = ShowMeGeometry.uprightToRaw(
+            normalizedRoot[0].toFloat(), normalizedRoot[1].toFloat(), binding.value.clockwiseRotation)
+        val k = sample.ref.intrinsics
+        val x = (raw[0].toDouble() * k.width).coerceIn(0.0, k.width - 1.0)
+        val y = (raw[1].toDouble() * k.height).coerceIn(0.0, k.height - 1.0)
+        val sensorPixel = V2(x, y)
+
+        val attempt = sdk.placeInteractive(sample, sensorPixel)
+        val placed = attempt.placement ?: run {
+            notice("StableAR placement rejected: ${attempt.reason}")
+            return null
+        }
+        val world = sdk.worldPoint(placed.attachment.id) ?: run {
+            sdk.remove(placed.attachment.id)
+            notice("StableAR placement rejected: ARCore lost the new anchor immediately")
+            return null
+        }
+        diagnostics[placed.attachment.id] = Diagnostic(
+            placed.attachment.id,
+            videoFrameId,
+            sample.ref.capturedNs,
+            placed.fit.depth,
+            attempt.mode,
+            lastReason = attempt.reason,
+        )
         val gray = sample.gray
         if (gray != null && gray.width == sample.ref.intrinsics.width && gray.height == sample.ref.intrinsics.height) {
             val id = placed.attachment.id
@@ -217,10 +259,12 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
                 runCatching { tracker.add(id, gray.bytes, gray.width, gray.height, sensorPixel) }
             }
         } else {
-            diagnostics[placed.attachment.id]?.lastReason = "Depth attachment active; exact-size visual reference unavailable"
+            diagnostics[placed.attachment.id]?.lastReason =
+                "${attempt.reason}; exact-size visual reference unavailable"
         }
         updateDiagnostics(force = true)
-        return Placement(placed.attachment.id, world.floatArray(), videoFrameId, placed.fit.depth)
+        notice("StableAR ${attempt.mode.lowercase(Locale.US)}: ${"%.2f".format(Locale.US, placed.fit.depth)} m")
+        return Placement(placed.attachment.id, world.floatArray(), videoFrameId, placed.fit.depth, attempt.mode)
     }
 
     fun worldPoint(attachmentId: Long): FloatArray? {
@@ -386,6 +430,7 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
                 .put("frameId", d.sourceVideoFrameId)
                 .put("generation", snapshot?.generation ?: JSONObject.NULL)
                 .put("state", snapshot?.state?.name ?: "REMOVED")
+                .put("placementMode", d.placementMode)
                 .put("initialDepthM", d.initialDepthM)
                 .put("currentDepthM", snapshot?.depthM ?: JSONObject.NULL)
                 .put("correctionDisplacementM", if (displacement.isFinite()) displacement else JSONObject.NULL)
