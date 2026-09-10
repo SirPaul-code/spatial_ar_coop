@@ -88,10 +88,14 @@ internal object StableArPlacementMath {
         return doubleArrayOf(points.sumOf { it[0] } / points.size, points.sumOf { it[1] } / points.size)
     }
 
-    /** Preserve ShowMe's existing stroke geometry around one coherent StableAR spatial root. */
-    fun relativeOffsets(world: List<FloatArray>): List<FloatArray>? {
+    /**
+     * Preserve ShowMe's exact historical stroke around the actual StableAR placement point.
+     * The StableAR root reconstructed from the centroid pixel is not assumed to equal the 3D
+     * centroid of all independently reconstructed stroke vertices.
+     */
+    fun relativeOffsets(world: List<FloatArray>, rootWorld: FloatArray): List<FloatArray>? {
+        if (rootWorld.size < 3 || rootWorld.take(3).any { !it.isFinite() }) return null
         if (world.isEmpty() || world.any { it.size < 3 || it.take(3).any { v -> !v.isFinite() } }) return null
-        val center = FloatArray(3) { axis -> world.sumOf { it[axis].toDouble() }.div(world.size).toFloat() }
-        return world.map { p -> FloatArray(3) { axis -> p[axis] - center[axis] } }
+        return world.map { p -> FloatArray(3) { axis -> p[axis] - rootWorld[axis] } }
     }
 }
