@@ -44,18 +44,26 @@ class StableArIntegrationTest {
         assertNull(frames.resolve(13,5));assertEquals(0,frames.frameCount())
     }
 
-    @Test fun oneCoherentStrokeRootPreservesRelativeShapeForPinsArrowsDrawingsAndCircles() {
+    @Test fun oneCoherentStableRootPreservesPinArrowDrawingAndCircleGeometryExactly() {
         val pin=listOf(floatArrayOf(1f,2f,3f))
         val arrow=listOf(floatArrayOf(0f,0f,1f),floatArrayOf(2f,0f,1f))
+        val drawing=listOf(floatArrayOf(-.2f,.3f,1.2f),floatArrayOf(.4f,.7f,1.4f),floatArrayOf(.9f,.1f,1.1f))
         val circle=listOf(floatArrayOf(0f,1f,2f),floatArrayOf(1f,0f,2f),floatArrayOf(0f,-1f,2f),floatArrayOf(-1f,0f,2f))
-        assertArrayEquals(floatArrayOf(0f,0f,0f),StableArPlacementMath.relativeOffsets(pin)!![0],1e-6f)
-        for(shape in listOf(arrow,circle)) {
-            val offsets=StableArPlacementMath.relativeOffsets(shape)!!
-            repeat(3){axis->assertEquals(0.0,offsets.sumOf { it[axis].toDouble() },1e-6)}
+        val pinRoot=floatArrayOf(1f,2f,3f)
+        assertArrayEquals(floatArrayOf(0f,0f,0f),StableArPlacementMath.relativeOffsets(pin,pinRoot)!![0],1e-6f)
+
+        for(shape in listOf(arrow,drawing,circle)) {
+            // Deliberately use a root that is NOT the 3D centroid. The root comes from StableAR's
+            // exact historical centroid pixel reconstruction, not from averaging world vertices.
+            val stableRoot=floatArrayOf(.37f,-.21f,1.83f)
+            val offsets=StableArPlacementMath.relativeOffsets(shape,stableRoot)!!
+            for(i in shape.indices) {
+                val reconstructed=FloatArray(3){axis->stableRoot[axis]+offsets[i][axis]}
+                assertArrayEquals(shape[i],reconstructed,1e-6f)
+            }
             for(i in shape.indices)for(j in shape.indices) {
-                val original=ShowMeGeometry.distance(shape[i],shape[j])
-                val shifted=ShowMeGeometry.distance(offsets[i],offsets[j])
-                assertEquals(original.toDouble(),shifted.toDouble(),1e-6)
+                assertEquals(ShowMeGeometry.distance(shape[i],shape[j]).toDouble(),
+                    ShowMeGeometry.distance(offsets[i],offsets[j]).toDouble(),1e-6)
             }
         }
         val root=StableArPlacementMath.normalizedRoot(listOf(doubleArrayOf(.2,.3),doubleArrayOf(.8,.7)))!!
@@ -94,5 +102,30 @@ class StableArIntegrationTest {
         val command=state.pollSpatialLease()!!
         assertEquals(SpatialLeaseAction.FREEZE,command.action)
         command.answer.complete(false);assertFalse(pending.get())
+    }
+
+    @Test fun helperDisconnectQueuesUnfreezeAndAReplacementHelperCanReconnect() {
+        val state=ShowMeSession();state.begin();state.tracking=true
+        assertTrue(state.join("helper0001","Alice"))
+        val freeze=state.requestSpatialFreeze(44,state.epoch)
+        val freezeCommand=state.pollSpatialLease()!!
+        assertEquals(SpatialLeaseAction.FREEZE,freezeCommand.action)
+        freezeCommand.answer.complete(true);assertTrue(freeze.get())
+        state.leave("helper0001")
+        val release=state.pollSpatialLease()!!
+        assertEquals(SpatialLeaseAction.UNFREEZE,release.action)
+        release.answer.complete(true)
+        assertTrue(state.join("helper0002","Bob"))
+    }
+
+    @Test fun worldResetRejectsPendingAndOldEpochSpatialWork() {
+        val state=ShowMeSession();state.begin();state.tracking=true
+        val oldEpoch=state.epoch
+        val pending=state.requestSpatialFreeze(22,oldEpoch)
+        assertFalse(pending.isDone)
+        state.resetWorld()
+        assertTrue(state.epoch>oldEpoch)
+        assertTrue(pending.isDone);assertFalse(pending.get())
+        assertFalse(state.requestSpatialFreeze(22,oldEpoch).get())
     }
 }
