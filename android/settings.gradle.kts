@@ -6,4 +6,7 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "SpatialNoMap"
-include(":app", ":showme")
+include(":app", ":showme", ":core", ":arcore", ":vision")
+project(":core").projectDir = file("../sdk/core")
+project(":arcore").projectDir = file("../sdk/arcore")
+project(":vision").projectDir = file("../sdk/vision")
