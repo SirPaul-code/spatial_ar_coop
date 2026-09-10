@@ -184,11 +184,13 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
 
     private var lastDepthMs = 0f
     private fun publishVideo(frame: Frame, camera: Camera, strokes: List<StrokeSnapshot>): VideoDepthFrame? {
-        if (!state.active || state.paused) return null
+        // Keep the local AR preview completely independent of WebRTC. In particular, do not create
+        // a second shared EGL surface until an approved helper actually needs encoded video.
+        if (!state.active || state.paused || !state.hasHelper()) return null
         try {
             val dims = camera.imageIntrinsics.imageDimensions
             val pipe = videoPipe ?: RtcVideoPipe(call, dims[0], dims[1], imageRotation).also { videoPipe = it }
-            if (!state.hasHelper() || !pipe.isDue(frame.timestamp, System.nanoTime())) return null
+            if (!pipe.isDue(frame.timestamp, System.nanoTime())) return null
             val id = ++nextFrameId
             val epoch = state.epoch
             val start = System.nanoTime()

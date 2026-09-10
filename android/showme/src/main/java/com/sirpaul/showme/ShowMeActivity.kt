@@ -56,6 +56,7 @@ class ShowMeActivity : Activity() {
     private var destroyed = false
     private var micMuted = false
     private var pendingApproval: Pair<String,String>? = null
+    private var pendingInviteDialog = false
     private val ink = 0xff15191c.toInt()
     private val paper = 0xfff5f4ef.toInt()
     private val accent = 0xffa7ebc9.toInt()
@@ -199,17 +200,24 @@ class ShowMeActivity : Activity() {
         micMuted=!state.voiceEnabled;voice.setMuted(micMuted)
         starting=true
         if(local){launchLocal();return}
+        // Camera preview is the call screen. Do not block it on signaling or Worker latency.
+        renderer.action("clear")
+        home.visibility=View.GONE
+        statusText.text="Starting call"
         notice("Starting your call...")
         val connection=RemoteHostConnection(state,voice,{id,name->runOnUiThread { requestApproval(id,name) }},{text->notice(text)})
         remote=connection
         connection.start(BuildConfig.SHOWME_SERVICE_ORIGIN,settings.getString("installation_token","").orEmpty(),"ShowMe camera",
             onInstallationToken={token->settings.edit().putString("installation_token",token).apply()},onReady={url->
             runOnUiThread {
-                if(destroyed){connection.stop();return@runOnUiThread}
-                invite=url;starting=false;startedAt=monotonicMs();renderer.action("clear");home.visibility=View.GONE
-                state.paused=!foreground;inviteDialog()
+                if(destroyed||isFinishing){connection.stop();return@runOnUiThread}
+                invite=url;starting=false;startedAt=monotonicMs()
+                state.paused=!foreground
+                if(foreground)inviteDialog() else pendingInviteDialog=true
             }
-        },onFailure={message->runOnUiThread {starting=false;connection.stop(false);remote=null;notice(message)}})
+        },onFailure={message->runOnUiThread {
+            starting=false;connection.stop(false);remote=null;state.end();home.visibility=View.VISIBLE;notice(message)
+        }})
     }
     private fun requestApproval(id:String,name:String) {
         if(destroyed||!state.active)return
@@ -242,12 +250,17 @@ class ShowMeActivity : Activity() {
     }
     private fun inviteDialog() {
         if(invite.isBlank()||!state.active)return
+        if(destroyed||isFinishing||!foreground){pendingInviteDialog=true;return}
+        pendingInviteDialog=false
         val column=LinearLayout(this).apply {orientation=LinearLayout.VERTICAL;setPadding(d(22),d(12),d(22),d(8))}
-        val qr=MultiFormatWriter().encode(invite,BarcodeFormat.QR_CODE,360,360)
-        val bitmap=Bitmap.createBitmap(360,360,Bitmap.Config.ARGB_8888)
-        val pixels=IntArray(360*360){i->if(qr[i%360,i/360])Color.BLACK else Color.WHITE}
-        bitmap.setPixels(pixels,0,360,0,0,360,360)
-        column.addView(ImageView(this).apply {setImageBitmap(bitmap)},LinearLayout.LayoutParams(d(190),d(190)).apply {gravity=Gravity.CENTER_HORIZONTAL})
+        // A QR rendering failure must never terminate the call UI; Share/Copy still work.
+        runCatching {
+            val qr=MultiFormatWriter().encode(invite,BarcodeFormat.QR_CODE,360,360)
+            val bitmap=Bitmap.createBitmap(360,360,Bitmap.Config.ARGB_8888)
+            val pixels=IntArray(360*360){i->if(qr[i%360,i/360])Color.BLACK else Color.WHITE}
+            bitmap.setPixels(pixels,0,360,0,0,360,360)
+            column.addView(ImageView(this).apply {setImageBitmap(bitmap)},LinearLayout.LayoutParams(d(190),d(190)).apply {gravity=Gravity.CENTER_HORIZONTAL})
+        }
         column.addView(label(if(state.internet)"Open in any browser. You approve who joins." else "Open on the same Wi-Fi or hotspot. Browser microphone needs Internet mode.",13f,Color.WHITE)
             .apply {setPadding(0,d(18),0,d(12));gravity=Gravity.CENTER})
         AlertDialog.Builder(this).setTitle("Invite someone").setView(column).setPositiveButton("Share link"){_,_->shareInvite()}
@@ -283,9 +296,14 @@ class ShowMeActivity : Activity() {
             session.resume();renderer.arSession=session;renderer.resumed=true;gl.onResume()
         }catch(e:Exception){notice("Camera setup: ${e.message?:e.javaClass.simpleName}")}
     }
-    override fun onResume(){super.onResume();foreground=true;resumeAr()
+    override fun onResume(){super.onResume();foreground=true
+        // Do not open the camera merely by opening the app. Resume it only for an active/start-in-progress call.
+        if(state.active||starting||pendingLocal!=null)resumeAr()
         if(resumeSharing&&state.active){state.paused=false;voice.setMuted(micMuted)};resumeSharing=false
         pendingApproval?.let{pendingApproval=null;requestApproval(it.first,it.second)}
+        if(pendingInviteDialog&&state.active&&invite.isNotBlank())handler.post {
+            if(foreground&&!destroyed&&!isFinishing)inviteDialog()
+        }
     }
     override fun onPause(){
         foreground=false;resumeSharing=state.active&&!state.paused
