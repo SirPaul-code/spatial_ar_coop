@@ -26,6 +26,13 @@ jobs:
           echo "7d4a470eb81761679d25398b8849d0266e269ffa7c856d2d596fa19f20b53a31  /tmp/showme.patch" | sha256sum -c -
           git apply --check /tmp/showme.patch
           git apply /tmp/showme.patch
+          if compgen -G "showme/.bootstrap/fix-*.b64" > /dev/null; then
+            cat showme/.bootstrap/fix-*.b64 > /tmp/showme-fix.b64
+            base64 -d /tmp/showme-fix.b64 | gzip -d > /tmp/showme-fix.patch
+            echo "447d6586d1606c78ef1397da178044db1bfd3aebfa080c68a008715a7664492d  /tmp/showme-fix.patch" | sha256sum -c -
+            git apply --check /tmp/showme-fix.patch
+            git apply /tmp/showme-fix.patch
+          fi
           # GITHUB_TOKEN pushes should not be responsible for changing workflow definitions.
           # The canonical ShowMe CI workflow is updated separately after this release.
           git checkout HEAD -- .github/workflows/showme-ci.yml
