@@ -198,7 +198,7 @@ class ShowMeRenderer(private val state: ShowMeSession, private val overlay: Show
                 ?: return ShowMeSession.failure("INVALID_DRAWING", "Drawing coordinates are invalid.")
             val placement = stableAr.place(packet.id, state.epoch, root)
                 ?: return ShowMeSession.failure("NO_SURFACE", "StableAR could not retain the exact surface under this historical frame. Resume live view and try again.")
-            val offsets = StableArPlacementMath.relativeOffsets(world)
+            val offsets = StableArPlacementMath.relativeOffsets(world, placement.rootWorld)
             if (offsets == null) {
                 stableAr.remove(placement.attachmentId)
                 return ShowMeSession.failure("NO_SURFACE", "The drawing geometry could not be retained.")
