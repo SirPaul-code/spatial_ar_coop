@@ -63,7 +63,9 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
     private var boundSession: Session? = null
     private var adapter: ArCoreAdapter? = null
     private val registry = StableArFrameRegistry<FrameValue>()
-    private val tracker = LocalSurfaceTracker()
+    // Do not touch OpenCV native code while ShowMeActivity is still constructing its UI.
+    // OpenCVLoader.initLocal() runs later in onCreate, before any AR frame can reach this bridge.
+    private val tracker by lazy(LazyThreadSafetyMode.NONE) { LocalSurfaceTracker() }
     private val worker = Executors.newSingleThreadExecutor { task ->
         Thread({ android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); task.run() }, "ShowMe-StableAR-CV")
     }
@@ -301,7 +303,7 @@ class StableArShowMeBridge(private val notice: (String) -> Unit) {
         lifecycle.incrementAndGet()
         results.clear()
         if (!worker.isShutdown) {
-            queueWorker { tracker.close() }
+            queueWorker { runCatching { tracker.close() } }
             worker.shutdown()
         }
     }
