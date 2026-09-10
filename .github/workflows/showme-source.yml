@@ -1,0 +1,25 @@
+name: showme-source-bundle
+on:
+  push:
+    branches: [showme/remote-assistance]
+    paths: [.github/workflows/showme-source.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle committed source without checkout credentials
+        run: git archive --format=tar HEAD > showme-source.tar
+      - name: Include pinned WebRTC API sources for integration review
+        run: curl --fail --location --retry 2 https://repo.maven.apache.org/maven2/io/github/webrtc-sdk/android/144.7559.09/android-144.7559.09-sources.jar -o webrtc-sources.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: showme-source-bundle
+          path: |
+            showme-source.tar
+            webrtc-sources.jar
+          retention-days: 3
