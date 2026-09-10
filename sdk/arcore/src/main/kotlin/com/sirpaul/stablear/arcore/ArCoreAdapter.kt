@@ -60,13 +60,11 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
     fun freeze(frameId: Long): FrameRef? { owner(); return history.freeze(frameId) }
     fun unfreeze(frameId: Long) { owner(); history.unfreeze(frameId) }
 
-    /** Strict research placement contract. */
-    fun place(sample: CameraSample,pixel: V2): Placement? {
-        owner(); if(attachments.size>=64) return null
-        val cameraNow=history.currentWorldFromCamera(sample.ref) ?: return null
-        val fit=SurfaceFitter.fit(sample.ref.intrinsics,pixel,sample.depth) ?: return null
-        return createPlacement(sample,pixel,cameraNow,fit)
-    }
+    /**
+     * Placement for application use. Try the strict research fit first, then the bounded
+     * evidence-based interactive fit for sparse/one-sided real-world depth support.
+     */
+    fun place(sample: CameraSample,pixel: V2): Placement? = placeInteractive(sample,pixel).placement
 
     /**
      * User-facing placement: strict fit first, then a bounded edge-aware fit based only on measured
