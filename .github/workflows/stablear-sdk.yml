@@ -30,7 +30,11 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
+          cache-read-only: false
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
       - name: Android SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
       - name: Snapshot primary licence notices
@@ -39,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          gradle -p sdk --no-daemon :core:check :core:jar :arcore:assembleRelease :vision:assembleRelease :arcore:lintRelease :vision:lintRelease :demo:lintDebug :demo:assembleDebug 2>&1 | tee stablear-build.log
+          gradle -p sdk --no-daemon --continue :core:check :core:jar :arcore:assembleRelease :vision:assembleRelease :arcore:lintRelease :vision:lintRelease :demo:lintDebug :demo:assembleDebug 2>&1 | tee stablear-build.log
       - name: Exact dependency inventory and licence evidence
         shell: bash
         run: |
@@ -54,6 +58,7 @@ jobs:
           "$TOOLS/aapt" dump permissions sdk/demo/build/outputs/apk/debug/demo-debug.apk > stablear-permissions.txt
           if grep -E 'android.permission.(INTERNET|RECORD_AUDIO|ACCESS_FINE_LOCATION|NEARBY_WIFI_DEVICES)' stablear-permissions.txt; then exit 1; fi
           git rev-parse HEAD > sdk/build/compliance/built-commit.txt
+          git archive --format=zip HEAD sdk .github/workflows/stablear-sdk.yml > sdk/build/stablear-source.zip
       - name: SDK and demo artifacts - never a shared release/tag
         uses: actions/upload-artifact@v4
         with:
@@ -63,6 +68,7 @@ jobs:
             sdk/arcore/build/outputs/aar/*.aar
             sdk/vision/build/outputs/aar/*.aar
             sdk/demo/build/outputs/apk/debug/*.apk
+            sdk/build/stablear-source.zip
             sdk/build/compliance/
           if-no-files-found: error
           retention-days: 30

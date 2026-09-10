@@ -45,7 +45,7 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
         val k=frame.camera.calibration()
         val ref=history.capture(frame.camera.worldFromCv(),k,frame.timestamp) ?: return null
         val samples=sampleDepth(frame,k)
-        val gray=if(copyGray) copyGray(frame) else null
+        val gray=if(copyGray) Companion.copyGray(frame) else null
         return CameraSample(ref,samples,gray)
     }
     fun freeze(frameId: Long): FrameRef? { owner(); return history.freeze(frameId) }
@@ -74,7 +74,8 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
     fun observe(id: Long,observation: VisualObservation): LockDecision {
         owner(); val s=engine.snapshot(id)
         if(attachments[id]?.trackingState!=TrackingState.TRACKING) return LockDecision(false,"Anchor is not tracking",s)
-        pending[id]?.let { proposal ->
+        val proposal=pending[id]
+        if(proposal!=null) {
             if(observation.generation!=proposal.generation) pending.remove(id)
             else {
                 val decision=engine.commit(proposal,observation)
@@ -109,13 +110,13 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
         } catch(_: Exception) { null }
 
         fun sampleDepth(frame: Frame,k: Intrinsics): List<DepthSample> {
-            val result=ArrayList<DepthSample>(5000)
+            val result=ArrayList<DepthSample>(8000)
             fun read(image: android.media.Image,confidence: android.media.Image?,origin: DepthOrigin) {
                 if(image.timestamp<=0 || image.width*image.height>1024*1024) return
                 if(confidence!=null && (confidence.width!=image.width || confidence.height!=image.height)) return
                 val p=image.planes[0]; val b=p.buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN); val start=b.position()
                 val cp=confidence?.planes?.get(0); val cb=cp?.buffer?.duplicate(); val cs=cb?.position() ?: 0
-                val step=ceil(sqrt(image.width.toDouble()*image.height/2500)).toInt().coerceAtLeast(1)
+                val step=ceil(sqrt(image.width.toDouble()*image.height/8000)).toInt().coerceAtLeast(1)
                 val coordinates=FloatArray(6)
                 frame.transformCoordinates2d(Coordinates2d.TEXTURE_NORMALIZED,floatArrayOf(0f,0f,1f,0f,0f,1f),Coordinates2d.IMAGE_PIXELS,coordinates)
                 val source=EvidenceId(origin,image.timestamp)

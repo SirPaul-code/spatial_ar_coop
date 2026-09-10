@@ -47,7 +47,17 @@ def archive_evidence(data: bytes,prefix: str,out: pathlib.Path):
         for item in z.infolist():
             if item.is_dir(): continue
             if item.filename.endswith('.so'):
-                native.append({'path':item.filename,'sha256':sha(z.read(item))})
+                content=z.read(item)
+                record={'path':item.filename,'sha256':sha(content)}
+                marker=b'General configuration for OpenCV'
+                at=content.find(marker)
+                if at>=0:
+                    end=content.find(b'\0',at)
+                    summary=content[at:end if 0<end-at<100000 else at+100000]
+                    target=prefix+'-'+re.sub('[^a-zA-Z0-9_.-]','_',item.filename)+'.build-info.txt'
+                    (out/target).write_bytes(summary)
+                    record['embeddedBuildInfo']=target
+                native.append(record)
             elif re.search(r'(^|[/_.-])(license|licence|notice|copying|copyright)',item.filename,re.I):
                 content=z.read(item)
                 target=prefix+'-'+re.sub('[^a-zA-Z0-9_.-]','_',item.filename)
@@ -77,6 +87,9 @@ def main():
             policy=POLICY.get(group)
             if policy: entry.update(policy=policy[0],primarySource=policy[1])
             else: entry['policy']='REVIEW_REQUIRED'; unknown.append(entry['purl'])
+            if entry['pom'].get('error') or not entry['pom'].get('licenses'):
+                entry['metadataReview']='Missing licence metadata; explicit review required'
+                unknown.append(entry['purl']+' (POM licence unavailable)')
         if path.exists():
             data=path.read_bytes(); entry['sha256']=sha(data)
             entry['embeddedNotices'],entry['nativeLibraries']=archive_evidence(data,group+'-'+name+'-'+version,evidence)
@@ -86,6 +99,7 @@ def main():
         'commercialReleaseCleared':False,
         'releaseBlockers':['Owner commercial licence/EULA not finalized',
             'ARCore host terms acceptance, user disclosure and independent-value review',
+            'Android SDK toolchain agreement sections 3.2 and 3.5 distribution-model review',
             'Native OpenCV and ARCore subcomponent provenance must be reconciled with exact binary notices'],
         'scope':'Actual resolved SDK/demo runtime and compile artifacts; build tools are documented separately. No model weights included.'}
     (out/'license-report.json').write_text(json.dumps(report,indent=2)+'\n')
