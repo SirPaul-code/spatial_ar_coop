@@ -7,9 +7,8 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.LinkedHashMap
+import java.util.ArrayDeque
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicInteger
 
 fun monotonicMs(): Long = System.nanoTime() / 1_000_000L
 
@@ -34,6 +33,7 @@ fun projectStrokes(frame: CapturedFrame, rotation: Int, strokes: List<StrokeSnap
             val raw = ShowMeGeometry.project(frame, p)
             if (raw == null) { valid = false; break }
             val xy = ShowMeGeometry.rawToUpright(raw[0] / frame.intrinsics.width, raw[1] / frame.intrinsics.height, rotation)
+            if (xy.any { !it.isFinite() }) { valid = false; break }
             points.put(JSONArray().put(xy[0].toDouble()).put(xy[1].toDouble()))
         }
         if (valid) out.put(JSONObject().put("id", stroke.id).put("tool", stroke.tool).put("color", stroke.color)
@@ -54,9 +54,11 @@ class FrameHistory(private val clock: () -> Long = ::monotonicMs) {
     @Synchronized fun get(id: Long): FramePacket? {
         val held = pinned
         if (held?.id == id && clock() <= pinDeadline) return held
-        return frames[id]?.takeIf { clock() - it.capturedMs <= 8_000L }
+        return frames[id]?.takeIf { clock() - it.capturedMs in 0L..8_000L }
     }
     @Synchronized fun pin(id: Long): Boolean {
+        // Repeating a freeze request must not extend one historical image forever.
+        if (pinned?.id == id) return clock() <= pinDeadline
         val frame = get(id) ?: return false
         pinned = frame; pinDeadline = clock() + 60_000L
         return true
@@ -68,8 +70,7 @@ class FrameHistory(private val clock: () -> Long = ::monotonicMs) {
 class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     val frames = FrameHistory(clock)
     data class Command(val body: JSONObject, val answer: CompletableFuture<JSONObject>)
-    val commands = ConcurrentLinkedQueue<Command>()
-    private val pending = AtomicInteger()
+    private val commands = ArrayDeque<Command>()
     private val random = SecureRandom()
     @Volatile var active = false
         private set
@@ -103,31 +104,35 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         active = false; token = ""; helperId = ""; helperName = ""; helperSeenMs = 0L
         voiceState = "OFF"; frames.clear(); applied.clear()
         while (true) {
-            val c = commands.poll() ?: break
-            pending.decrementAndGet(); c.answer.complete(failure("SESSION_ENDED", "The camera owner ended this session."))
+            val command = commands.pollFirst() ?: break
+            command.answer.complete(failure("SESSION_ENDED", "The camera owner ended this session."))
         }
     }
     @Synchronized fun resetWorld() {
         epoch += 1; frames.clear(); applied.clear()
+        while (true) {
+            val command = commands.pollFirst() ?: break
+            command.answer.complete(failure("WORLD_CHANGED", "The AR camera session changed. Please try again."))
+        }
     }
-    fun authorized(value: String): Boolean = active && clock() < expiresMs && token.isNotBlank() &&
+    @Synchronized fun authorized(value: String): Boolean = active && clock() < expiresMs && token.isNotBlank() &&
         MessageDigest.isEqual(token.toByteArray(Charsets.UTF_8), value.toByteArray(Charsets.UTF_8))
     @Synchronized fun join(id: String, name: String): Boolean {
-        if (!id.matches(Regex("[A-Za-z0-9-]{8,80}"))) return false
+        if (!active || clock() >= expiresMs || !id.matches(Regex("[A-Za-z0-9-]{8,80}"))) return false
         if (helperId.isNotBlank() && helperId != id && clock() - helperSeenMs < 15_000L) return false
         helperId = id; helperName = name.filter { !it.isISOControl() }.take(32).ifBlank { "Helper" }
         helperSeenMs = clock()
         return true
     }
     @Synchronized fun heartbeat(id: String): Boolean {
-        if (id != helperId || id.isBlank()) return false
+        if (!active || clock() >= expiresMs || id != helperId || id.isBlank()) return false
         helperSeenMs = clock(); return true
     }
     @Synchronized fun leave(id: String) {
         if (id == helperId) { helperId = ""; helperName = ""; helperSeenMs = 0L; frames.unpin() }
     }
-    @Synchronized fun hasHelper(): Boolean = helperId.isNotBlank() && clock() - helperSeenMs < 15_000L
-    fun info(): JSONObject = JSONObject().put("active", active && clock() < expiresMs).put("paused", paused)
+    @Synchronized fun hasHelper(): Boolean = active && helperId.isNotBlank() && clock() - helperSeenMs < 15_000L
+    @Synchronized fun info(): JSONObject = JSONObject().put("active", active && clock() < expiresMs).put("paused", paused)
         .put("tracking", tracking).put("trackingMessage", trackingMessage).put("epoch", epoch)
         .put("hostName", hostName).put("helper", if (hasHelper()) helperName else "")
         .put("annotations", annotationCount).put("voiceEnabled", voiceEnabled).put("voiceState", voiceState)
@@ -137,15 +142,15 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         applied[id] = result
         while (applied.size > 256) applied.remove(applied.keys.first())
     }
-    fun submit(body: JSONObject): CompletableFuture<JSONObject> {
+    /** Admission and draining share the same lock; session end cannot race a queue counter. */
+    @Synchronized fun submit(body: JSONObject): CompletableFuture<JSONObject> {
         val result = CompletableFuture<JSONObject>()
-        if (!active || pending.incrementAndGet() > 32) {
-            if (active) pending.decrementAndGet()
+        if (!active || clock() >= expiresMs || commands.size >= 32) {
             result.complete(failure("BUSY", "Session is unavailable. Please retry.")); return result
         }
-        commands.add(Command(body, result)); return result
+        commands.addLast(Command(body, result)); return result
     }
-    fun poll(): Command? = commands.poll()?.also { pending.decrementAndGet() }
+    @Synchronized fun poll(): Command? = commands.pollFirst()
 
     companion object {
         val TOOLS = setOf("pin", "arrow", "draw", "circle")
@@ -157,7 +162,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
             if (tool !in TOOLS || body.optString("color") !in COLORS) return "Unknown drawing tool or color"
             if (body.optString("label").length > 64) return "Label is too long"
             val points = body.optJSONArray("points") ?: return "Missing points"
-            if (points.length() !in 1..96 || (tool != "pin" && points.length() < 2)) return "Invalid point count"
+            if (points.length() !in 1..96 || (tool == "pin" && points.length() != 1) || (tool != "pin" && points.length() < 2)) return "Invalid point count"
             for (i in 0 until points.length()) {
                 val p = points.optJSONArray(i) ?: return "Invalid point"
                 if (p.length() != 2) return "Invalid point"
