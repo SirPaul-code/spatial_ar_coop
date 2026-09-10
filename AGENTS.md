@@ -1,29 +1,29 @@
-# Spatial Sync agent handoff
+# ShowMe branch handoff
 
-Before changing this repository, read these in order:
+This branch is `showme/remote-assistance`. Read `docs/SHOWME.md` first, then `docs/CURRENT_RUNTIME.md`. `docs/AGENT_CONTEXT.md` documents the original Spatial Sync pipeline/history and is not the ShowMe product specification.
 
-1. `docs/CURRENT_RUNTIME.md` — authoritative short delta for the current physical runtime and the latest presentation/tracking changes.
-2. `docs/AGENT_CONTEXT.md` — long-form architecture/history and continuation context.
-3. `docs/SPATIAL_WORLD_DEMO.md` — only when changing WORLD/Bird's Eye presentation behavior.
+## Boundaries
 
-## Non-negotiable project rules
+- ShowMe starts from Spatial Sync commit `a5970e9be7fef9434dbf2e681274dc56c9462fe4`.
+- Do not change `android/app/**` or `.github/workflows/ci.yml` while implementing ShowMe. Its original two-phone alignment, Wi-Fi Aware, vehicles and surface pipeline must remain intact. CI checks this diff.
+- ShowMe is a separate Android application module `:showme`, package `com.sirpaul.showme`, not a rename/replacement of Spatial Sync.
+- The `outdoor/gnss-global` and `fresh/no-map-runtime-poc` branches are not targets for ShowMe commits.
+- ShowMe releases go to `showme-latest`, never `latest-dev`.
+- No Google Cloud Anchors. Only the camera owner's ARCore world is needed; the browser has no AR world and does not perform two-device alignment.
+- Remote input always carries the exact displayed frame ID and AR epoch. Never hit-test an old browser pixel against a new camera frame.
+- Invalid/expired frame, missing depth, discontinuity, lost tracking or world reset must reject the drawing. Never invent a fixed-distance plane to make a demo look successful.
+- Drawings remain 3D geometry attached to local ARCore anchors. Browser overlay geometry must originate from those anchors, not a permanent screen-space sketch.
+- Optional visual/depth/edge verification runs separately from GL/networking and has bounded correction limits. It is not evidence of guaranteed centimetre accuracy.
+- Local HTTP supports video and drawing on a trusted LAN. Browser microphone capture requires trusted HTTPS. Do not remove browser security checks or claim a self-signed certificate is universally trusted.
+- Session tokens are ephemeral bearer capabilities. No analytics, cloud image uploads or silent audio capture.
+- All user-visible UI is English. Native/browser permission prompts are explicit.
+- Never claim hardware validation from CI alone. Inspect final CI and release assets before claiming APK availability.
+- Update `docs/SHOWME.md` after meaningful changes and describe unimplemented production features honestly.
 
-- Working branch: `fresh/no-map-runtime-poc` unless the user explicitly changes it.
-- No Google Cloud Anchors, no required external server, no pre-scanned map.
-- ARCore `Anchor` objects are local anchors only.
-- Prefer spatial correctness and stability over bandwidth, compute, battery use, APK size, or elegance.
-- Manual targets are additive; a new target must not replace an old one.
-- Cars/persons are dynamic tracks, not permanent static ARCore anchors.
-- Keep all product UI text in English.
-- Wire protocol is V6; both phones must run the same build.
-- The current CREATE/JOIN -> Wi-Fi Aware -> acquisition burst -> host-canonical LOCKED path is a physically proven baseline. Do not modify `WifiAwarePeerTransport`, peer handshake, or startup alignment while working on vehicle presentation or target-surface precision unless a new physical failure specifically points there.
-- Vehicle dedupe is room-level: the same physical vehicle must converge to one shared track id/owner, coast briefly through missed detections, then expire after the memory TTL.
-- Manual-target precision is layered: ARCore placement -> visual/metric surface resolver -> bounded multi-view surface atlas -> optional fail-closed edge snap. These target-level refinements must never participate in shared-world startup alignment.
-- Host-first canonical alignment, peer bootstrap, acquisition bursts, range/gravity sanity, and fail-closed placement are intentional. Do not replace them with blind threshold relaxation.
-- Physical alignment failures must be diagnosed from `quality.ndjson`, `events.ndjson`, and replayable `frames.spv6` before changing alignment gates.
-- The `WORLD` view must visualize real current shared-world data; do not fake/pre-bake its map or actor positions.
-- `SharedRoomState` is N-peer ready, but current `WifiAwarePeerTransport` is still one active physical peer/socket. Do not claim live 3+ phone fan-out until that transport boundary is actually refactored.
-- Do not claim CI/release is ready until the final GitHub Action succeeds and `latest-dev` targets the final branch HEAD.
-- After substantial runtime changes, update `docs/CURRENT_RUNTIME.md`; update `docs/AGENT_CONTEXT.md` when the architecture itself changes.
+## Build
 
-Always inspect current branch HEAD, recent commits, CI and `latest-dev` before continuing. The last known-good alignment/placement baseline before the current vehicle/precision layer was `02fc3c4ae145e25fb429936da94b68a8aa020f38` (`fix: keep golden alignment and harden manual POI placement`).
+From `android/`: `./gradlew :showme:testDebugUnitTest :showme:lintDebug :showme:lintRelease :showme:assembleDebug :showme:assembleRelease`.
+
+Browser math: `node --test showme/web/geometry.test.mjs` from root. Browser integration: install `showme/package.json` dependencies and run `npm run test:browser` inside `showme/`.
+
+Current code and CI are authoritative; this handoff intentionally does not invent a future successful run or physical acceptance result.

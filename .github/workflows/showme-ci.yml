@@ -1,0 +1,120 @@
+name: showme-local-ci
+
+on:
+  push:
+    branches: [showme/remote-assistance]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: showme-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Guard the existing spatial runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code a5970e9be7fef9434dbf2e681274dc56c9462fe4 -- android/app .github/workflows/ci.yml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Browser geometry unit tests
+        run: node --test showme/web/geometry.test.mjs
+      - name: Browser integration dependencies
+        working-directory: showme
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Browser interaction and layout smoke test
+        working-directory: showme
+        run: npm run test:browser
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: ShowMe unit tests, lint and APKs
+        working-directory: android
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :showme:testDebugUnitTest :showme:lintDebug :showme:lintRelease :showme:assembleDebug :showme:assembleRelease 2>&1 | tee ../showme-build.log
+      - name: Verify separate application identity and stable trial signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          EXPECTED="9e752e4f1ae0d9f1dd72b17a3d72d88e82e54075651dc268657877a0e73eaf3a"
+          : > showme-signatures.txt
+          for APK in android/showme/build/outputs/apk/debug/showme-debug.apk android/showme/build/outputs/apk/release/showme-release.apk; do
+            "$TOOLS/apksigner" verify --verbose --print-certs "$APK" | tee -a showme-signatures.txt
+            ACTUAL=$("$TOOLS/apksigner" verify --print-certs "$APK" | grep -i "Signer #1 certificate SHA-256 digest:" | head -1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]')
+            test "$ACTUAL" = "$EXPECTED"
+            "$TOOLS/aapt" dump badging "$APK" | grep "package: name='com.sirpaul.showme'"
+          done
+          if "$TOOLS/aapt" dump badging android/showme/build/outputs/apk/release/showme-release.apk | grep -q application-debuggable; then exit 1; fi
+      - name: Upload diagnostics and browser screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showme-diagnostics
+          path: |
+            showme-build.log
+            showme-signatures.txt
+            showme/test-results/
+            android/showme/build/reports/
+            android/showme/build/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload signed ShowMe APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: showme-signed-apks
+          path: android/showme/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish isolated ShowMe release
+        if: github.ref == 'refs/heads/showme/remote-assistance'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp android/showme/build/outputs/apk/debug/showme-debug.apk ShowMe-latest-dev.apk
+          cp android/showme/build/outputs/apk/release/showme-release.apk ShowMe-latest-release.apk
+          sha256sum ShowMe-latest-dev.apk ShowMe-latest-release.apk > SHOWME-SHA256SUMS.txt
+          zip -j ShowMe-browser.zip showme/web/index.html showme/web/style.css showme/web/app.js showme/web/geometry.mjs
+          cat > SHOWME-RELEASE.md <<EOF
+          ShowMe local preview from \`showme/remote-assistance\` at \`$GITHUB_SHA\`.
+
+          Install \`ShowMe-latest-release.apk\` on the camera owner's Android phone. The helper opens the invitation in a browser on the same Wi-Fi or hotspot; no helper APK is required.
+
+          - Separate application ID: \`com.sirpaul.showme\` (coexists with Spatial Sync).
+          - Browser desktop/mobile smoke tests and geometry tests passed.
+          - Android unit tests and debug/release lint passed.
+          - Both APK signatures verified; release APK is non-debuggable.
+          - Frame-exact pins, arrows, freehand drawings and circles use historical depth and local ARCore anchors.
+          - HTTP local mode: video and drawings. Browser microphone requires trusted HTTPS; local HTTPS/trusted PKCS12 options included.
+          - No external hosting, internet-room connectivity, login or billing is provisioned.
+          - Real phone/browser spatial and audio acceptance tests are still required. CI is not a hardware accuracy guarantee.
+          - Uses a public trial signing key; NOT a production Play signing identity.
+
+          Existing Spatial Sync \`latest-dev\` and the outdoor branch are unchanged.
+          EOF
+          gh release delete showme-latest --cleanup-tag -y || true
+          gh release create showme-latest ShowMe-latest-release.apk ShowMe-latest-dev.apk ShowMe-browser.zip SHOWME-SHA256SUMS.txt showme-signatures.txt \
+            --target "$GITHUB_SHA" --prerelease --latest=false --title "ShowMe - local camera assistance preview" --notes-file SHOWME-RELEASE.md
