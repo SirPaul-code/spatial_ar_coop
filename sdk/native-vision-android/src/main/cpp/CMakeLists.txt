@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.22)
 project(StableARVisionAndroid LANGUAGES C CXX)
-# Android Gradle Prefab package name comes from prefab.json (`opencv`), not from
-# desktop OpenCVConfig.cmake. This creates opencv::opencv_java4.
-find_package(opencv REQUIRED CONFIG)
+# The official org.opencv:opencv Android AAR exposes Prefab package `OpenCV`
+# with module `opencv_java4`. Its native binary requires c++_shared; that STL
+# selection is configured by this Android module's Gradle build.
+find_package(OpenCV REQUIRED CONFIG)
 set(STABLEAR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(STABLEAR_VISION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../../native-vision ${CMAKE_CURRENT_BINARY_DIR}/stablear-native-vision)
