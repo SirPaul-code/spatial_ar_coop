@@ -89,12 +89,14 @@ internal object StableArPlacementMath {
     }
 
     /**
-     * Preserve ShowMe's exact historical stroke around the actual StableAR placement point.
-     * The StableAR root reconstructed from the centroid pixel is not assumed to equal the 3D
-     * centroid of all independently reconstructed stroke vertices.
+     * A single-point pin is the StableAR root itself. Never preserve a legacy reconstructed
+     * world position as an offset, because doing so algebraically cancels StableAR's depth.
+     * Multi-point tools still preserve their historical shape around the StableAR root until
+     * their complete geometry is migrated to SDK-owned reconstruction.
      */
     fun relativeOffsets(world: List<FloatArray>, rootWorld: FloatArray): List<FloatArray>? {
         if (rootWorld.size < 3 || rootWorld.take(3).any { !it.isFinite() }) return null
+        if (world.size == 1) return listOf(floatArrayOf(0f, 0f, 0f))
         if (world.isEmpty() || world.any { it.size < 3 || it.take(3).any { v -> !v.isFinite() } }) return null
         return world.map { p -> FloatArray(3) { axis -> p[axis] - rootWorld[axis] } }
     }
