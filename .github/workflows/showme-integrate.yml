@@ -1,0 +1,35 @@
+name: showme-reviewed-source-integration
+on:
+  push:
+    branches: [showme/remote-assistance]
+    paths: [showme/.webrtc-upgrade/**]
+permissions:
+  contents: write
+jobs:
+  integrate:
+    if: contains(github.event.head_commit.message, '[stage-only]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and apply the reviewed source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat showme/.webrtc-upgrade/part-{0,1,2,3} | xz -d > "$RUNNER_TEMP/showme.patch"
+          echo "842da0442b3f57fbf210025db6cd23f7243097716e1439a52d8032e49525e62b  $RUNNER_TEMP/showme.patch" | sha256sum -c -
+          git apply --check --unidiff-zero "$RUNNER_TEMP/showme.patch"
+          git apply --unidiff-zero "$RUNNER_TEMP/showme.patch"
+          git diff --exit-code a5970e9be7fef9434dbf2e681274dc56c9462fe4 -- android/app .github/workflows/ci.yml
+          git rm -r showme/.webrtc-upgrade
+          git add -- .gitignore AGENTS.md android/showme docs showme
+          git diff --cached --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(showme): replace JPEG live polling with frame-linked GPU WebRTC video'
+          git fetch origin showme/remote-assistance
+          test "$(git rev-parse origin/showme/remote-assistance)" = "$GITHUB_SHA"
+          git push origin HEAD:refs/heads/showme/remote-assistance
+          echo "Integrated source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

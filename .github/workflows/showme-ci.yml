@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   verify-build-release:
+    if: "!contains(github.event.head_commit.message, '[stage-only]')"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -29,7 +30,7 @@ jobs:
         with:
           node-version: '22'
       - name: Browser geometry unit tests
-        run: node --test showme/web/geometry.test.mjs
+        run: node --test showme/web/*.test.mjs
       - name: Browser integration dependencies
         working-directory: showme
         run: |
@@ -97,9 +98,9 @@ jobs:
           cp android/showme/build/outputs/apk/debug/showme-debug.apk ShowMe-latest-dev.apk
           cp android/showme/build/outputs/apk/release/showme-release.apk ShowMe-latest-release.apk
           sha256sum ShowMe-latest-dev.apk ShowMe-latest-release.apk > SHOWME-SHA256SUMS.txt
-          zip -j ShowMe-browser.zip showme/web/index.html showme/web/style.css showme/web/app.js showme/web/geometry.mjs
+          zip -j ShowMe-browser.zip showme/web/index.html showme/web/style.css showme/web/app.js showme/web/geometry.mjs showme/web/live-video.mjs
           cat > SHOWME-RELEASE.md <<EOF
-          ShowMe local preview from \`showme/remote-assistance\` at \`$GITHUB_SHA\`.
+          ShowMe WebRTC build from \`showme/remote-assistance\` at \`$GITHUB_SHA\`.
 
           Install \`ShowMe-latest-release.apk\` on the camera owner's Android phone. The helper opens the invitation in a browser on the same Wi-Fi or hotspot; no helper APK is required.
 
@@ -107,7 +108,8 @@ jobs:
           - Browser desktop/mobile smoke tests and geometry tests passed.
           - Android unit tests and debug/release lint passed.
           - Both APK signatures verified; release APK is non-debuggable.
-          - Frame-exact pins, arrows, freehand drawings and circles use historical depth and local ARCore anchors.
+          - Real WebRTC video (30-fps target), GPU camera capture, audio/data and frame-exact AR annotations.
+          - Browser tests exercise an actual RTP encode/decode connection with synthetic camera/depth fixtures; no native-device performance guarantee.
           - HTTP local mode: video and drawings. Browser microphone requires trusted HTTPS; local HTTPS/trusted PKCS12 options included.
           - No external hosting, internet-room connectivity, login or billing is provisioned.
           - Real phone/browser spatial and audio acceptance tests are still required. CI is not a hardware accuracy guarantee.
@@ -117,4 +119,4 @@ jobs:
           EOF
           gh release delete showme-latest --cleanup-tag -y || true
           gh release create showme-latest ShowMe-latest-release.apk ShowMe-latest-dev.apk ShowMe-browser.zip SHOWME-SHA256SUMS.txt showme-signatures.txt \
-            --target "$GITHUB_SHA" --prerelease --latest=false --title "ShowMe - local camera assistance preview" --notes-file SHOWME-RELEASE.md
+            --target "$GITHUB_SHA" --prerelease --latest=false --title "ShowMe - WebRTC camera assistance" --notes-file SHOWME-RELEASE.md
