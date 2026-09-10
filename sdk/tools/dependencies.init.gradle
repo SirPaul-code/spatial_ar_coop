@@ -1,0 +1,23 @@
+import groovy.json.JsonOutput
+// Records Gradle's actual resolved artifacts, not merely direct declarations.
+gradle.projectsEvaluated {
+    gradle.rootProject.tasks.register('exportResolvedArtifacts') {
+        doLast {
+            def rows=[]
+            gradle.rootProject.allprojects.each { p ->
+                ['runtimeClasspath','testRuntimeClasspath','releaseRuntimeClasspath','releaseCompileClasspath'].each { name ->
+                    def c=p.configurations.findByName(name)
+                    if(c!=null && c.canBeResolved) {
+                        c.resolvedConfiguration.resolvedArtifacts.each { a ->
+                            def id=a.moduleVersion.id
+                            rows << [scope:p.path+':'+name,group:id.group,name:id.name,version:id.version,
+                                artifact:a.file.absolutePath,classifier:a.classifier ?: '',type:a.type]
+                        }
+                    }
+                }
+            }
+            def out=new File(gradle.rootProject.buildDir,'compliance/resolved.json')
+            out.parentFile.mkdirs(); out.text=JsonOutput.prettyPrint(JsonOutput.toJson(rows))+'\n'
+        }
+    }
+}

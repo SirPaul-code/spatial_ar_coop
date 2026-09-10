@@ -1,0 +1,80 @@
+name: stablear-sdk
+on:
+  push:
+    branches: [research_sdk]
+    paths: ['sdk/**', '.github/workflows/stablear-sdk.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: stablear-sdk-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    if: github.ref == 'refs/heads/research_sdk'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Guard existing products and branch scope
+        run: |
+          test "$GITHUB_REF" = refs/heads/research_sdk
+          git diff --exit-code b2f549b3d462152f1b1044c6479a2392c81ded84 -- android showme server AGENTS.md README.md .github/workflows/ci.yml .github/workflows/showme-ci.yml
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - uses: android-actions/setup-android@v3
+      - name: Android SDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Snapshot primary licence notices
+        run: python3 sdk/tools/collect_notices.py
+      - name: Compile actual libraries, run contracts, lint, and build separate demo
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p sdk --no-daemon :core:check :core:jar :arcore:assembleRelease :vision:assembleRelease :arcore:lintRelease :vision:lintRelease :demo:lintDebug :demo:assembleDebug 2>&1 | tee stablear-build.log
+      - name: Exact dependency inventory and licence evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p sdk --no-daemon -I "$PWD/sdk/tools/dependencies.init.gradle" exportResolvedArtifacts
+          python3 sdk/tools/audit_licenses.py --resolved sdk/build/compliance/resolved.json --out sdk/build/compliance | tee stablear-licenses.log
+      - name: Verify demo identity and restricted permissions
+        run: |
+          TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          "$TOOLS/apksigner" verify sdk/demo/build/outputs/apk/debug/demo-debug.apk
+          "$TOOLS/aapt" dump badging sdk/demo/build/outputs/apk/debug/demo-debug.apk | grep "package: name='com.sirpaul.stablear.demo'"
+          "$TOOLS/aapt" dump permissions sdk/demo/build/outputs/apk/debug/demo-debug.apk > stablear-permissions.txt
+          if grep -E 'android.permission.(INTERNET|RECORD_AUDIO|ACCESS_FINE_LOCATION|NEARBY_WIFI_DEVICES)' stablear-permissions.txt; then exit 1; fi
+          git rev-parse HEAD > sdk/build/compliance/built-commit.txt
+      - name: SDK and demo artifacts - never a shared release/tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: stablear-sdk-and-demo
+          path: |
+            sdk/core/build/libs/*.jar
+            sdk/arcore/build/outputs/aar/*.aar
+            sdk/vision/build/outputs/aar/*.aar
+            sdk/demo/build/outputs/apk/debug/*.apk
+            sdk/build/compliance/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Diagnostics and source snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stablear-diagnostics
+          path: |
+            stablear-*.log
+            stablear-permissions.txt
+            sdk/**/build/reports/
+            sdk/build/compliance/
+          if-no-files-found: warn
+          retention-days: 14
