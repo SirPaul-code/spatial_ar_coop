@@ -123,7 +123,10 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
             val command = commands.pollFirst() ?: break
             command.answer.complete(failure("SESSION_ENDED", "The camera owner ended this session."))
         }
+        // Reject old lease requests first, then schedule a fresh owner-thread release. This also
+        // covers server expiry/revocation paths that call state.end() without an Activity callback.
         failSpatialLeases()
+        requestSpatialUnfreezeLocked()
     }
     @Synchronized fun resetWorld() {
         epoch += 1; frames.clear(); videoFrames.clear(); applied.clear()
@@ -132,6 +135,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
             command.answer.complete(failure("WORLD_CHANGED", "The AR camera session changed. Please try again."))
         }
         failSpatialLeases()
+        requestSpatialUnfreezeLocked()
     }
     @Synchronized fun authorized(value: String): Boolean = active && clock() < expiresMs && token.isNotBlank() &&
         MessageDigest.isEqual(token.toByteArray(Charsets.UTF_8), value.toByteArray(Charsets.UTF_8))
