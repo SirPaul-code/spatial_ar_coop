@@ -25,22 +25,44 @@ class RemoteHostConnection(private val state:ShowMeSession,private val call:RtcV
     private var latestRequest=""
     private var helperName="Helper"
 
-    fun start(origin:String,createKey:String,name:String,onReady:(String)->Unit,onFailure:(String)->Unit) {
+    private data class HttpResult(val code:Int,val body:JSONObject)
+
+    fun start(origin:String,installationToken:String,name:String,onInstallationToken:(String)->Unit,onReady:(String)->Unit,onFailure:(String)->Unit) {
         worker.execute {
             try {
                 require(origin.startsWith("https://")) { "A trusted HTTPS service address is required." }
-                val response=post("${origin.trimEnd('/')}/api/rooms",createKey,JSONObject().put("name",name))
-                require(response.optBoolean("ok")) { response.optString("message","The service could not start a call.") }
+                var token=installationToken
+                if(token.isBlank()) {
+                    token=register(origin)
+                    onInstallationToken(token)
+                }
+                var response=post("${origin.trimEnd('/')}/api/rooms",token,JSONObject().put("name",name))
+                if(response.code==401) {
+                    token=register(origin)
+                    onInstallationToken(token)
+                    response=post("${origin.trimEnd('/')}/api/rooms",token,JSONObject().put("name",name))
+                }
+                require(response.code in 200..299&&response.body.optBoolean("ok")) {
+                    response.body.optString("message","The service could not start a call.")
+                }
                 if(stopped)return@execute
-                hostToken=response.getString("hostToken")
-                socketUrl=response.getString("socketUrl")
-                apiRoot="${origin.trimEnd('/')}/api/rooms/${response.getString("roomId")}"
-                inviteUrl=response.getString("inviteUrl")
+                hostToken=response.body.getString("hostToken")
+                socketUrl=response.body.getString("socketUrl")
+                apiRoot="${origin.trimEnd('/')}/api/rooms/${response.body.getString("roomId")}"
+                inviteUrl=response.body.getString("inviteUrl")
                 state.begin();state.secure=true;state.internet=true
                 connect()
                 onReady(inviteUrl)
             }catch(e:Exception){onFailure(e.message ?: "Could not reach your ShowMe service.")}
         }
+    }
+    private fun register(origin:String):String {
+        val response=post("${origin.trimEnd('/')}/api/installations","",JSONObject()
+            .put("platform","android").put("version",BuildConfig.VERSION_NAME))
+        require(response.code in 200..299&&response.body.optBoolean("ok")) {
+            response.body.optString("message","Could not register this ShowMe installation.")
+        }
+        return response.body.getString("installationToken")
     }
     private fun connect() {
         if(stopped)return
@@ -89,7 +111,6 @@ class RemoteHostConnection(private val state:ShowMeSession,private val call:RtcV
                 require(response.isSuccessful&&body.optBoolean("ok")){body.optString("message","Relay service unavailable.")}
                 body.getJSONArray("iceServers")
             }
-            // Camera factory starts on its own GL context, independently of the service connection.
             val deadline=monotonicMs()+5000
             while(!call.isReady()&&!stopped&&monotonicMs()<deadline)Thread.sleep(50)
             val answer=call.answer(message.getString("sdp"),ice).get(12,TimeUnit.SECONDS)
@@ -100,12 +121,11 @@ class RemoteHostConnection(private val state:ShowMeSession,private val call:RtcV
                 .put("message",e.message ?: "Could not connect video. Please retry.").toString())
         }
     }
-    private fun post(url:String,key:String,body:JSONObject):JSONObject {
-        val request=Request.Builder().url(url).header("Authorization","Bearer $key")
-            .post(body.toString().toRequestBody("application/json".toMediaType())).build()
-        return client.newCall(request).execute().use {response->
-            val result=JSONObject(response.body?.string() ?: "{}")
-            require(response.isSuccessful){result.optString("message","Service returned ${response.code}")};result
+    private fun post(url:String,key:String,body:JSONObject):HttpResult {
+        val builder=Request.Builder().url(url).post(body.toString().toRequestBody("application/json".toMediaType()))
+        if(key.isNotBlank())builder.header("Authorization","Bearer $key")
+        return client.newCall(builder.build()).execute().use {response->
+            HttpResult(response.code,JSONObject(response.body?.string() ?: "{}"))
         }
     }
     fun stop(endRoom:Boolean=true) {
@@ -113,7 +133,6 @@ class RemoteHostConnection(private val state:ShowMeSession,private val call:RtcV
         stopped=true
         if(endRoom)socket?.send(JSONObject().put("type","end").toString())
         socket?.close(1000,"Session finished");socket=null
-        // HTTP fallback revokes the room even if the signaling socket was interrupted.
         if(endRoom&&apiRoot.isNotBlank())worker.execute {runCatching {post("$apiRoot/end",hostToken,JSONObject())}}
         worker.shutdown();client.connectionPool.evictAll()
     }
