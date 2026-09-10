@@ -16,6 +16,7 @@ import kotlin.math.*
 class LabRenderer(private val status: (String)->Unit,private val rotation: ()->Int): GLSurfaceView.Renderer {
     @Volatile var session: Session?=null
     @Volatile var running=false
+    @Volatile var compareInitial=true
     private var bound: Session?=null; private var adapter: ArCoreAdapter?=null
     private var width=1; private var height=1
     private val layer=CameraLayer()
@@ -35,6 +36,13 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
     fun tap(x: Float,y: Float) { val d=presented ?: return; tap.set(Tap(d,x,y)) }
     fun clear() { reset.set(true) }
     fun invalidate() { presented=null; tap.set(null); lifecycle.incrementAndGet(); reset.set(true) }
+    /** Queue on the current GL owner before GLSurfaceView.onPause acknowledges pause. */
+    fun releaseArOnOwnerThread() {
+        val ids=adapter?.engine?.snapshots()?.map { it.id }.orEmpty()
+        adapter?.close(); adapter=null; bound=null; lastTimestamp=0L
+        answers.clear(); reset.set(false)
+        worker.execute { ids.forEach(tracker::remove) }
+    }
     fun exportMetrics()=metrics
     fun shutdown() { lifecycle.incrementAndGet(); worker.execute { tracker.close() }; worker.shutdown() }
     override fun onSurfaceCreated(gl: GL10?,config: EGLConfig?) { layer.create(); bound=null }
@@ -85,16 +93,19 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
                     } else reason="Anchored with depth; visual reference unavailable."
                 }
             }
-            val points=sdk.engine.snapshots().mapNotNull { snap ->
-                val p=sdk.worldPoint(snap.id) ?: return@mapNotNull null
-                val camera=frame.camera.worldFromCv().inverse().point(p)
-                val px=frame.camera.calibration().project(camera) ?: return@mapNotNull null
+            val cameraFromWorld=frame.camera.worldFromCv().inverse()
+            val calibration=frame.camera.calibration()
+            fun project(world: V3?): FloatArray? {
+                if(world==null) return null
+                val px=calibration.project(cameraFromWorld.point(world)) ?: return null
                 val out=FloatArray(2)
                 frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS,floatArrayOf(px.x.toFloat(),px.y.toFloat()),Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,out)
-                if(!out.all { it.isFinite() }) null else out
+                return out.takeIf { it.all(Float::isFinite) }
             }
-            // Annotations and the camera background are submitted in the same GL frame.
-            layer.points(points)
+            val snapshots=sdk.engine.snapshots()
+            if(compareInitial) layer.points(snapshots.mapNotNull { project(sdk.initialWorldPoint(it.id)) },true)
+            // Both paired references and current annotations share the camera GL frame.
+            layer.points(snapshots.mapNotNull { project(sdk.worldPoint(it.id)) })
             if(frame.timestamp!=lastTimestamp) {
                 lastTimestamp=frame.timestamp
                 val sample=sdk.capture(frame)
@@ -131,11 +142,16 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
         lastUi=now
         val p95=durations.sorted()[(durations.size*.95).toInt().coerceAtMost(durations.size-1)]
         val n=sdk.engine.snapshots().size
-        status("StableAR Lab | $n anchors | $corrections accepted corrections\n$reason\nRender CPU p95: ${"%.1f".format(p95)} ms | Offline, single device")
+        status("StableAR Lab | $n anchors | $corrections accepted corrections\n$reason\nRender CPU p95: ${"%.1f".format(p95)} ms | Yellow: initial, green: refined")
         metrics=JSONObject().put("sdk","0.1.0-research").put("model",android.os.Build.MODEL)
             .put("frames",frames).put("anchors",n).put("acceptedCorrections",corrections)
             .put("renderCpuP95Ms",p95).put("historyAnchors",sdk.history.anchorCount())
-            .put("physicalAccuracyMeasured",false).put("cameraImagesIncluded",false)
+            .put("attachments",org.json.JSONArray().also { array ->
+                sdk.engine.snapshots().forEach { s -> array.put(JSONObject().put("id",s.id).put("state",s.state.name)
+                    .put("depthM",s.depthM).put("conditionalSigmaM",s.conditionalSigmaM).put("travelM",s.travelM)
+                    .put("refinementDisplacementM",sdk.initialWorldPoint(s.id)?.let { initial ->
+                        sdk.worldPoint(s.id)?.let { (it-initial).norm() } } ?: JSONObject.NULL)) }
+            }).put("physicalAccuracyMeasured",false).put("cameraImagesIncluded",false)
             .put("reason",reason).toString(2)
     }
 }
@@ -163,8 +179,8 @@ private class CameraLayer {
         for(parameter in intArrayOf(GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_TEXTURE_WRAP_T)) GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,parameter,GLES20.GL_CLAMP_TO_EDGE)
         cameraProgram=program("attribute vec2 pos; attribute vec2 tex; varying vec2 v; void main(){v=tex;gl_Position=vec4(pos,0.,1.);}",
             "#extension GL_OES_EGL_image_external : require\nprecision mediump float; uniform samplerExternalOES image; varying vec2 v; void main(){gl_FragColor=texture2D(image,v);}")
-        pointProgram=program("attribute vec2 pos; void main(){gl_Position=vec4(pos,0.,1.);gl_PointSize=28.;}",
-            "precision mediump float; void main(){float r=length(gl_PointCoord-vec2(.5));if(r>.48||r<.32)discard;gl_FragColor=vec4(.1,1.,.75,1.);}")
+        pointProgram=program("attribute vec2 pos; uniform float diameter; void main(){gl_Position=vec4(pos,0.,1.);gl_PointSize=diameter;}",
+            "precision mediump float; uniform vec4 tint; void main(){float r=length(gl_PointCoord-vec2(.5));if(r>.48||r<.32)discard;gl_FragColor=tint;}")
     }
     fun camera(frame: Frame) {
         if(frame.timestamp==0L) return
@@ -177,9 +193,12 @@ private class CameraLayer {
         GLES20.glVertexAttribPointer(p,2,GLES20.GL_FLOAT,false,0,buffer(quad)); GLES20.glVertexAttribPointer(t,2,GLES20.GL_FLOAT,false,0,buffer(uv))
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4); GLES20.glDisableVertexAttribArray(p); GLES20.glDisableVertexAttribArray(t)
     }
-    fun points(points: List<FloatArray>) {
+    fun points(points: List<FloatArray>,initial: Boolean=false) {
         if(points.isEmpty()) return
         GLES20.glUseProgram(pointProgram); val p=GLES20.glGetAttribLocation(pointProgram,"pos")
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(pointProgram,"diameter"),if(initial) 36f else 28f)
+        if(initial) GLES20.glUniform4f(GLES20.glGetUniformLocation(pointProgram,"tint"),1f,.8f,.15f,1f)
+        else GLES20.glUniform4f(GLES20.glGetUniformLocation(pointProgram,"tint"),.1f,1f,.75f,1f)
         GLES20.glEnableVertexAttribArray(p)
         GLES20.glVertexAttribPointer(p,2,GLES20.GL_FLOAT,false,0,buffer(points.flatMap { it.toList() }.toFloatArray()))
         GLES20.glDrawArrays(GLES20.GL_POINTS,0,points.size); GLES20.glDisableVertexAttribArray(p)

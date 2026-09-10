@@ -29,14 +29,10 @@ class LabActivity : Activity() {
             AlertDialog.Builder(this).setMessage("OpenCV could not load: ${t.message}").setPositiveButton("Close") { _,_ -> finish() }.show(); return
         }
         val layout=FrameLayout(this)
-        view=GLSurfaceView(this).apply { setEGLContextClientVersion(2); preserveEGLContextOnPause=true }
+        view=LabSurfaceView(this) { x,y -> renderer.tap(x,y) }.apply { setEGLContextClientVersion(2); preserveEGLContextOnPause=true }
         status=TextView(this).apply { textSize=15f; setPadding(24,20,24,20); setBackgroundColor(0xCC14202B.toInt()) }
         renderer=LabRenderer({ message -> runOnUiThread { status.text=message } }, { @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation })
         view.setRenderer(renderer)
-        view.setOnTouchListener { _, event ->
-            if(event.action==android.view.MotionEvent.ACTION_UP) { renderer.tap(event.x,event.y); view.performClick() }
-            true
-        }
         layout.addView(view)
         layout.addView(status,FrameLayout.LayoutParams(-1,-2,Gravity.TOP))
         val tools=LinearLayout(this).apply { orientation=LinearLayout.HORIZONTAL; gravity=Gravity.CENTER; setBackgroundColor(0xCC14202B.toInt()) }
@@ -51,7 +47,7 @@ class LabActivity : Activity() {
         button("Licences") { showNotices() }
         layout.addView(tools,FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM))
         setContentView(layout)
-        status.text="StableAR Lab\nTap a textured surface. Move sideways to verify depth.\nNo server or second device required."
+        status.setText(R.string.startup_status)
         showNotices()
     }
     private fun showNotices() {
@@ -66,7 +62,7 @@ class LabActivity : Activity() {
         super.onResume(); if(!::renderer.isInitialized) return
         if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED) {
             if(!permissionRequested) { permissionRequested=true; requestPermissions(arrayOf(Manifest.permission.CAMERA),1) }
-            else status.text="Camera permission is required. Enable it in Android app settings, then return."
+            else status.setText(R.string.camera_permission_needed)
             return
         }
         try {
@@ -81,14 +77,18 @@ class LabActivity : Activity() {
                 }
             }
             session!!.resume(); renderer.session=session; renderer.running=true; view.onResume()
-        } catch(e: Exception) { status.text="AR unavailable: ${e.javaClass.simpleName}: ${e.message}" }
+        } catch(e: Exception) { status.text=getString(R.string.ar_unavailable,e.javaClass.simpleName,e.message.orEmpty()) }
     }
     override fun onRequestPermissionsResult(requestCode: Int,permissions: Array<out String>,grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode,permissions,grantResults)
         if(requestCode==1 && grantResults.firstOrNull()==PackageManager.PERMISSION_GRANTED) onResume()
     }
     override fun onPause() {
-        if(::renderer.isInitialized) { renderer.running=false; renderer.invalidate(); view.onPause(); session?.pause() }
+        if(::renderer.isInitialized) {
+            renderer.running=false; renderer.invalidate()
+            view.queueEvent { renderer.releaseArOnOwnerThread() }
+            view.onPause(); session?.pause()
+        }
         super.onPause()
     }
     override fun onDestroy() {
@@ -101,7 +101,7 @@ class LabActivity : Activity() {
         super.onActivityResult(requestCode,resultCode,data)
         if(requestCode==9 && resultCode==RESULT_OK) data?.data?.let { uri ->
             try { contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(pendingExport) } }
-            catch(e: Exception) { status.text="Export failed: ${e.message}" }
+            catch(e: Exception) { status.text=getString(R.string.export_failed,e.message.orEmpty()) }
         }
         pendingExport=""
     }

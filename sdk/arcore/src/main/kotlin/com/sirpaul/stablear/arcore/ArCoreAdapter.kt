@@ -30,6 +30,7 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
     private var anchorSequence=0L
     private val attachments=linkedMapOf<Long,Anchor>()
     private val pending=linkedMapOf<Long,LockProposal>()
+    private val initialPoints=linkedMapOf<Long,V3>()
     val engine=AttachmentEngine(clock,policy)
     val history=FrameLedger(AnchorFactory { pose ->
         val anchor=session.createAnchor(pose.arPose()); val token=++anchorSequence
@@ -59,7 +60,7 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
         try {
             val root=RootReference(sample.ref.id,sample.ref.epoch,++anchorSequence,sample.ref.cameraTimestampNs,
                 anchor.pose.rigid().inverse()*cameraNow,sample.ref.intrinsics,pixel)
-            val s=engine.create(root,fit); attachments[s.id]=anchor
+            val s=engine.create(root,fit); attachments[s.id]=anchor; initialPoints[s.id]=s.pointInAnchor()
             return Placement(s,fit)
         } catch(t: Throwable) { anchor.detach(); throw t }
     }
@@ -90,9 +91,14 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
         if(a.trackingState!=TrackingState.TRACKING) return null
         return a.pose.rigid().point(s.pointInAnchor())
     }
-    fun remove(id: Long) { owner(); attachments.remove(id)?.detach(); engine.remove(id); pending.remove(id) }
+    /** Paired unrefined reference on the SAME native anchor; not physical ground truth. */
+    fun initialWorldPoint(id: Long): V3? {
+        owner(); val a=attachments[id] ?: return null; val point=initialPoints[id] ?: return null
+        return if(a.trackingState==TrackingState.TRACKING) a.pose.rigid().point(point) else null
+    }
+    fun remove(id: Long) { owner(); attachments.remove(id)?.detach(); engine.remove(id); pending.remove(id); initialPoints.remove(id) }
     fun trackingLost() { owner(); pending.clear(); engine.snapshots().forEach { engine.visibility(it.id,false,true) } }
-    fun reset() { owner(); attachments.values.forEach { it.detach() }; attachments.clear(); pending.clear(); engine.clear(); history.reset() }
+    fun reset() { owner(); attachments.values.forEach { it.detach() }; attachments.clear(); pending.clear(); initialPoints.clear(); engine.clear(); history.reset() }
     override fun close()=reset()
 
     companion object {

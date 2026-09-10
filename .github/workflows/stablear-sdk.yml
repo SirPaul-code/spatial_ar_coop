@@ -50,6 +50,8 @@ jobs:
           set -o pipefail
           gradle -p sdk --no-daemon -I "$PWD/sdk/tools/dependencies.init.gradle" exportResolvedArtifacts
           python3 sdk/tools/audit_licenses.py --resolved sdk/build/compliance/resolved.json --out sdk/build/compliance | tee stablear-licenses.log
+          python3 sdk/tools/native_notices.py | tee stablear-native-notices.log
+          gradle -p sdk --no-daemon :demo:assembleDebug
       - name: Verify demo identity and restricted permissions
         run: |
           TOOLS="$ANDROID_HOME/build-tools/36.0.0"

@@ -9,6 +9,8 @@ import org.opencv.video.Video
 import kotlin.math.*
 
 /** Caller owns the single bounded worker. No model weights, detector boxes or screen smoothing. */
+// forwardBackwardPx is measured LK cycle error, or ORB symmetric-transfer error.
+// method distinguishes them; a missing check is never represented as a measured zero.
 data class ImageMatch(val pixel: V2,val inliers: Int,val medianReprojectionPx: Double,
     val forwardBackwardPx: Double,val method: String)
 
@@ -28,14 +30,19 @@ class LocalSurfaceTracker : AutoCloseable {
         val image=Mat(height,width,CvType.CV_8UC1); image.put(0,0,gray)
         val mask=Mat.zeros(height,width,CvType.CV_8UC1)
         val corners=MatOfPoint(); val keys=MatOfKeyPoint(); val desc=Mat()
+        var transferred=false
         try {
             Imgproc.circle(mask,Point(pixel.x,pixel.y),64,Scalar(255.0),-1)
             Imgproc.goodFeaturesToTrack(image,corners,120,.015,5.0,mask)
             orb.detectAndCompute(image,mask,keys,desc)
-            if(corners.total()<12) { image.release(); keys.release(); desc.release(); return false }
+            if(corners.total()<12) return false
             refs[id]=Reference(image,pixel,MatOfPoint2f(*corners.toArray()),keys,desc)
+            transferred=true
             return true
-        } finally { corners.release(); mask.release() }
+        } finally {
+            corners.release(); mask.release()
+            if(!transferred) { image.release(); keys.release(); desc.release() }
+        }
     }
     /** Once per incoming exposure, shared across all attachments. */
     fun beginFrame(id: Long,gray: ByteArray,width: Int,height: Int) {
@@ -79,10 +86,11 @@ class LocalSurfaceTracker : AutoCloseable {
     }
     private fun geometry(ref: Reference,a: List<Point>,b: List<Point>,fb: Double,method: String): ImageMatch? {
         val src=MatOfPoint2f(*a.toTypedArray()); val dst=MatOfPoint2f(*b.toTypedArray()); val mask=Mat()
-        val h=Calib3d.findHomography(src,dst,Calib3d.RANSAC,1.5,mask,2000,.995)
+        var h=Mat(); val inverse=Mat(); val backProjected=MatOfPoint2f()
         val projected=MatOfPoint2f(); val click=MatOfPoint2f(Point(ref.pixel.x,ref.pixel.y)); val out=MatOfPoint2f()
         try {
-            if(h.empty()) return null
+            h.release(); h=Calib3d.findHomography(src,dst,Calib3d.RANSAC,1.5,mask,2000,.995)
+            if(h.empty() || Core.invert(h,inverse,Core.DECOMP_SVD)<1e-9) return null
             val flags=ByteArray(a.size); mask.get(0,0,flags)
             val kept=a.indices.filter { flags[it].toInt()!=0 }
             if(kept.size<12 || kept.size<a.size*.65) return null
@@ -94,9 +102,14 @@ class LocalSurfaceTracker : AutoCloseable {
             if(!p.x.isFinite() || !p.y.isFinite() || p.x<0 || p.y<0 || p.x>=current.cols() || p.y>=current.rows()) return null
             val pp=projected.toArray()
             val errors=kept.map { hypot(pp[it].x-b[it].x,pp[it].y-b[it].y) }.sorted()
-            val median=errors[errors.size/2]; if(median>1.0) return null
-            return ImageMatch(V2(p.x,p.y),kept.size,median,fb,method)
-        } finally { src.release(); dst.release(); mask.release(); h.release(); projected.release(); click.release(); out.release() }
+            val median=errors[errors.size/2]; if(!median.isFinite() || median>1.0) return null
+            Core.perspectiveTransform(dst,backProjected,inverse)
+            val back=backProjected.toArray()
+            val reverseErrors=kept.map { hypot(back[it].x-a[it].x,back[it].y-a[it].y) }.sorted()
+            val reverse=reverseErrors[reverseErrors.size/2]
+            if(!reverse.isFinite() || reverse>1.0) return null
+            return ImageMatch(V2(p.x,p.y),kept.size,median,max(fb,reverse),method)
+        } finally { src.release(); dst.release(); mask.release(); h.release(); inverse.release(); backProjected.release(); projected.release(); click.release(); out.release() }
     }
     fun remove(id: Long) { refs.remove(id)?.let { it.image.release(); it.corners.release(); it.keypoints.release(); it.descriptors.release() } }
     override fun close() { refs.keys.toList().forEach(::remove); current.release(); currentKeys.release(); currentDesc.release(); orb.clear(); matcher.clear() }
