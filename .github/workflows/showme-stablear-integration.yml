@@ -1,0 +1,88 @@
+name: showme-stablear-integration
+
+on:
+  push:
+    branches: [showme/stablear-integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: showme-stablear-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard unrelated Spatial Sync and known-good SDK source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code e5fe5e30627382578cc12b8065d496a385dd350a -- android/app .github/workflows/ci.yml
+          git diff --exit-code 38978da448b6610606e9145367b9b31328bb5cc0 -- sdk
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: ShowMe browser contracts
+        run: node --test showme/web/*.test.mjs
+
+      - name: Real browser WebRTC and annotation smoke
+        working-directory: showme
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          npm run test:browser
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: StableAR contracts and ShowMe integration build
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x android/gradlew
+          android/gradlew -p android --no-daemon \
+            :core:check \
+            :arcore:assembleRelease \
+            :vision:assembleRelease \
+            :showme:testDebugUnitTest \
+            :showme:lintDebug \
+            :showme:assembleDebug 2>&1 | tee showme-stablear-build.log
+
+      - name: Verify integration APK identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=android/showme/build/outputs/apk/debug/showme-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep "package: name='com.sirpaul.showme'"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+
+      - name: Upload integration diagnostics and APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showme-stablear-integration
+          path: |
+            showme-stablear-build.log
+            android/showme/build/reports/
+            android/showme/build/test-results/
+            android/showme/build/outputs/apk/debug/showme-debug.apk
+          if-no-files-found: warn
+          retention-days: 14
