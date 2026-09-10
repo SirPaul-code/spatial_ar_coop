@@ -67,12 +67,21 @@ class FrameHistory(private val clock: () -> Long = ::monotonicMs) {
     @Synchronized fun clear() { frames.clear(); unpin() }
 }
 
+enum class SpatialLeaseAction { FREEZE, UNFREEZE }
+data class SpatialLeaseCommand(
+    val action: SpatialLeaseAction,
+    val frameId: Long,
+    val epoch: Int,
+    val answer: CompletableFuture<Boolean>,
+)
+
 class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     val frames = FrameHistory(clock)
     val telemetry = FrameTelemetry()
     val videoFrames = VideoDepthHistory(clock)
     data class Command(val body: JSONObject, val answer: CompletableFuture<JSONObject>, val prepared: PreparedStroke? = null)
     private val commands = ArrayDeque<Command>()
+    private val spatialLeases = ArrayDeque<SpatialLeaseCommand>()
     private val random = SecureRandom()
     @Volatile var active = false
         private set
@@ -93,6 +102,8 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     @Volatile var secure = false
     @Volatile var internet = false
     @Volatile var hostName = "Camera owner"
+    @Volatile var stableArEnabled = BuildConfig.STABLE_AR_ENABLED
+    @Volatile var stableArDiagnostics = "{}"
     private var helperId = ""
     private var helperSeenMs = 0L
     private var expiresMs = 0L
@@ -112,6 +123,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
             val command = commands.pollFirst() ?: break
             command.answer.complete(failure("SESSION_ENDED", "The camera owner ended this session."))
         }
+        failSpatialLeases()
     }
     @Synchronized fun resetWorld() {
         epoch += 1; frames.clear(); videoFrames.clear(); applied.clear()
@@ -119,6 +131,7 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
             val command = commands.pollFirst() ?: break
             command.answer.complete(failure("WORLD_CHANGED", "The AR camera session changed. Please try again."))
         }
+        failSpatialLeases()
     }
     @Synchronized fun authorized(value: String): Boolean = active && clock() < expiresMs && token.isNotBlank() &&
         MessageDigest.isEqual(token.toByteArray(Charsets.UTF_8), value.toByteArray(Charsets.UTF_8))
@@ -135,7 +148,10 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
     }
     @Synchronized fun touchHelper() { if(helperId.isNotBlank()&&active)helperSeenMs=clock() }
     @Synchronized fun leave(id: String) {
-        if (id == helperId) { helperId = ""; helperName = ""; helperSeenMs = 0L; frames.unpin() }
+        if (id == helperId) {
+            helperId = ""; helperName = ""; helperSeenMs = 0L; frames.unpin()
+            requestSpatialUnfreezeLocked()
+        }
     }
     @Synchronized fun hasHelper(): Boolean = active && helperId.isNotBlank() && clock() - helperSeenMs < 15_000L
     @Synchronized fun info(): JSONObject = JSONObject().put("active", active && clock() < expiresMs).put("paused", paused)
@@ -144,6 +160,8 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         .put("annotations", annotationCount).put("voiceEnabled", voiceEnabled).put("voiceState", voiceState)
         .put("secure", secure).put("internet",internet).put("version", BuildConfig.VERSION_NAME).put("timing",telemetry.snapshot())
         .put("videoTransport", "WEBRTC").put("videoState", videoState).put("captureFps", captureFps.toDouble()).put("targetFps", 30)
+        .put("spatialMode", if(stableArEnabled) "STABLE_AR" else "LEGACY")
+        .put("stableAr", if(stableArEnabled) runCatching { JSONObject(stableArDiagnostics) }.getOrElse { JSONObject() } else JSONObject())
     @Synchronized fun previous(id: String): JSONObject? = applied[id]
     @Synchronized fun remember(id: String, result: JSONObject) {
         applied[id] = result
@@ -158,6 +176,41 @@ class ShowMeSession(private val clock: () -> Long = ::monotonicMs) {
         commands.addLast(Command(body, result, prepared)); return result
     }
     @Synchronized fun poll(): Command? = commands.pollFirst()
+
+    /** Session/network workers request leases; only ShowMeRenderer executes them on the AR owner thread. */
+    @Synchronized fun requestSpatialFreeze(frameId: Long, requestedEpoch: Int): CompletableFuture<Boolean> {
+        val result = CompletableFuture<Boolean>()
+        if (!stableArEnabled) { result.complete(true); return result }
+        if (!active || paused || !tracking || requestedEpoch != epoch || frameId <= 0L || spatialLeases.size >= 8) {
+            result.complete(false); return result
+        }
+        spatialLeases.addLast(SpatialLeaseCommand(SpatialLeaseAction.FREEZE, frameId, requestedEpoch, result))
+        return result
+    }
+    @Synchronized fun requestSpatialUnfreeze(): CompletableFuture<Boolean> {
+        val result = CompletableFuture<Boolean>()
+        if (!stableArEnabled) { result.complete(true); return result }
+        if (spatialLeases.size >= 8) { result.complete(false); return result }
+        spatialLeases.addLast(SpatialLeaseCommand(SpatialLeaseAction.UNFREEZE, -1L, epoch, result))
+        return result
+    }
+    @Synchronized fun pollSpatialLease(): SpatialLeaseCommand? = spatialLeases.pollFirst()
+    @Synchronized fun setSpatialMode(enabled: Boolean) {
+        stableArEnabled = enabled
+        stableArDiagnostics = "{}"
+        frames.clear(); videoFrames.clear(); applied.clear()
+        failSpatialLeases()
+    }
+    private fun requestSpatialUnfreezeLocked() {
+        if (!stableArEnabled || spatialLeases.size >= 8) return
+        spatialLeases.addLast(SpatialLeaseCommand(SpatialLeaseAction.UNFREEZE, -1L, epoch, CompletableFuture()))
+    }
+    private fun failSpatialLeases() {
+        while (true) {
+            val lease = spatialLeases.pollFirst() ?: break
+            lease.answer.complete(false)
+        }
+    }
 
     companion object {
         val TOOLS = setOf("pin", "arrow", "draw", "circle")
