@@ -5,8 +5,6 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// Reuse the actual existing geometry/surface pipeline without modifying :app.
-// Generated copies are build output, not a fork of the algorithms.
 val spatialSourceNames = listOf(
     "Models.kt", "MetricSupportSampler.kt", "CameraBackgroundRenderer.kt",
     "AlignmentEngine.kt", "EssentialSharedPoseSolver.kt", "SharedVisualAnchorSolver.kt",
@@ -40,8 +38,8 @@ android {
         minSdk = 33
         targetSdk = 36
         versionCode = 100000 + runNumber * 10 + runAttempt
-        versionName = "0.3.0-internet.$runNumber.$runAttempt"
-        // Commodity phones used for the physical trial are ARM64.
+        versionName = "0.4.0-internet.$runNumber.$runAttempt"
+        buildConfigField("String", "SHOWME_SERVICE_ORIGIN", "\"https://showme-calls.sirpaul-showme.workers.dev\"")
         ndk { abiFilters += "arm64-v8a" }
     }
     signingConfigs {
