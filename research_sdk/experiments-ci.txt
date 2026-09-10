@@ -1,0 +1,296 @@
+{
+  "seed": 20260910,
+  "python": "3.13.15",
+  "numpy": "2.3.5",
+  "opencv": "4.13.0",
+  "scope": "Synthetic mathematical and image tests, not phone measurements or end-to-end SDK evaluation.",
+  "timing_and_gauge": {
+    "timing": [
+      {
+        "delay_ms": 16.7,
+        "wrong_world_error_mm": 39.98578496783289,
+        "rendered_error_px": 15.99668658920507
+      },
+      {
+        "delay_ms": 50.0,
+        "wrong_world_error_mm": 119.70329710574241,
+        "rendered_error_px": 47.94506863574378
+      },
+      {
+        "delay_ms": 100.0,
+        "wrong_world_error_mm": 239.30786164673262,
+        "rendered_error_px": 96.23510897555997
+      },
+      {
+        "delay_ms": 200.0,
+        "wrong_world_error_mm": 477.82632820494206,
+        "rendered_error_px": 195.29055802221234
+      }
+    ],
+    "rigid_gauge_stale_mm": {
+      "n": 1000,
+      "median": 63.23655248270492,
+      "p95": 118.61304862230921,
+      "rms": 71.46005838933888
+    },
+    "rigid_gauge_anchor_local_mm": {
+      "n": 1000,
+      "median": 2.220446049250313e-13,
+      "p95": 4.460938472487882e-13,
+      "rms": 2.6396704480168244e-13
+    },
+    "caveat": "Exact invariance only for common rigid gauge updates; not a model of nonrigid SLAM correction."
+  },
+  "depth_observability": {
+    "monte_carlo": [
+      {
+        "baseline_mm": 10.0,
+        "depth_absolute_error_mm": {
+          "n": 20000,
+          "median": 237.1092018475258,
+          "p95": 820.7614782784694,
+          "rms": 413.53834330632844
+        },
+        "linearized_sigma_mm": 353.5533905932738
+      },
+      {
+        "baseline_mm": 50.0,
+        "depth_absolute_error_mm": {
+          "n": 20000,
+          "median": 47.79631264063633,
+          "p95": 138.3584248998897,
+          "rms": 71.1279916594429
+        },
+        "linearized_sigma_mm": 70.71067811865477
+      },
+      {
+        "baseline_mm": 200.0,
+        "depth_absolute_error_mm": {
+          "n": 20000,
+          "median": 11.95864584469497,
+          "p95": 34.9543460833102,
+          "rms": 17.730931354907106
+        },
+        "linearized_sigma_mm": 17.677669529663692
+      }
+    ],
+    "single_view_information_eigenvalues": [
+      0.0,
+      160000.0,
+      160000.0
+    ],
+    "assumptions": "Exact poses/calibration; Gaussian independent 0.5 px error in each of two images. No depth prior."
+  },
+  "correlated_depth": {
+    "n_observations": 30,
+    "common_bias_sigma_mm": 20.0,
+    "white_noise_sigma_mm": 10.0,
+    "empirical_mean_error_sigma_mm": 20.10014185060149,
+    "naive_reported_sigma_mm": 4.0824829046386295,
+    "correlation_aware_sigma_mm": 20.083160441856094,
+    "naive_95pct_interval_coverage": 0.3085,
+    "aware_95pct_interval_coverage": 0.95105,
+    "repeats_30_from_10_empirical_sigma_mm": 3.131240457961191,
+    "caveat": "Assumed noise model, not measured ARCore noise. Source-ID deduplication alone does not remove shared bias."
+  },
+  "plane_fitting": {
+    "cases": {
+      "symmetric_support": {
+        "local_median_error_mm": {
+          "n": 500,
+          "median": 6.17938452247957,
+          "p95": 17.660264930209934,
+          "rms": 9.151028752343288
+        },
+        "plane_fit_error_mm": {
+          "n": 500,
+          "median": 0.9855421532118935,
+          "p95": 2.108445665027813,
+          "rms": 1.2006418763920845
+        }
+      },
+      "asymmetric_support": {
+        "local_median_error_mm": {
+          "n": 500,
+          "median": 47.30633825310626,
+          "p95": 58.0180919464577,
+          "rms": 47.56182335367237
+        },
+        "plane_fit_error_mm": {
+          "n": 500,
+          "median": 1.0777578399786547,
+          "p95": 3.0854846321631366,
+          "rms": 1.5739289801939254
+        }
+      }
+    },
+    "note": "Median baseline represents verifier simplification, NOT existing ShowMe pointAt which already fits inverse depth."
+  },
+  "edge_refinement": {
+    "cases": [
+      {
+        "rotation_deg": 0,
+        "total": 36,
+        "image_gate_accepted": 36,
+        "image_gate_accepted_worse_than_input": 0,
+        "accepted_refined_error_px": {
+          "n": 36,
+          "median": 0.4999999999999886,
+          "p95": 0.5000000000000113,
+          "rms": 0.5055250296034326
+        },
+        "coarse_input_error_px": 1.2206555615733703,
+        "oracle_warped_template_error_px": {
+          "n": 36,
+          "median": 0.4999999999999886,
+          "p95": 0.5000000000000113,
+          "rms": 0.49999999999999617
+        }
+      },
+      {
+        "rotation_deg": 2,
+        "total": 36,
+        "image_gate_accepted": 36,
+        "image_gate_accepted_worse_than_input": 1,
+        "accepted_refined_error_px": {
+          "n": 36,
+          "median": 0.3679080752487988,
+          "p95": 0.7434446949142908,
+          "rms": 0.5075842427467622
+        },
+        "coarse_input_error_px": 1.2206555615733703,
+        "oracle_warped_template_error_px": {
+          "n": 36,
+          "median": 0.538577174013396,
+          "p95": 1.2031937299683986,
+          "rms": 0.7901680994229011
+        }
+      },
+      {
+        "rotation_deg": 4,
+        "total": 36,
+        "image_gate_accepted": 5,
+        "image_gate_accepted_worse_than_input": 0,
+        "accepted_refined_error_px": {
+          "n": 5,
+          "median": 0.6478959770285407,
+          "p95": 0.8066095302115884,
+          "rms": 0.6244771509894484
+        },
+        "coarse_input_error_px": 1.2206555615733703,
+        "oracle_warped_template_error_px": {
+          "n": 36,
+          "median": 0.8462879185073504,
+          "p95": 1.1541543474239984,
+          "rms": 0.9031407413915816
+        }
+      },
+      {
+        "rotation_deg": 8,
+        "total": 36,
+        "image_gate_accepted": 0,
+        "image_gate_accepted_worse_than_input": 0,
+        "accepted_refined_error_px": null,
+        "coarse_input_error_px": 1.2206555615733703,
+        "oracle_warped_template_error_px": {
+          "n": 36,
+          "median": 0.9838730060637664,
+          "p95": 1.1151026732548663,
+          "rms": 1.0225953667166352
+        }
+      },
+      {
+        "rotation_deg": 16,
+        "total": 36,
+        "image_gate_accepted": 0,
+        "image_gate_accepted_worse_than_input": 0,
+        "accepted_refined_error_px": null,
+        "coarse_input_error_px": 1.2206555615733703,
+        "oracle_warped_template_error_px": {
+          "n": 36,
+          "median": 0.8256242790201431,
+          "p95": 0.85338704924772,
+          "rms": 0.6889655883228439
+        }
+      },
+      {
+        "rotation_deg": 24,
+        "total": 36,
+        "image_gate_accepted": 0,
+        "image_gate_accepted_worse_than_input": 0,
+        "accepted_refined_error_px": null,
+        "coarse_input_error_px": 1.2206555615733703,
+        "oracle_warped_template_error_px": {
+          "n": 36,
+          "median": 0.8862368012174938,
+          "p95": 0.9690777439246449,
+          "rms": 0.8643037939645608
+        }
+      }
+    ],
+    "caveat": "Image-gate stress test of the published constants; no metric/depth gates. Oracle warped control is NOT an achieved SDK improvement. Synthetic planar images; no occlusion."
+  },
+  "klt": {
+    "detected": 256,
+    "accepted": 256,
+    "error_px": {
+      "n": 256,
+      "median": 0.07666506954195354,
+      "p95": 0.16534040809789508,
+      "rms": 0.09573546553656968
+    },
+    "blank_image_points": 0,
+    "caveat": "One synthetic planar pair; not a long-sequence/occlusion/mobile benchmark."
+  },
+  "smoothing": {
+    "cases": [
+      {
+        "alpha": 1.0,
+        "moving_projection_error_px": {
+          "n": 540,
+          "median": 0.5637153726880086,
+          "p95": 1.5632057999173326,
+          "rms": 0.7940638743963847
+        },
+        "asymptotic_low_frequency_delay_ms": 0.0
+      },
+      {
+        "alpha": 0.5,
+        "moving_projection_error_px": {
+          "n": 540,
+          "median": 6.989023620688116,
+          "p95": 10.120276237129243,
+          "rms": 7.009079587492683
+        },
+        "asymptotic_low_frequency_delay_ms": 16.666666666666668
+      },
+      {
+        "alpha": 0.2,
+        "moving_projection_error_px": {
+          "n": 540,
+          "median": 27.098237797885403,
+          "p95": 38.5404799183278,
+          "rms": 27.10268024764796
+        },
+        "asymptotic_low_frequency_delay_ms": 66.66666666666667
+      },
+      {
+        "alpha": 0.05,
+        "moving_projection_error_px": {
+          "n": 540,
+          "median": 83.38457139373136,
+          "p95": 120.50091025126063,
+          "rms": 85.21729769401473
+        },
+        "asymptotic_low_frequency_delay_ms": 316.6666666666666
+      }
+    ],
+    "caveat": "Smoothing screen coordinates; not smoothing a slowly varying anchor-local correction."
+  },
+  "reprojection": {
+    "depth_error_mm": 150,
+    "original_view_error_px": 0.0,
+    "error_after_20cm_translation_px": 5.581395348837219,
+    "lesson": "Small reprojection residual from one view cannot certify depth accuracy."
+  }
+}

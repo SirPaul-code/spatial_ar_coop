@@ -1,0 +1,52 @@
+TAP version 13
+# Subtest: portrait image is letterboxed, not stretched or cropped
+ok 1 - portrait image is letterboxed, not stretched or cropped
+  ---
+  duration_ms: 2.001202
+  type: 'test'
+  ...
+# Subtest: pointer coordinates exclude the letterbox and preserve normalized image pixels
+ok 2 - pointer coordinates exclude the letterbox and preserve normalized image pixels
+  ---
+  duration_ms: 0.251278
+  type: 'test'
+  ...
+# Subtest: arrows preserve both endpoints and sample the whole physical surface
+ok 3 - arrows preserve both endpoints and sample the whole physical surface
+  ---
+  duration_ms: 0.295625
+  type: 'test'
+  ...
+# Subtest: freehand samples are bounded and retain stroke endpoints
+ok 4 - freehand samples are bounded and retain stroke endpoints
+  ---
+  duration_ms: 1.178735
+  type: 'test'
+  ...
+# Subtest: circle stays within drag bounds in either direction
+ok 5 - circle stays within drag bounds in either direction
+  ---
+  duration_ms: 0.310928
+  type: 'test'
+  ...
+# Subtest: frame metadata and image travel in one atomic envelope
+ok 6 - frame metadata and image travel in one atomic envelope
+  ---
+  duration_ms: 1.518575
+  type: 'test'
+  ...
+# Subtest: rejects malformed, oversized or inconsistent frame metadata
+ok 7 - rejects malformed, oversized or inconsistent frame metadata
+  ---
+  duration_ms: 0.439732
+  type: 'test'
+  ...
+1..7
+# tests 7
+# suites 0
+# pass 7
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 74.832682
