@@ -1,6 +1,7 @@
 /** Small pure policy module, shared by the deployed service and its tests. */
 export const ROOM_RE = /^[A-Za-z0-9_-]{24}$/;
 export const ID_RE = /^[A-Za-z0-9_-]{8,80}$/;
+export const INSTALL_RE = /^[a-f0-9]{32}$/i;
 export const MAX_SIGNAL_BYTES = 90_000;
 export const MAX_SESSION_SECONDS = 3600;
 export const json = (value, status=200) => new Response(JSON.stringify(value), {
@@ -29,7 +30,6 @@ export async function sameSecret(value, expected) {
 export function bearer(request) {
   const header=request.headers.get('authorization')||'';
   if(header.startsWith('Bearer '))return header.slice(7);
-  // Browser WebSockets cannot set Authorization. A subprotocol avoids secrets in URL query/logs.
   return (request.headers.get('sec-websocket-protocol')||'').split(',').map(v=>v.trim())
     .find(v=>v.startsWith('cap.'))?.slice(4)||'';
 }
