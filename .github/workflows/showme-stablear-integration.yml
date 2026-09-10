@@ -92,7 +92,7 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "ShowMe - StableAR integration test" \
             --prerelease \
-            --notes "StableAR physical-test build. Pin depth is owned by StableAR, with strict placement first and a bounded evidence-based edge-aware fit for sparse real-world ARCore depth. No guessed fixed-distance plane. Includes exact-frame WebRTC integration and startup OpenCV fix. Test prerelease only; not Google Play production signing."
+            --notes "StableAR physical-test build. The production placement path reuses the exact WebRTC encoder upright-to-raw pixel transform, resolves foreground/background depth layers with RAW + smoothed depth + ARCore point-cloud evidence, and cannot fall back to the old conservative placement call. If the initial metric depth is grossly wrong, the first visual lock may bootstrap depth from 4+ independent views with held-out verification; all later corrections return to tight bounded limits. No fixed-distance or guessed plane. Test prerelease only; not Google Play production signing."
 
       - name: Upload integration diagnostics and APK
         if: always()
