@@ -38,8 +38,9 @@ android {
         minSdk = 33
         targetSdk = 36
         versionCode = 100000 + runNumber * 10 + runAttempt
-        versionName = "0.4.0-internet.$runNumber.$runAttempt"
+        versionName = "0.4.0-stablear.$runNumber.$runAttempt"
         buildConfigField("String", "SHOWME_SERVICE_ORIGIN", "\"https://showme-calls.sirpaul-showme.workers.dev\"")
+        buildConfigField("boolean", "STABLE_AR_ENABLED", "true")
         ndk { abiFilters += "arm64-v8a" }
     }
     signingConfigs {
@@ -74,6 +75,9 @@ tasks.configureEach {
     if (name.startsWith("compile") && name.endsWith("Kotlin")) dependsOn(prepareSpatialSources)
 }
 dependencies {
+    implementation(project(":core"))
+    implementation(project(":arcore"))
+    implementation(project(":vision"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.ar:core:1.56.0")
     implementation("org.opencv:opencv:4.12.0")
