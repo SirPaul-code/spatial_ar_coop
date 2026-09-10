@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: showme-stablear-${{ github.ref }}
@@ -73,6 +73,25 @@ jobs:
           APK=android/showme/build/outputs/apk/debug/showme-debug.apk
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep "package: name='com.sirpaul.showme'"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+
+      - name: Publish StableAR test prerelease
+        if: success() && github.ref == 'refs/heads/showme/stablear-integration'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APK=android/showme/build/outputs/apk/debug/showme-debug.apk
+          OUT=ShowMe-StableAR-latest.apk
+          SUM=SHOWME-STABLEAR-SHA256SUMS.txt
+          cp "$APK" "$OUT"
+          sha256sum "$OUT" > "$SUM"
+          gh release delete showme-stablear-latest --yes --cleanup-tag || true
+          gh release create showme-stablear-latest "$OUT" "$SUM" \
+            --target "$GITHUB_SHA" \
+            --title "ShowMe - StableAR integration test" \
+            --prerelease \
+            --notes "StableAR physical-test build. StableAR is the sole initial depth authority for pin annotations; legacy ShowMe depth no longer gates or offsets StableAR pins. Includes startup OpenCV fix and exact-frame StableAR integration. Test prerelease only; not Google Play production signing."
 
       - name: Upload integration diagnostics and APK
         if: always()
