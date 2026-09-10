@@ -8,6 +8,16 @@ class StableArIntegrationTest {
     private fun binding(id:Long,epoch:Int,source:Long,captured:Long,value:String="sample") =
         StableVideoBinding(id,epoch,source,source*1_000_000L,captured,value)
 
+    private fun beginStable(state: ShowMeSession) {
+        state.begin()
+        // begin() closes any prior logical session first. StableAR mode therefore emits one
+        // idempotent owner-thread UNFREEZE cleanup before accepting a new historical lease.
+        state.pollSpatialLease()?.let { cleanup ->
+            assertEquals(SpatialLeaseAction.UNFREEZE,cleanup.action)
+            cleanup.answer.complete(true)
+        }
+    }
+
     @Test fun exactVideoIdentityAcceptsLiveAndDelayedFramesButRejectsWrongEpochAndStaleFrames() {
         var now=1_000_000_000L
         val frames=StableArFrameRegistry<String>({now},historyNs=4_000_000_000L)
@@ -92,7 +102,7 @@ class StableArIntegrationTest {
     }
 
     @Test fun legacyModeBypassesStableArLeaseWithoutRevertingCode() {
-        val state=ShowMeSession();state.begin();state.stableArEnabled=false
+        val state=ShowMeSession();beginStable(state);state.stableArEnabled=false
         assertTrue(state.requestSpatialFreeze(123,state.epoch).get())
         assertTrue(state.requestSpatialUnfreeze().get())
         assertNull(state.pollSpatialLease())
@@ -105,7 +115,7 @@ class StableArIntegrationTest {
     }
 
     @Test fun helperDisconnectQueuesUnfreezeAndAReplacementHelperCanReconnect() {
-        val state=ShowMeSession();state.begin();state.tracking=true
+        val state=ShowMeSession();beginStable(state);state.tracking=true
         assertTrue(state.join("helper0001","Alice"))
         val freeze=state.requestSpatialFreeze(44,state.epoch)
         val freezeCommand=state.pollSpatialLease()!!
@@ -118,8 +128,8 @@ class StableArIntegrationTest {
         assertTrue(state.join("helper0002","Bob"))
     }
 
-    @Test fun worldResetRejectsPendingAndOldEpochSpatialWork() {
-        val state=ShowMeSession();state.begin();state.tracking=true
+    @Test fun worldResetRejectsPendingAndOldEpochSpatialWorkThenQueuesOwnerCleanup() {
+        val state=ShowMeSession();beginStable(state);state.tracking=true
         val oldEpoch=state.epoch
         val pending=state.requestSpatialFreeze(22,oldEpoch)
         assertFalse(pending.isDone)
@@ -127,5 +137,16 @@ class StableArIntegrationTest {
         assertTrue(state.epoch>oldEpoch)
         assertTrue(pending.isDone);assertFalse(pending.get())
         assertFalse(state.requestSpatialFreeze(22,oldEpoch).get())
+        val cleanup=state.pollSpatialLease()!!
+        assertEquals(SpatialLeaseAction.UNFREEZE,cleanup.action)
+    }
+
+    @Test fun sessionEndRejectsPendingSpatialWorkAndQueuesOwnerUnfreeze() {
+        val state=ShowMeSession();beginStable(state);state.tracking=true
+        val pending=state.requestSpatialFreeze(51,state.epoch)
+        state.end()
+        assertTrue(pending.isDone);assertFalse(pending.get())
+        val cleanup=state.pollSpatialLease()!!
+        assertEquals(SpatialLeaseAction.UNFREEZE,cleanup.action)
     }
 }
