@@ -87,6 +87,7 @@ class ShowMeActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setDecorFitsSystemWindows(false)
         settings.edit().remove("origin").remove("key").apply()
+        state.stableArEnabled = settings.getBoolean("stable_ar_enabled", BuildConfig.STABLE_AR_ENABLED)
         voice = RtcVoice(this,state)
         val api = SessionApi(state,voice)
         voice.controlHandler = api::handle
@@ -139,7 +140,7 @@ class ShowMeActivity : Activity() {
         micButton=button("Mute") { toggleMic() }
         pauseButton=button("Pause") {
             if(state.active){state.paused=!state.paused;voice.setMuted(micMuted||state.paused)
-                if(state.paused){state.frames.clear();state.videoFrames.clear()}}
+                if(state.paused){state.frames.clear();state.videoFrames.clear();state.requestSpatialUnfreeze();renderer.invalidateStableArFrames()}}
         }
         addEqual(callControls,micButton);addEqual(callControls,pauseButton)
         addEqual(callControls,button("End call",false,0xfff3aaa1.toInt()) {
@@ -169,16 +170,29 @@ class ShowMeActivity : Activity() {
     }
     private fun addEqual(row:LinearLayout,view:View){row.addView(view,LinearLayout.LayoutParams(0,d(46),1f).apply{setMargins(d(3),0,d(3),0)})}
     private fun settingsMenu() {
-        AlertDialog.Builder(this).setTitle("ShowMe").setItems(arrayOf("Use local Wi-Fi","About this build")) { _,which->
-            when(which){0->startCall(true);1->AlertDialog.Builder(this).setTitle("ShowMe")
-                .setMessage("${BuildConfig.VERSION_NAME}\n\nInternet calls use encrypted WebRTC media with relay fallback. No service activation or Cloudflare setup is required in the app. Surface marks stay in this AR camera session.")
-                .setPositiveButton("Done",null).show()}
+        val mode=if(state.stableArEnabled)"StableAR" else "Legacy"
+        AlertDialog.Builder(this).setTitle("ShowMe").setItems(arrayOf("Use local Wi-Fi","Spatial tracking: $mode","About this build")) { _,which->
+            when(which){
+                0->startCall(true)
+                1->{
+                    val enabled=!state.stableArEnabled
+                    AlertDialog.Builder(this).setTitle("Use ${if(enabled)"StableAR" else "legacy tracking"}?")
+                        .setMessage("Switching spatial engines clears current marks and invalidates frozen frames so the two correction systems can never control the same annotation.")
+                        .setNegativeButton("Cancel",null).setPositiveButton("Switch"){_,_->
+                            settings.edit().putBoolean("stable_ar_enabled",enabled).apply()
+                            renderer.requestStableArEnabled(enabled)
+                        }.show()
+                }
+                2->AlertDialog.Builder(this).setTitle("ShowMe")
+                    .setMessage("${BuildConfig.VERSION_NAME}\n\nSpatial mode: $mode\n\nStableAR uses the existing ARCore camera/session and exact WebRTC frame identity; it does not create another camera or SLAM system. Physical accuracy has not been ground-truth measured. Internet calls use encrypted WebRTC media with relay fallback.")
+                    .setPositiveButton("Done",null).show()
+            }
         }.show()
     }
     private fun callMenu() {
         AlertDialog.Builder(this).setTitle("Call").setItems(arrayOf("Copy invitation","Connection details","Return to start")){_,which->
             when(which){0->copyInvite();1->AlertDialog.Builder(this).setTitle("Connection details")
-                .setMessage("${if(state.internet)"Internet" else "Local Wi-Fi"}\nWebRTC: ${state.videoState}\nCapture: %.1f fps\n%s".format(Locale.US,state.captureFps,state.telemetry.snapshot().toString(2)))
+                .setMessage("${if(state.internet)"Internet" else "Local Wi-Fi"}\nSpatial: ${if(state.stableArEnabled)"StableAR" else "Legacy"}\nWebRTC: ${state.videoState}\nCapture: %.1f fps\n%s\nStableAR: %s".format(Locale.US,state.captureFps,state.telemetry.snapshot().toString(2),state.stableArDiagnostics))
                 .setPositiveButton("Done",null).show();2->{if(state.active)endSession();home.visibility=View.VISIBLE}}
         }.show()
     }
@@ -216,7 +230,7 @@ class ShowMeActivity : Activity() {
                 if(foreground)inviteDialog() else pendingInviteDialog=true
             }
         },onFailure={message->runOnUiThread {
-            starting=false;connection.stop(false);remote=null;state.end();home.visibility=View.VISIBLE;notice(message)
+            starting=false;connection.stop(false);remote=null;renderer.invalidateStableArFrames();state.end();home.visibility=View.VISIBLE;notice(message)
         }})
     }
     private fun requestApproval(id:String,name:String) {
@@ -244,7 +258,7 @@ class ShowMeActivity : Activity() {
                 server=local
                 runOnUiThread {invite="http://${addresses.first()}:${local.listeningPort}/#${state.token}";startedAt=monotonicMs()
                     home.visibility=View.GONE;renderer.action("clear");state.paused=!foreground;inviteDialog()}
-            }catch(e:Exception){state.end();notice(e.message?:"Could not start local sharing.")}
+            }catch(e:Exception){renderer.invalidateStableArFrames();state.end();notice(e.message?:"Could not start local sharing.")}
             finally{starting=false}
         }
     }
@@ -276,6 +290,7 @@ class ShowMeActivity : Activity() {
         micMuted=!micMuted;state.voiceEnabled=true;voice.setMuted(micMuted)
     }
     private fun endSession(){
+        renderer.invalidateStableArFrames();state.requestSpatialUnfreeze()
         remote?.stop();remote=null;state.end();voice.disconnect();state.voiceEnabled=false
         invite="";startedAt=0L;val old=server;server=null;io.execute{old?.stop()}
         notice("Call ended. Marks remain until you clear them.")
@@ -307,7 +322,8 @@ class ShowMeActivity : Activity() {
     }
     override fun onPause(){
         foreground=false;resumeSharing=state.active&&!state.paused
-        if(state.active){state.paused=true;state.frames.clear();state.videoFrames.clear();voice.setMuted(true)}
+        renderer.invalidateStableArFrames()
+        if(state.active){state.paused=true;state.frames.clear();state.videoFrames.clear();state.requestSpatialUnfreeze();voice.setMuted(true)}
         renderer.resumed=false;gl.onPause();runCatching{ar?.pause()};super.onPause()
     }
     override fun onDestroy(){destroyed=true;handler.removeCallbacksAndMessages(null);remote?.stop();state.end();server?.stop()
