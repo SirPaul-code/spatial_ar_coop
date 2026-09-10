@@ -34,9 +34,9 @@ class StableArInteractiveSurfaceFitTest {
     }
 
     @Test fun foregroundMetricLayerBeatsDenseBackgroundPlane() {
-        // Reproduces the physical PCB/ECU-in-front-of-monitor failure: the background is denser and
-        // even has samples a couple of pixels closer to the click, so a naive nearest/dominant fit
-        // selects ~1.8 m. Independent RAW/point-cloud support proves a ~0.75 m foreground layer.
+        // Reproduces the physical PCB/ECU-in-front-of-monitor failure. A conservative single-layer
+        // fit must reject the mixed depth discontinuity; interactive placement may then select the
+        // foreground only because independent RAW/point-cloud evidence establishes its ownership.
         val background=listOf(
             s(640.0,356.0,1.80),s(644.0,360.0,1.80),s(640.0,364.0,1.81),s(636.0,360.0,1.79),
             s(644.0,364.0,1.80),s(636.0,356.0,1.81),s(648.0,352.0,1.79),s(632.0,368.0,1.80),
@@ -51,9 +51,8 @@ class StableArInteractiveSurfaceFitTest {
             s(652.0,366.0,.76,cloud,.90),
         )
         val all=background+foreground
-        val strict=SurfaceFitter.fit(k,click,all)
-        assertNotNull("the conservative fitter intentionally demonstrates the old background trap",strict)
-        assertEquals(1.80,strict!!.depth,.08)
+        assertNull("mixed foreground/background depth must not be accepted as one strict surface",
+            SurfaceFitter.fit(k,click,all))
 
         val interactive=SurfaceFitter.fitInteractive(k,click,all)
         assertNotNull("interactive fit must recover the visible foreground layer",interactive)
@@ -71,6 +70,7 @@ class StableArInteractiveSurfaceFitTest {
             s(651.0,370.0,1.58), s(655.0,357.0,.71), s(656.0,364.0,1.61),
             s(670.0,350.0,.70), s(672.0,370.0,.71),
         )
-        assertNull(SurfaceFitter.fitInteractive(k,click,samples))
+        assertNull("three close samples from a competing layer must veto an ambiguous placement",
+            SurfaceFitter.fitInteractive(k,click,samples))
     }
 }
