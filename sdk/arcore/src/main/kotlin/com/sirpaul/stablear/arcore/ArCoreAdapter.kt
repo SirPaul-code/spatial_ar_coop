@@ -20,6 +20,14 @@ fun Camera.calibration(): Intrinsics {
 data class GrayImage(val width: Int,val height: Int,val bytes: ByteArray,val timestampNs: Long)
 data class CameraSample(val ref: FrameRef,val depth: List<DepthSample>,val gray: GrayImage?)
 data class Placement(val attachment: AttachmentSnapshot,val fit: SurfaceFit)
+data class PlacementAttempt(
+    val placement: Placement?,
+    val mode: String,
+    val reason: String,
+    val depthSamples: Int,
+    val nearbySamples: Int,
+    val nearestSupportPx: Double?,
+)
 data class ObservationContext(val id: Long,val generation: Long,val root: RootReference,val frame: FrameRef,
     val cameraInAnchor: Rigid)
 
@@ -51,10 +59,50 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
     }
     fun freeze(frameId: Long): FrameRef? { owner(); return history.freeze(frameId) }
     fun unfreeze(frameId: Long) { owner(); history.unfreeze(frameId) }
+
+    /** Strict research placement contract. */
     fun place(sample: CameraSample,pixel: V2): Placement? {
         owner(); if(attachments.size>=64) return null
         val cameraNow=history.currentWorldFromCamera(sample.ref) ?: return null
         val fit=SurfaceFitter.fit(sample.ref.intrinsics,pixel,sample.depth) ?: return null
+        return createPlacement(sample,pixel,cameraNow,fit)
+    }
+
+    /**
+     * User-facing placement: strict fit first, then a bounded edge-aware fit based only on measured
+     * depth evidence. Returns enough diagnostics for a host to explain a refusal instead of hiding
+     * every failure behind a generic NO_SURFACE message.
+     */
+    fun placeInteractive(sample: CameraSample,pixel: V2): PlacementAttempt {
+        owner()
+        val k=sample.ref.intrinsics
+        val radius=max(24.0,k.width*.04)
+        val valid=sample.depth.filter { it.confidence>=.5 && it.z in .15..8.0 }
+        val nearby=valid.filter { (it.pixel-pixel).norm()<=radius }
+        val nearest=valid.minOfOrNull { (it.pixel-pixel).norm() }
+        fun rejected(reason:String)=PlacementAttempt(null,"REJECTED",reason,sample.depth.size,nearby.size,nearest)
+        if(attachments.size>=64) return rejected("StableAR attachment capacity reached")
+        if(!k.contains(pixel)) return rejected("Mapped helper pixel is outside the AR camera image")
+        val cameraNow=history.currentWorldFromCamera(sample.ref)
+            ?: return rejected("The retained ARCore frame/anchor is no longer tracking")
+        if(sample.depth.isEmpty()) return rejected("ARCore returned no depth or point-cloud evidence for this exact video frame")
+        if(valid.isEmpty()) return rejected("ARCore depth exists, but none of it has usable confidence/range")
+
+        val strict=SurfaceFitter.fit(k,pixel,sample.depth)
+        val fit=strict ?: SurfaceFitter.fitInteractive(k,pixel,sample.depth,radius)
+        if(fit==null) {
+            val nearText=if(nearest==null) "none" else "%.1f px".format(java.util.Locale.US,nearest)
+            return rejected("Depth evidence is present but not coherent at this pixel (samples=${sample.depth.size}, local=${nearby.size}, nearest=$nearText)")
+        }
+        val placement=createPlacement(sample,pixel,cameraNow,fit)
+            ?: return rejected("Metric depth fit succeeded, but ARCore could not create/retain the surface anchor")
+        val mode=if(strict!=null)"STRICT" else "EDGE_AWARE"
+        return PlacementAttempt(placement,mode,
+            "$mode depth fit: ${fit.supportCount} supports, z=${"%.3f".format(java.util.Locale.US,fit.depth)} m",
+            sample.depth.size,nearby.size,nearest)
+    }
+
+    private fun createPlacement(sample: CameraSample,pixel: V2,cameraNow: Rigid,fit: SurfaceFit): Placement? {
         val world=cameraNow.point(sample.ref.intrinsics.ray(pixel)*fit.depth)
         val anchor=try { session.createAnchor(Rigid(world).arPose()) } catch(_: Exception) { return null }
         try {
@@ -64,6 +112,7 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
             return Placement(s,fit)
         } catch(t: Throwable) { anchor.detach(); throw t }
     }
+
     fun context(id: Long,sample: CameraSample,frame: Frame): ObservationContext? {
         owner(); val s=engine.snapshot(id) ?: return null
         val a=attachments[id] ?: return null
