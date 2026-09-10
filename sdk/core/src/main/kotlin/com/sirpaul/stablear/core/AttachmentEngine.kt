@@ -5,9 +5,12 @@ import kotlin.math.*
 /** Values are deliberately not sold as calibrated ARCore covariance. */
 data class LockPolicy(val minimumViews: Int=4,val minimumParallaxDeg: Double=2.0,
     val maxCorrectionM: Double=.08,val totalTravelM: Double=.15,
+    val bootstrapMaxCorrectionM: Double=3.0,
     val maxConditionalSigmaM: Double=.03,val assumedCommonTranslationSigmaM: Double=.005,
     val systematicFloorM: Double=.01,val maxObservationAgeNs: Long=2_000_000_000L) {
-    init { require(listOf(minimumParallaxDeg,maxCorrectionM,totalTravelM,maxConditionalSigmaM,assumedCommonTranslationSigmaM,systematicFloorM).all { it.isFinite() }); require(minimumViews>=3 && minimumParallaxDeg>0 && maxCorrectionM>0 && totalTravelM>0)
+    init { require(listOf(minimumParallaxDeg,maxCorrectionM,totalTravelM,bootstrapMaxCorrectionM,
+        maxConditionalSigmaM,assumedCommonTranslationSigmaM,systematicFloorM).all { it.isFinite() });
+        require(minimumViews>=3 && minimumParallaxDeg>0 && maxCorrectionM>0 && totalTravelM>0 && bootstrapMaxCorrectionM>0)
         require(maxConditionalSigmaM>0 && assumedCommonTranslationSigmaM>=0 && systematicFloorM>=0 && maxObservationAgeNs>0) }
 }
 data class RootReference(val frameId: Long,val epoch: Long,val anchorId: Long,val cameraTimestampNs: Long,
@@ -29,12 +32,13 @@ data class AttachmentSnapshot(val id: Long,val generation: Long,val root: RootRe
 }
 data class LockProposal(val attachmentId: Long,val generation: Long,val epoch: Long,val anchorId: Long,
     val depthM: Double,val conditionalSigmaM: Double,val parallaxDeg: Double,val observations: List<VisualObservation>,
-    val reason: String)
+    val reason: String,val bootstrap: Boolean=false)
 data class LockDecision(val accepted: Boolean,val reason: String,val snapshot: AttachmentSnapshot?)
 
 /** Robust one-dimensional geometric solve. Correspondence identity is a separate front-end obligation. */
 object RayRefiner {
-    fun propose(s: AttachmentSnapshot,observations: List<VisualObservation>,p: LockPolicy): LockProposal? {
+    fun propose(s: AttachmentSnapshot,observations: List<VisualObservation>,p: LockPolicy,
+        bootstrap: Boolean=false): LockProposal? {
         val root=s.root; val ray=root.cameraInAnchor.q.rotate(root.intrinsics.ray(root.pixel))
         val origin=root.cameraInAnchor.t
         val obs=observations.filter { it.epoch==root.epoch && it.anchorId==root.anchorId && it.generation==s.generation &&
@@ -49,22 +53,51 @@ object RayRefiner {
             if(a.norm()<1e-6 || b.norm()<1e-6) return 0.0
             return acos((a.dot(b)/(a.norm()*b.norm())).coerceIn(-1.0,1.0))*180/PI
         }
-        if(obs.maxOf { angle(s.depthM,it) }<p.minimumParallaxDeg) return null
-        val lo=max(.15,s.depthM-p.maxCorrectionM); val hi=min(8.0,s.depthM+p.maxCorrectionM)
-        var z=s.depthM
-        val priorSigma=max(.025,s.conditionalSigmaM)
+        fun medianResidual(z: Double,list: List<VisualObservation>): Double {
+            val values=list.map { o -> (project(z,o) ?: return Double.POSITIVE_INFINITY).minus(o.pixel).norm() }.sorted()
+            return if(values.isEmpty())Double.POSITIVE_INFINITY else values[values.size/2]
+        }
+        /**
+         * Closed-form least-squares intersection of the immutable source ray with independently
+         * observed camera rays. Unlike the depth seed, this estimate can recover a thin foreground
+         * object even when ARCore depth initially returned the background surface.
+         */
+        fun triangulatedDepth(list: List<VisualObservation>): Double? {
+            var a=0.0; var b=0.0
+            for(o in list) {
+                val d=o.cameraInAnchor.q.rotate(o.intrinsics.ray(o.pixel)).unit()
+                val c=origin-o.cameraInAnchor.t
+                val mr=ray-d*(d.dot(ray))
+                val mc=c-d*(d.dot(c))
+                a+=mr.dot(mr)
+                b+=mr.dot(mc)
+            }
+            if(!a.isFinite() || a<1e-9 || !b.isFinite()) return null
+            return (-b/a).takeIf { it.isFinite() && it in .15..8.0 }
+        }
+
+        val correctionLimit=if(bootstrap)p.bootstrapMaxCorrectionM else p.maxCorrectionM
+        val lo=max(.15,s.depthM-correctionLimit); val hi=min(8.0,s.depthM+correctionLimit)
+        var z=if(bootstrap) triangulatedDepth(obs) ?: return null else s.depthM
+        if(z !in lo..hi) return null
+        if(obs.maxOf { angle(z,it) }<p.minimumParallaxDeg) return null
+
+        // The initial metric-depth seed is only a weak prior during bootstrap. After the first
+        // verified lock it becomes a tight local prior again.
+        val priorSigma=if(bootstrap) max(.75,s.conditionalSigmaM*10) else max(.025,s.conditionalSigmaM)
         fun solve(active: List<VisualObservation>,robust: Boolean): Boolean {
-            repeat(15) {
+            repeat(if(bootstrap)20 else 15) {
                 var h=1/(priorSigma*priorSigma); var g=(z-s.depthM)*h
                 for(o in active) {
                     val predicted=project(z,o) ?: return false
-                    val a=project(z+1e-4,o) ?: return false; val b=project(z-1e-4,o) ?: return false
-                    val j=V2((a.x-b.x)/2e-4/o.sigmaPx,(a.y-b.y)/2e-4/o.sigmaPx)
+                    val aPx=project(z+1e-4,o) ?: return false; val bPx=project(z-1e-4,o) ?: return false
+                    val j=V2((aPx.x-bPx.x)/2e-4/o.sigmaPx,(aPx.y-bPx.y)/2e-4/o.sigmaPx)
                     val r=V2((predicted.x-o.pixel.x)/o.sigmaPx,(predicted.y-o.pixel.y)/o.sigmaPx)
                     val w=if(robust) min(1.0,2/r.norm().coerceAtLeast(1e-12)) else 1.0
                     h+=w*(j.x*j.x+j.y*j.y); g+=w*(j.x*r.x+j.y*r.y)
                 }
-                val step=(g/h).coerceIn(-.03,.03); z=(z-step).coerceIn(lo,hi)
+                val maxStep=if(bootstrap).15 else .03
+                val step=(g/h).coerceIn(-maxStep,maxStep); z=(z-step).coerceIn(lo,hi)
             }
             return true
         }
@@ -74,6 +107,14 @@ object RayRefiner {
         if(z-lo<1e-5 || hi-z<1e-5) return null
         if(kept.any { (project(z,it) ?: return null).minus(it.pixel).norm()>3*it.sigmaPx }) return null
         val parallax=kept.maxOf { angle(z,it) }; if(parallax<p.minimumParallaxDeg) return null
+
+        // A large bootstrap jump is legal only if visual reprojection becomes decisively better.
+        // This prevents an accidental correspondence from dragging a good metric seed across space.
+        if(bootstrap && abs(z-s.depthM)>.10) {
+            val before=medianResidual(s.depthM,kept); val after=medianResidual(z,kept)
+            if(!before.isFinite() || !after.isFinite() || after>=before*.65 || before-after<1.0) return null
+        }
+
         var h=1/(priorSigma*priorSigma); val cross=DoubleArray(3)
         for(o in kept) {
             val ap=project(z+1e-5,o) ?: return null; val am=project(z-1e-5,o) ?: return null
@@ -88,14 +129,16 @@ object RayRefiner {
         val sigma=sqrt(1/h+p.systematicFloorM.pow(2)+p.assumedCommonTranslationSigmaM.pow(2)*cross.sumOf { (it/h).pow(2) })
         if(sigma>p.maxConditionalSigmaM) return null
         return LockProposal(s.id,s.generation,root.epoch,root.anchorId,z,sigma,parallax,kept.toList(),
-            "Conditional geometry support; identity and systematic noise remain assumptions")
+            if(bootstrap)"Multi-view bootstrap geometry; held-out validation required"
+            else "Conditional geometry support; identity and systematic noise remain assumptions",bootstrap)
     }
 }
 
 /** Own-thread state machine. No learning before commit, no coordinate frame leaking through workers. */
 class AttachmentEngine(private val clock: ()->Long, val policy: LockPolicy=LockPolicy()) {
     private data class Entry(var snapshot: AttachmentSnapshot,val seedDepth: Double,
-        val observations: LinkedHashMap<Long,VisualObservation> = linkedMapOf(),var lastCommitNs: Long=0)
+        val observations: LinkedHashMap<Long,VisualObservation> = linkedMapOf(),var lastCommitNs: Long=0,
+        var lockedOnce: Boolean=false)
     private val entries=linkedMapOf<Long,Entry>(); private var nextId=0L
     fun create(root: RootReference,fit: SurfaceFit): AttachmentSnapshot {
         require(fit.depth in .15..8.0 && fit.conditionalSigma.isFinite() && fit.conditionalSigma>0)
@@ -113,13 +156,12 @@ class AttachmentEngine(private val clock: ()->Long, val policy: LockPolicy=LockP
             clock()-o.capturedNs !in 0..policy.maxObservationAgeNs || o.cameraTimestampNs<=e.lastCommitNs ||
             e.observations.containsKey(o.cameraTimestampNs)) return null
         e.observations.entries.removeAll { clock()-it.value.capturedNs !in 0..policy.maxObservationAgeNs }
-        // Adjacent frames at effectively the same viewpoint add no useful conditioning.
         val previous=e.observations.values.lastOrNull()
         if(previous!=null && ((previous.cameraInAnchor.t-o.cameraInAnchor.t).norm()<.015 ||
                 o.cameraTimestampNs-previous.cameraTimestampNs<80_000_000L)) return null
         e.observations[o.cameraTimestampNs]=o
         while(e.observations.size>12) e.observations.remove(e.observations.keys.first())
-        return RayRefiner.propose(s,e.observations.values.toList(),policy)
+        return RayRefiner.propose(s,e.observations.values.toList(),policy,bootstrap=!e.lockedOnce)
     }
     /** Recompute from retained observations; a public/caller-forged proposal cannot bypass geometric gates. */
     fun commit(proposal: LockProposal,current: VisualObservation): LockDecision {
@@ -130,10 +172,11 @@ class AttachmentEngine(private val clock: ()->Long, val policy: LockPolicy=LockP
             return reject("Stale attachment generation or tracking space")
         if(current.epoch!=s.root.epoch || current.anchorId!=s.root.anchorId || current.generation!=s.generation ||
             clock()-current.capturedNs !in 0..policy.maxObservationAgeNs) return reject("Invalid current observation")
-        val fit=RayRefiner.propose(s,e.observations.values.filter { clock()-it.capturedNs in 0..policy.maxObservationAgeNs },policy)
+        val bootstrap=!e.lockedOnce
+        val fit=RayRefiner.propose(s,e.observations.values.filter { clock()-it.capturedNs in 0..policy.maxObservationAgeNs },policy,bootstrap)
             ?: return reject("Evidence no longer supports correction")
-        if(abs(fit.depthM-proposal.depthM)>1e-8) return reject("Proposal no longer matches evidence")
-        // Commit must be corroborated by a held-out image, not one used for the solve.
+        if(fit.bootstrap!=proposal.bootstrap || abs(fit.depthM-proposal.depthM)>1e-8)
+            return reject("Proposal no longer matches evidence")
         if(fit.observations.any { it.cameraTimestampNs==current.cameraTimestampNs } ||
             current.cameraTimestampNs-(fit.observations.maxOf { it.cameraTimestampNs })<80_000_000L)
             return reject("Need a new held-out observation")
@@ -142,13 +185,18 @@ class AttachmentEngine(private val clock: ()->Long, val policy: LockPolicy=LockP
         val px=current.intrinsics.project(current.cameraInAnchor.inverse().point(point)) ?: return reject("Behind camera")
         if((px-current.pixel).norm()>2*current.sigmaPx) return reject("Held-out reprojection failed")
         val travel=(point-s.pointInAnchor()).norm()
-        if(travel>policy.maxCorrectionM || s.travelM+travel>policy.totalTravelM ||
+        if(bootstrap) {
+            if(travel>policy.bootstrapMaxCorrectionM ||
+                abs(fit.depthM-e.seedDepth)*s.root.intrinsics.ray(s.root.pixel).norm()>policy.bootstrapMaxCorrectionM)
+                return reject("Bootstrap correction travel limit")
+        } else if(travel>policy.maxCorrectionM || s.travelM+travel>policy.totalTravelM ||
             abs(fit.depthM-e.seedDepth)*s.root.intrinsics.ray(s.root.pixel).norm()>policy.totalTravelM)
             return reject("Correction travel limit")
         e.snapshot=s.copy(generation=s.generation+1,depthM=fit.depthM,conditionalSigmaM=fit.conditionalSigmaM,
-            state=LockState.GEOMETRY_SUPPORTED,travelM=s.travelM+travel)
+            state=LockState.GEOMETRY_SUPPORTED,travelM=if(bootstrap)0.0 else s.travelM+travel)
+        e.lockedOnce=true
         e.lastCommitNs=current.cameraTimestampNs; e.observations.clear()
-        return LockDecision(true,"Accepted with held-out evidence",e.snapshot)
+        return LockDecision(true,if(bootstrap)"Accepted multi-view bootstrap with held-out evidence" else "Accepted with held-out evidence",e.snapshot)
     }
     fun visibility(id: Long,visible: Boolean,lost: Boolean=false) {
         val e=entries[id] ?: return
