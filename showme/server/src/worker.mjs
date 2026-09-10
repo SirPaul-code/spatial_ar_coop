@@ -1,6 +1,7 @@
-import {ROOM_RE,ID_RE,MAX_SIGNAL_BYTES,MAX_SESSION_SECONDS,json,fail,boundedInt,cleanName,token,digest,sameSecret,bearer,readJson,approvedSignal,normalizeIce} from './policy.mjs';
+import {ROOM_RE,ID_RE,INSTALL_RE,MAX_SIGNAL_BYTES,MAX_SESSION_SECONDS,json,fail,boundedInt,cleanName,token,digest,sameSecret,bearer,readJson,approvedSignal,normalizeIce} from './policy.mjs';
 
 const SOCKET_PROTOCOL='showme.v1';
+const INSTALL_TOKEN_DAYS=365;
 const safeSend=(socket,value)=>{try{socket.send(typeof value==='string'?value:JSON.stringify(value));return true;}catch{return false;}};
 function secure(response) {
   const headers=new Headers(response.headers);
@@ -9,6 +10,25 @@ function secure(response) {
   headers.set('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   return new Response(response.body,{status:response.status,headers});
 }
+function b64url(bytes){return btoa(String.fromCharCode(...bytes)).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');}
+async function installSignature(payload,secret){
+  if(!secret)return '';
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  return b64url(new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(payload))));
+}
+async function issueInstallation(secret){
+  const id=token(18),issued=Math.floor(Date.now()/1000),expires=issued+INSTALL_TOKEN_DAYS*86400;
+  const payload=`v1.${id}.${issued}.${expires}`,signature=await installSignature(payload,secret);
+  return {id,expiresAt:expires*1000,installationToken:`${payload}.${signature}`};
+}
+async function verifyInstallation(value,secret){
+  if(typeof value!=='string'||value.length>256)return null;
+  const parts=value.split('.');if(parts.length!==5||parts[0]!=='v1'||!ROOM_RE.test(parts[1]))return null;
+  const issued=Number(parts[2]),expires=Number(parts[3]);
+  if(!Number.isInteger(issued)||!Number.isInteger(expires)||issued>Math.floor(Date.now()/1000)+300||expires<=Math.floor(Date.now()/1000))return null;
+  const payload=parts.slice(0,4).join('.'),expected=await installSignature(payload,secret);
+  return await sameSecret(parts[4],expected)?{id:parts[1],expiresAt:expires*1000}:null;
+}
 
 export default {
   async fetch(request,env) {
@@ -16,14 +36,26 @@ export default {
     try {
       const origin=request.headers.get('origin');
       if(origin&&origin!==url.origin)return fail('ORIGIN','Cross-origin access is not permitted.',403);
-      if(path==='/api/health')return json({ok:true,service:'ShowMe',protocol:3,
+      if(path==='/api/health')return json({ok:true,service:'ShowMe',protocol:4,
         configured:!!env.ROOM_CREATE_KEY,relayConfigured:!!(env.TURN_KEY_ID&&env.TURN_API_TOKEN)});
-      if(path==='/api/rooms'&&request.method==='POST') {
-        if(!await sameSecret(bearer(request),env.ROOM_CREATE_KEY))return fail('ACTIVATION_REQUIRED','Connect this phone using your ShowMe activation link.',401);
+      if(path==='/api/installations'&&request.method==='POST') {
+        if(!env.ROOM_CREATE_KEY)return fail('SERVICE_NOT_READY','ShowMe service is not configured.',503);
         const body=await readJson(request);
-        // A hard room/day ceiling on top of an unguessable owner activation key bounds demo abuse.
+        if(body.platform!=='android')return fail('CLIENT','Unsupported client.',400);
+        const remote=request.headers.get('cf-connecting-ip')||request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()||'unknown';
+        const fingerprint=(await digest(remote)).slice(0,32);
         const quota=env.ROOMS.get(env.ROOMS.idFromName('__creation_quota__'));
-        const allowed=await quota.fetch(new Request('https://room.internal/quota',{method:'POST'}));
+        const allowed=await quota.fetch(new Request('https://room.internal/install-quota',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({fingerprint})}));
+        if(!allowed.ok)return allowed;
+        const created=await issueInstallation(env.ROOM_CREATE_KEY);
+        return json({ok:true,installationToken:created.installationToken,expiresAt:created.expiresAt});
+      }
+      if(path==='/api/rooms'&&request.method==='POST') {
+        const installation=await verifyInstallation(bearer(request),env.ROOM_CREATE_KEY);
+        if(!installation)return fail('INSTALLATION_REQUIRED','This installation must register again.',401);
+        const body=await readJson(request);
+        const quota=env.ROOMS.get(env.ROOMS.idFromName('__creation_quota__'));
+        const allowed=await quota.fetch(new Request('https://room.internal/quota',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({installationId:installation.id})}));
         if(!allowed.ok)return allowed;
         const roomId=token(18),hostToken=token(24),guestToken=token(24);
         const expiresAt=Date.now()+boundedInt(env.SESSION_SECONDS,1800,300,MAX_SESSION_SECONDS)*1000;
@@ -43,7 +75,7 @@ export default {
       }
       if(path.startsWith('/api/'))return fail('NOT_FOUND','Unknown endpoint.',404);
       if(request.method!=='GET'&&request.method!=='HEAD')return fail('METHOD','Unsupported method.',405);
-      if(path==='/setup')return secure(await env.ASSETS.fetch(new Request(new URL('/setup.html',url),request)));
+      if(path==='/setup')return secure(new Response('ShowMe no longer uses activation links. Open the app and tap Start a call.',{status:410,headers:{'content-type':'text/plain; charset=utf-8'}}));
       if(path==='/')return secure(await env.ASSETS.fetch(new Request(new URL('/welcome.html',url),request)));
       if(path.startsWith('/r/')){
         if(!ROOM_RE.test(path.slice(3)))return fail('NOT_FOUND','Invalid invitation.',404);
@@ -63,7 +95,6 @@ export class ShowMeRoom {
     if(typeof WebSocketRequestResponsePair!=='undefined')ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping','pong'));
   }
   async save(){await this.ctx.storage.put('room',this.record);}
-  // getWebSockets takes one tag, not an array (Cloudflare Hibernation API).
   peers(role){return this.ctx.getWebSockets(role);}
   send(role,message){for(const socket of this.peers(role))safeSend(socket,message);}
   async role(request) {
@@ -74,12 +105,29 @@ export class ShowMeRoom {
   }
   async fetch(request) {
     const path=new URL(request.url).pathname;
+    if(path==='/install-quota'){
+      const body=await request.json(),fingerprint=String(body.fingerprint||'');
+      if(!INSTALL_RE.test(fingerprint))return fail('INVALID_REQUEST','Invalid installation fingerprint.',400);
+      const day=new Date().toISOString().slice(0,10),globalCap=boundedInt(this.env.MAX_INSTALLATIONS_PER_DAY,1000,10,100000);
+      const ipCap=boundedInt(this.env.MAX_INSTALLATIONS_PER_IP_PER_DAY,10,1,100);
+      const allowed=await this.ctx.storage.transaction(async tx=>{
+        const totalKey=`install-total:${day}`,ipKey=`install:${day}:${fingerprint}`;
+        const total=Number(await tx.get(totalKey)||0),perIp=Number(await tx.get(ipKey)||0);
+        if(total>=globalCap||perIp>=ipCap)return false;
+        await tx.put(totalKey,total+1);await tx.put(ipKey,perIp+1);return true;
+      });
+      return allowed?json({ok:true}):fail('INSTALL_RATE_LIMIT','Too many new installations. Try again later.',429);
+    }
     if(path==='/quota'){
-      const day=new Date().toISOString().slice(0,10);
-      const cap=boundedInt(this.env.MAX_ROOMS_PER_DAY,20,1,500);
+      const body=await request.json(),installationId=String(body.installationId||'');
+      if(!ROOM_RE.test(installationId))return fail('INVALID_REQUEST','Invalid installation.',400);
+      const day=new Date().toISOString().slice(0,10),globalCap=boundedInt(this.env.MAX_ROOMS_PER_DAY,1000,10,100000);
+      const installCap=boundedInt(this.env.MAX_ROOMS_PER_INSTALL_PER_DAY,50,1,1000);
       const value=await this.ctx.storage.transaction(async tx=>{
-        const q=await tx.get('quota');const next={day,count:q?.day===day?q.count+1:1};
-        if(next.count>cap)return false;await tx.put('quota',next);return true;
+        const totalKey=`room-total:${day}`,installKey=`room:${day}:${installationId}`;
+        const total=Number(await tx.get(totalKey)||0),perInstall=Number(await tx.get(installKey)||0);
+        if(total>=globalCap||perInstall>=installCap)return false;
+        await tx.put(totalKey,total+1);await tx.put(installKey,perInstall+1);return true;
       });
       return value?json({ok:true}):fail('DAILY_LIMIT','Daily session limit reached. Try again tomorrow.',429);
     }
@@ -107,7 +155,7 @@ export class ShowMeRoom {
       this.send('guest',{type:'owner-online'});
       if(this.record.guestId&&!this.record.approved)safeSend(server,{type:'join-request',viewerId:this.record.guestId,name:this.record.guestName});
     }
-    safeSend(server,{type:'hello',role,expiresAt:this.record.expiresAt,ownerName:this.record.ownerName,protocol:3});
+    safeSend(server,{type:'hello',role,expiresAt:this.record.expiresAt,ownerName:this.record.ownerName,protocol:4});
     const protocols=(request.headers.get('sec-websocket-protocol')||'').split(',').map(v=>v.trim());
     return new Response(null,{status:101,webSocket:client,headers:protocols.includes(SOCKET_PROTOCOL)?{'Sec-WebSocket-Protocol':SOCKET_PROTOCOL}:{}});
   }
@@ -116,7 +164,6 @@ export class ShowMeRoom {
     if(cached&&Date.now()<cached.expiresAt-60_000)return json({ok:true,iceServers:cached.servers,expiresAt:cached.expiresAt});
     if(!this.env.TURN_KEY_ID||!this.env.TURN_API_TOKEN)
       return fail('RELAY_NOT_CONFIGURED','The ShowMe service needs its TURN key configured before Internet calls.',503);
-    // Credentials last beyond the maximum room lifetime, but never live inside the APK/source.
     const ttl=Math.min(MAX_SESSION_SECONDS+300,Math.max(600,Math.ceil((this.record.expiresAt-Date.now())/1000)+120));
     const response=await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(this.env.TURN_KEY_ID)}/credentials/generate-ice-servers`,{
       method:'POST',headers:{Authorization:`Bearer ${this.env.TURN_API_TOKEN}`,'Content-Type':'application/json'},body:JSON.stringify({ttl})});
@@ -154,7 +201,6 @@ export class ShowMeRoom {
     if(message.type==='end'&&attachment.role==='host'){await this.finish();return;}
     const approved=!!this.record.approved&&(attachment.role==='host'||this.record.approved===attachment.viewerId);
     if(approvedSignal(message,attachment.role,approved)){
-      // Forward only fields from the signaling protocol; never accept camera frames or arbitrary RPC.
       const outgoing=message.type==='offer'?{type:'offer',id:message.id,sdp:message.sdp,viewerId:attachment.viewerId}:
         {type:'answer',id:message.id,sdp:message.sdp,video:message.video,ok:message.ok!==false,message:message.message};
       this.send(attachment.role==='host'?'guest':'host',outgoing);return;
@@ -164,10 +210,7 @@ export class ShowMeRoom {
   async webSocketClose(socket,code,reason) {
     const a=socket.deserializeAttachment();if(!this.record||!a)return;
     if(a.role==='host'&&a.id===this.record.hostConnection)this.send('guest',{type:'owner-offline'});
-    if(a.role==='guest'&&a.viewerId===this.record.guestId){
-      this.send('host',{type:'helper-left',viewerId:a.viewerId});
-      // Retain approval for reconnect with the same random viewer ID, until expiry.
-    }
+    if(a.role==='guest'&&a.viewerId===this.record.guestId)this.send('host',{type:'helper-left',viewerId:a.viewerId});
     try{socket.close(code,reason);}catch{}
   }
   async webSocketError(socket){await this.webSocketClose(socket,1011,'Connection interrupted');}
