@@ -2,42 +2,50 @@
 
 Runtime commit: `46cde39bd60826d2965b7bb4801b743cee83c9a7`.
 Branch: `showme/local-assist`.
-The documentation-only commit containing this file does not alter the APK runtime.
+Documentation-only commits after this runtime do not change the APK implementation.
 
-## Verified build, not yet a published GitHub Release
+## Published Android prerelease
 
-GitHub Actions run `34416568515`, job `102682658872`, workflow `showme-local-ci` run 2 / attempt 1:
+Verified on 2026-09-10: GitHub Actions run `34416568515`, attempt **2**, job `102783849689`, completed successfully, including publication.
 
 - Original Spatial Sync runtime protection check: passed.
-- Node browser protocol/geometry tests: 10 passed.
-- Playwright browser tests: 6 passed across desktop and mobile layouts. Camera input is explicitly mocked for these UI tests.
-- JVM tests: 17 passed (5 geometry, 9 protocol/policy, 3 real loopback HTTP/WebSocket integration tests).
-- Android compilation, debug and release APKs: passed.
-- Android debug/release lint: 0 errors; app warnings remain.
+- Browser protocol tests and Playwright browser tests: passed. Browser UI camera input is mocked; these are not physical AR acceptance tests.
+- Android unit tests, compilation, debug/release lint and debug/release APK packaging: passed.
 - APK signature verification: passed.
 - Artifact upload: passed.
-- GitHub Release publication: FAILED with HTTP 403, `Resource not accessible by integration`; GitHub's response mentions the workflow token's missing `workflows` permission.
+- Separate ShowMe GitHub prerelease publication: passed.
 
-Do NOT describe the entire workflow as green and do NOT claim `showme-local-2-1` was published. A release permission/tag-publication fix is still needed. Do not alter the original `latest-dev` or other branches to work around this.
+Release tag: `showme-local-2-2`.
+Release ID: `386082046`.
+Release target: `46cde39bd60826d2965b7bb4801b743cee83c9a7`.
 
-## Deliverable artifact
+Release page:
+https://github.com/SirPaul-code/spatial_ar_coop/releases/tag/showme-local-2-2
 
-Run artifact `10129422707`, name `showme-local-apks`, contains:
+Signed release APK:
+https://github.com/SirPaul-code/spatial_ar_coop/releases/download/showme-local-2-2/ShowMe-local-release.apk
 
-- `ShowMe-local-release.apk` (189468155 bytes)
-- `ShowMe-local-debug.apk`
-- `ShowMe-SHA256SUMS.txt`
-- `ShowMe-signature.txt`
-- `ShowMe-source.zip` (includes the required original Android source dependencies and wrapper)
+Release APK asset ID: `554504961`.
+Size: `189468155` bytes.
+SHA-256:
+`7ee78887a754cc7e9421ff7bfb24f11fb36e165607235f396830cf9c22108273`
 
-The signed release APK was extracted from this artifact and checked against its SHA-256:
+The release also contains `ShowMe-local-debug.apk`, `ShowMe-SHA256SUMS.txt`, `ShowMe-signature.txt`, and `ShowMe-source.zip`.
 
-`87d999a6c8864e0a20f7624834e6251ce372c2c06d14de47a667613c670794ba`
+App ID: `com.sirpaul.showme`; it installs alongside Spatial Sync. Minimum SDK: 33. Version name: `0.1.0-local.2`; this second build attempt has version code `10022`. Signing uses the existing public development sideload certificate, NOT a private production/Play signing identity.
 
-App ID: `com.sirpaul.showme`; it installs alongside Spatial Sync. Signing is the existing public development sideload certificate, NOT a private production/Play signing identity.
+## Previous failed publication is no longer a blocker
+
+Attempt 1 built and signed the app successfully, but failed during GitHub Release creation. The retrieved job log reports HTTP 500; an earlier version of this handoff described HTTP 403/missing workflow permissions. Do not treat that earlier diagnosis as an established current blocker: attempt 2 succeeded without code, workflow, or permission changes. Do not claim that `showme-local-2-1` exists.
+
+The older attempt-1 artifact `10129422707` contains an APK with SHA-256 `87d999a6c8864e0a20f7624834e6251ce372c2c06d14de47a667613c670794ba`. It is the same runtime source but a different build/version code; prefer the published attempt-2 APK above.
+
+No changes were made to `android/`, `.github/workflows/ci.yml`, Spatial Sync `latest-dev`, or the outdoor branch for this rebuild/publication.
 
 ## Remaining validation
 
 No physical two-device AR placement test has been performed by the agent. Follow `RELEASE_CHECKLIST.md`, especially freezing a browser frame, moving the camera, then placing a mark on that old image. A successful build and synthetic geometry tests are not a centimeter-accuracy measurement.
 
-Current scope is local Wi-Fi/hotspot camera streaming and AR annotations with owner approval. Ordinary LAN HTTP helper microphone remains restricted by browser secure-context requirements; native-to-browser listen-only audio is implemented but still needs the device/browser test. Internet sessions, accounts, billing, licences, TLS deployment and TURN are not deployed.
+Current scope is local Wi-Fi/hotspot camera streaming and AR annotations with owner approval. The helper opens the invite in a browser and does not install an app. A shared link still requires LAN/hotspot reachability; it is not an Internet session.
+
+Ordinary LAN HTTP helper microphone remains restricted by browser secure-context requirements; native-to-browser listen-only audio is implemented but still needs a device/browser test. Use a trusted WPA-protected LAN/hotspot and do not expose the embedded HTTP endpoint publicly. Internet sessions, accounts, billing, licences, TLS deployment and TURN are not deployed.
