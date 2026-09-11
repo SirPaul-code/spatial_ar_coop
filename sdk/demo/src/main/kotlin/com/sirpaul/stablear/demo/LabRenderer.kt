@@ -1,5 +1,6 @@
 package com.sirpaul.stablear.demo
 
+import android.content.Context
 import android.opengl.*
 import com.google.ar.core.*
 import com.sirpaul.stablear.arcore.*
@@ -13,7 +14,7 @@ import javax.microedition.khronos.opengles.GL10
 import org.json.JSONObject
 import kotlin.math.*
 
-class LabRenderer(private val status: (String)->Unit,private val rotation: ()->Int): GLSurfaceView.Renderer {
+class LabRenderer(private val context: Context,private val status: (String)->Unit,private val rotation: ()->Int): GLSurfaceView.Renderer {
     @Volatile var session: Session?=null
     @Volatile var running=false
     @Volatile var compareInitial=true
@@ -22,7 +23,7 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
     private val layer=CameraLayer()
     private val worker=Executors.newSingleThreadExecutor()
     private val busy=AtomicBoolean(false); private val reset=AtomicBoolean(false)
-    private val tracker=LocalSurfaceTracker()
+    private val tracker=DemoVisionBackend(context)
     private val lifecycle=AtomicLong(1)
     private data class Displayed(val sample: CameraSample,val viewToImage: FloatArray,val width: Int,val height: Int)
     private data class Tap(val displayed: Displayed,val x: Float,val y: Float)
@@ -75,7 +76,7 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
                 val o=VisualObservation(c.frame.id,c.root.epoch,c.root.anchorId,c.generation,
                     c.frame.cameraTimestampNs,c.frame.capturedNs,c.cameraInAnchor,c.frame.intrinsics,
                     match.pixel,match.inliers,match.forwardBackwardPx,match.medianReprojectionPx)
-                val decision=sdk.observe(c.id,o); reason=decision.reason
+                val decision=sdk.observe(c.id,o); reason="${match.method}: ${decision.reason}"
                 if(decision.accepted) corrections++
             }
             tap.getAndSet(null)?.let { command ->
@@ -89,7 +90,7 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
                     if(p==null) reason="No supported surface at this pixel. Move sideways and retry."
                     else if(gray!=null) {
                         worker.execute { tracker.add(p.attachment.id,gray.bytes,gray.width,gray.height,pixel) }
-                        reason="Anchored. Move sideways for independent verification."
+                        reason="Anchored. XFeat/LiteRT preferred; LK/ORB fallback. Move sideways for verification."
                     } else reason="Anchored with depth; visual reference unavailable."
                 }
             }
@@ -143,7 +144,7 @@ class LabRenderer(private val status: (String)->Unit,private val rotation: ()->I
         val p95=durations.sorted()[(durations.size*.95).toInt().coerceAtMost(durations.size-1)]
         val n=sdk.engine.snapshots().size
         status("StableAR Lab | $n anchors | $corrections accepted corrections\n$reason\nRender CPU p95: ${"%.1f".format(p95)} ms | Yellow: initial, green: refined")
-        metrics=JSONObject().put("sdk","0.1.0-research").put("model",android.os.Build.MODEL)
+        metrics=JSONObject().put("sdk","0.2.0-xfeat").put("model",android.os.Build.MODEL)
             .put("frames",frames).put("anchors",n).put("acceptedCorrections",corrections)
             .put("renderCpuP95Ms",p95).put("historyAnchors",sdk.history.anchorCount())
             .put("attachments",org.json.JSONArray().also { array ->
