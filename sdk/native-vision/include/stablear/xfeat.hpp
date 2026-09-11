@@ -72,8 +72,10 @@ struct XFeatMatch {
  * This class does not run the neural network. LiteRT/CoreML/other platform runtimes own inference
  * and pass their borrowed output buffers here. StableAR remains the geometry authority.
  *
- * Template updates are explicit. Call addTemplate only after an independently accepted StableAR
- * observation/commit; the tracker never self-trains from its own unverified match.
+ * The root is immutable. Direct addTemplate remains available for already-verified callers, but the
+ * safer asynchronous path is stageTemplate -> independent StableAR geometric/held-out acceptance ->
+ * commitStagedTemplate. Staging copies only the local descriptor patch from the exact current map.
+ * At most one staged candidate exists per attachment; a newer candidate invalidates the older token.
  */
 class XFeatLocalTracker {
 public:
@@ -88,6 +90,14 @@ public:
     bool addTemplate(uint64_t id, const XFeatMapView& map, V2 pixel, XFeatView view = {});
     bool beginFrame(uint64_t frame_id, const XFeatMapView& map);
     std::optional<XFeatMatch> track(uint64_t id, V2 predicted_pixel, XFeatView current_view = {});
+
+    /** Snapshot a candidate patch from the current exact frame without admitting it to the bank. */
+    std::optional<uint64_t> stageTemplate(uint64_t id, V2 pixel, XFeatView view = {});
+    /** Admit only the exact staged patch represented by token. Attachment id must also match. */
+    bool commitStagedTemplate(uint64_t id, uint64_t token);
+    /** Drop a candidate after rejection/staleness. A stale or mismatched token is a no-op. */
+    void discardStagedTemplate(uint64_t id, uint64_t token);
+
     void remove(uint64_t id);
     void clear();
     const XFeatPolicy& policy() const;

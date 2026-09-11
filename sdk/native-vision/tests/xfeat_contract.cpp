@@ -85,13 +85,35 @@ int main() {
     assert(match->sigma_px >= 0.5 && match->sigma_px <= 4.0);
     assert(match->image.method == "XFEAT_PATCH");
 
-    XFeatView high_quality;
-    high_quality.direction = V3{0.0, 0.0, 1.0};
-    high_quality.reliability = 0.95;
-    assert(tracker.addTemplate(7, current.view(), match->image.pixel, high_quality));
+    XFeatView verified_view;
+    verified_view.direction = V3{0.0, 0.0, 1.0};
+    verified_view.reliability = 0.95;
 
+    // Staging must not mutate the bank, and only the newest pending patch for an attachment remains valid.
+    const auto stale_token = tracker.stageTemplate(7, match->image.pixel, verified_view);
+    assert(stale_token.has_value());
+    verified_view.reliability = 0.96;
+    const auto accepted_token = tracker.stageTemplate(7, match->image.pixel, verified_view);
+    assert(accepted_token.has_value() && *accepted_token != *stale_token);
+    assert(!tracker.commitStagedTemplate(7, *stale_token));
+    assert(!tracker.commitStagedTemplate(8, *accepted_token));
+
+    // Change the active frame before commit. Commit must use the descriptor snapshot captured by stage,
+    // not whichever map happens to be current when geometric acceptance arrives asynchronously.
+    assert(tracker.beginFrame(11, root.view()));
+    assert(tracker.commitStagedTemplate(7, *accepted_token));
+    assert(!tracker.commitStagedTemplate(7, *accepted_token));
+
+    // Explicit direct admission is retained for already-verified native callers.
+    assert(tracker.addTemplate(7, current.view(), match->image.pixel, verified_view));
+
+    assert(tracker.beginFrame(12, current.view()));
+    const auto removable = tracker.stageTemplate(7, match->image.pixel, verified_view);
+    assert(removable.has_value());
     tracker.remove(7);
+    assert(!tracker.commitStagedTemplate(7, *removable));
     assert(!tracker.track(7, root_px));
+
     std::cout << "StableAR XFeat contract passed\n";
     return 0;
 }

@@ -50,6 +50,14 @@ STABLEAR_VISION_API int stablear_xfeat_add_root(stablear_xfeat_tracker* tracker,
 STABLEAR_VISION_API int stablear_xfeat_add_template(stablear_xfeat_tracker* tracker,uint64_t attachment_id,const float* descriptors,const float* reliability,int cells_width,int cells_height,int image_width,int image_height,double pixel_x,double pixel_y,int has_view_direction,double view_x,double view_y,double view_z,double scale,double reliability_score);
 STABLEAR_VISION_API int stablear_xfeat_begin_frame(stablear_xfeat_tracker* tracker,uint64_t frame_id,const float* descriptors,const float* reliability,int cells_width,int cells_height,int image_width,int image_height);
 STABLEAR_VISION_API int stablear_xfeat_track(stablear_xfeat_tracker* tracker,uint64_t attachment_id,double predicted_x,double predicted_y,int has_view_direction,double view_x,double view_y,double view_z,double scale,double reliability_score,stablear_xfeat_match* out_match);
+/*
+ * Safe asynchronous template admission. stage copies only the local descriptor patch from the
+ * current exact frame and returns an opaque token. It does NOT alter the active template bank.
+ * A newer staged candidate for the same attachment invalidates the older token.
+ */
+STABLEAR_VISION_API uint64_t stablear_xfeat_stage_template(stablear_xfeat_tracker* tracker,uint64_t attachment_id,double pixel_x,double pixel_y,int has_view_direction,double view_x,double view_y,double view_z,double scale,double reliability_score);
+STABLEAR_VISION_API int stablear_xfeat_commit_staged_template(stablear_xfeat_tracker* tracker,uint64_t attachment_id,uint64_t token);
+STABLEAR_VISION_API void stablear_xfeat_discard_staged_template(stablear_xfeat_tracker* tracker,uint64_t attachment_id,uint64_t token);
 STABLEAR_VISION_API void stablear_xfeat_remove(stablear_xfeat_tracker* tracker,uint64_t attachment_id);
 STABLEAR_VISION_API void stablear_xfeat_clear(stablear_xfeat_tracker* tracker);
 #ifdef __cplusplus
