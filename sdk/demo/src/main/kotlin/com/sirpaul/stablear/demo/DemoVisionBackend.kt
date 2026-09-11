@@ -5,15 +5,7 @@ import com.sirpaul.stablear.core.V2
 import com.sirpaul.stablear.nativevision.XFeatLiteRtTracker
 import com.sirpaul.stablear.vision.LocalSurfaceTracker
 
-/**
- * Reference integration used by the lab app.
- *
- * XFeat/LiteRT is the preferred image-correspondence source. The established LK/ORB tracker stays
- * available as a deterministic fallback so a device without a supported LiteRT GPU can still run
- * the complete StableAR geometry pipeline.
- *
- * One instance is owned by the demo's single vision worker thread.
- */
+/** Reference integration for the lab app: XFeat/LiteRT first, LK/ORB fallback. */
 internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
     data class Match(
         val pixel: V2,
@@ -27,6 +19,7 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
     )
 
     private val fallback = LocalSurfaceTracker()
+    private val ids = linkedSetOf<Long>()
     private var xfeatAttempted = false
     private var xfeat: XFeatLiteRtTracker? = null
     private var currentFrameId = Long.MIN_VALUE
@@ -52,39 +45,30 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
         currentHeight = height
         val ml = learned() ?: return
         try {
-            if (!ml.beginFrame(id, gray, width, height)) {
-                ml.close()
-                xfeat = null
-            }
+            if (!ml.beginFrame(id, gray, width, height)) disableLearned(ml)
         } catch (_: Throwable) {
-            runCatching { ml.close() }
-            xfeat = null
+            disableLearned(ml)
         }
     }
 
-    /** Captures both learned and classical immutable root evidence from the exact placement frame. */
+    /** Captures immutable root evidence from the exact placement exposure for both backends. */
     fun add(id: Long, gray: ByteArray, width: Int, height: Int, pixel: V2): Boolean {
         val classical = fallback.add(id, gray, width, height, pixel)
-        val ml = learned()
         var learnedAdded = false
+        val ml = learned()
         if (ml != null) {
             try {
-                // Placement can refer to a previously displayed frame, so never assume current ML
-                // descriptors correspond to this root exposure.
-                if (currentFrameId == gray.hashCode().toLong()) {
+                if (ml.beginFrame(rootFrameId(id, gray), gray, width, height)) {
                     learnedAdded = ml.addRoot(id, pixel.x, pixel.y)
-                } else if (ml.beginFrame(rootFrameId(id, gray), gray, width, height)) {
-                    learnedAdded = ml.addRoot(id, pixel.x, pixel.y)
-                    // Restore the latest live frame so subsequent track() uses the correct exposure.
-                    currentGray?.let { live ->
-                        if (currentFrameId != Long.MIN_VALUE) ml.beginFrame(currentFrameId, live, currentWidth, currentHeight)
-                    }
+                }
+                currentGray?.let { live ->
+                    if (currentFrameId != Long.MIN_VALUE) ml.beginFrame(currentFrameId, live, currentWidth, currentHeight)
                 }
             } catch (_: Throwable) {
-                runCatching { ml.close() }
-                xfeat = null
+                disableLearned(ml)
             }
         }
+        if (learnedAdded || classical) ids += id
         return learnedAdded || classical
     }
 
@@ -95,19 +79,15 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
                 try {
                     ml.track(id, predicted.x, predicted.y)?.let { m ->
                         return Match(
-                            pixel = V2(m.x, m.y),
-                            inliers = m.inliers,
+                            pixel = V2(m.x, m.y), inliers = m.inliers,
                             reprojectionPx = m.medianReprojectionPx,
                             forwardBackwardPx = m.medianReprojectionPx,
-                            sigmaPx = m.sigmaPx,
-                            method = "XFEAT_LITERT",
-                            score = m.score,
-                            scoreMargin = m.scoreMargin,
+                            sigmaPx = m.sigmaPx, method = "XFEAT_LITERT",
+                            score = m.score, scoreMargin = m.scoreMargin,
                         )
                     }
                 } catch (_: Throwable) {
-                    runCatching { ml.close() }
-                    xfeat = null
+                    disableLearned(ml)
                 }
             }
         }
@@ -116,23 +96,28 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
     }
 
     fun remove(id: Long) {
+        ids -= id
         fallback.remove(id)
         runCatching { xfeat?.remove(id) }
     }
 
     fun clear() {
-        fallback.close()
+        ids.toList().forEach(::remove)
         runCatching { xfeat?.clear() }
     }
 
     override fun close() {
+        clear()
         runCatching { xfeat?.close() }
         xfeat = null
         fallback.close()
     }
 
-    private fun rootFrameId(id: Long, gray: ByteArray): Long {
-        // Positive deterministic id local to this worker; it is only an inference-frame identity.
-        return ((id shl 32) xor gray.contentHashCode().toLong()).and(Long.MAX_VALUE).coerceAtLeast(1L)
+    private fun disableLearned(ml: XFeatLiteRtTracker) {
+        runCatching { ml.close() }
+        if (xfeat === ml) xfeat = null
     }
+
+    private fun rootFrameId(id: Long, gray: ByteArray): Long =
+        ((id shl 32) xor gray.contentHashCode().toLong()).and(Long.MAX_VALUE).coerceAtLeast(1L)
 }
