@@ -121,6 +121,30 @@ jobs:
           unzip -l sdk/native-vision-android/build/outputs/aar/native-vision-android-release.aar | tee native-vision-aar.txt
           grep -q 'jni/arm64-v8a/' native-android-aar.txt
           grep -q 'jni/arm64-v8a/' native-vision-aar.txt
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import zipfile
+          from pathlib import Path
+
+          manifest = json.loads(Path('sdk/models/xfeat/manifest.json').read_text())
+          aar = Path('sdk/native-vision-android/build/outputs/aar/native-vision-android-release.aar')
+          with zipfile.ZipFile(aar) as zf:
+              names = zf.namelist()
+              asset = 'assets/models/xfeat.tflite'
+              if asset not in names:
+                  raise SystemExit(f'{asset} missing from {aar}')
+              data = zf.read(asset)
+              if len(data) != manifest['size_bytes']:
+                  raise SystemExit(f'XFeat size mismatch: {len(data)} != {manifest["size_bytes"]}')
+              digest = hashlib.sha256(data).hexdigest()
+              if digest != manifest['sha256']:
+                  raise SystemExit(f'XFeat SHA-256 mismatch: {digest} != {manifest["sha256"]}')
+              duplicate_stl = [name for name in names if name.endswith('/libc++_shared.so')]
+              if duplicate_stl:
+                  raise SystemExit(f'StableAR vision AAR must not package libc++_shared.so: {duplicate_stl}')
+          print('PASS: pinned XFeat model payload and no duplicate StableAR shared STL')
+          PY
       - name: Android diagnostics
         if: always()
         uses: actions/upload-artifact@v4
