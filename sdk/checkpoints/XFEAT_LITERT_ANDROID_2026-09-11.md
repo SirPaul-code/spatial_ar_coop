@@ -1,98 +1,145 @@
-# XFeat LiteRT Android checkpoint — 2026-09-11
+# XFeat + LiteRT Android / portable matcher checkpoint — 2026-09-11
 
 Branch: `stablear/multiplatform-sdk`
+Frozen Android reference: `research_sdk@38978da448b6610606e9145367b9b31328bb5cc0`
+Documented code checkpoint: `e461e81c375e3875237ab0286718af1d4a4f7939`
 
-## Goal
+## Outcome
 
-Add a ready-made learned visual-correspondence backend for StableAR without replacing ARCore/ARKit/OpenXR geometry. XFeat is visual evidence only: the host projects the material 3D point into the current frame, XFeat searches locally around that prediction, and StableAR geometry decides whether/how to use the residual.
+The XFeat idea is no longer just research. StableAR now has:
 
-## Upstream model contract
+- a pinned Apache-2.0 XFeat LiteRT model;
+- an Android LiteRT execution path;
+- a runtime-neutral C++ learned-correspondence matcher;
+- arbitrary-tap 5x5 dense descriptor fingerprinting;
+- source/model coordinate mapping and source-space uncertainty;
+- LK/ORB fallback;
+- post-geometric-acceptance staged multi-view template admission;
+- geometric view direction + perspective-scale metadata;
+- an OpenCV-independent `StableAR::xfeat` target;
+- an iOS device+simulator `StableARXFeatNative.xcframework` build path.
 
-Pinned model metadata lives in `sdk/models/xfeat/manifest.json`.
+XFeat still does **not** replace ARCore/ARKit/OpenXR VIO and never directly moves an attachment.
 
-- upstream: `litert-community/xfeat-litert`
+## Model pin
+
+- repo: `litert-community/xfeat-litert`
 - revision: `bd421aad1ce6d25dc172cd9579cc13b9da21356f`
-- artifact: `xfeat.tflite`
-- size: `1,414,480` bytes
+- file: `xfeat.tflite`
+- bytes: `1,414,480`
 - SHA-256: `6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df`
-- license: Apache-2.0
-- input: float32 `[1,480,640,1]`, grayscale + per-image InstanceNorm
-- output 0: descriptors `[1,64,60,80]`
-- output 1: keypoint logits `[1,65,60,80]`
-- output 2: reliability `[1,1,60,80]`
+- input: `[1,480,640,1]` Float32 grayscale after per-image InstanceNorm
+- dense descriptors: `[1,64,60,80]`
+- reliability: `[1,1,60,80]`
 
-## Implemented in this checkpoint
+`sdk/models/xfeat/manifest.json` is the build integrity record. Android CI checks the exact asset hash and size inside the release AAR.
 
-### Shared C++
+## Android implementation
 
-Existing `XFeatLocalTracker` is retained as the platform-independent matcher. It already has bounded coarse-to-fine search, a local descriptor fingerprint, ambiguity rejection, multi-view templates, and explicit-only template admission.
+`XFeatLiteRtTracker` owns one persistent LiteRT `CompiledModel` and reusable tensor buffers on its vision worker. GPU is attempted first and CPU is the fallback.
 
-Two correctness fixes were added:
+Coordinates are explicit:
+- caller/StableAR uses source CPU-image pixels;
+- model uses fixed 640x480 pixels;
+- wrapper uses half-pixel resize transforms in both directions;
+- returned point and `sigmaPx` are source-image units;
+- XFeat patch-consensus residual remains a fixed-model-raster quality metric rather than being mislabeled as a source-pixel geometric error.
 
-1. Android Clang rejected aggregate/default construction because `XFeatLocalTracker` has an explicit constructor. `stablear_xfeat_tracker` now explicitly constructs it with `XFeatPolicy{}`.
-2. The C ABI previously let `beginFrame()` retain a borrowed descriptor pointer past the call. This is unsafe through JNI because `GetFloatArrayElements` may return temporary storage. `stablear_xfeat_tracker` now owns copies of the current descriptor and reliability maps until the next frame/clear/destroy.
+The placement root uses the actual grayscale image timestamp. No synthetic visual frame id is generated.
 
-Relevant commits:
+When there are zero active attachments, the demo does not schedule XFeat inference.
 
-- `77916efaa715234588a269891eb4c512d2020dca` — explicit XFeat construction fix
-- `07811d256a3717842556015f476cd7f07212c6b8` — native ownership of current XFeat frame buffers
+## Anti-drift multi-view bank
 
-### Android model packaging
+A raw XFeat match is never admitted as a new template.
 
-`native-vision-android` now has a deterministic `prepareXFeatModel` build task which downloads the exact pinned artifact, verifies SHA-256 and byte size, and packages it under `assets/models/xfeat.tflite`.
+Safe flow:
 
-LiteRT dependency is pinned to `com.google.ai.edge.litert:litert:2.2.0`.
+```text
+inference frame A
+   -> XFeat match
+   -> copy/stage local descriptor patch from A
+   -> inert token
+   -> StableAR geometry + held-out validation on AR owner thread
+        -> accepted: commit exact staged patch
+        -> rejected/stale: discard token
+```
 
-Commit: `377abf45a885c39be3b2e9ef6ba35a77f3a52863`.
+Properties:
+- at most one pending candidate per attachment;
+- newer candidate invalidates older token;
+- token must match attachment id;
+- commit does not read the current descriptor map;
+- changing to frame B before commit still commits the snapshot from frame A;
+- remove/reset purges pending candidates.
 
-### Android runtime prototype
+The shared C++ contract tests these conditions.
 
-`XFeatLiteRtTracker.kt` now:
+## Viewpoint metadata
 
-- creates one persistent LiteRT `CompiledModel`, GPU preferred;
-- creates persistent input/output tensor buffers once;
-- resizes grayscale to 640x480 and mirrors the shared InstanceNorm contract;
-- runs XFeat;
-- reads descriptor output 0 and reliability output 2;
-- feeds them into the shared C++ `XFeatLocalTracker` through JNI;
-- supports root capture, bounded tracking, explicit multi-view template admission, remove/clear;
-- enforces single-worker-thread ownership.
+For each current observation the lab derives, in anchor coordinates:
 
-JNI XFeat bridge commit: `441093ce8c38660d44ffb83796505fc9a65dcbcd`.
-Android LiteRT runtime commit: `282e2556ee0689d5e170e8e08d16267489a1f2e2`.
-Android enum exposure commit: `de920af7e4ddbcefc58103377312f959cef69894`.
+- `viewDirection = normalize(cameraPosition - materialPoint)`;
+- `scale = clamp(rootPointCameraZ / currentPointCameraZ, 0.5, 2.0)`.
 
-## Deliberate prototype limitations
+The bank uses direction for same-view replacement/deduplication and uses relative template scale to resize descriptor-patch offsets. This is intended to keep the bounded max-8 bank diverse across orbit/distance changes.
 
-This is not yet the final shipping data path.
+## Packaging fixes
 
-The public Kotlin LiteRT API currently reads the approximately 307k-float descriptor tensor into a `FloatArray`, then JNI copies/borrows it for the native call, and the C ABI copies the current map for safe lifetime. This is acceptable for proving end-to-end correctness but is too much memory traffic for the final high-rate mobile backend.
+The official OpenCV Android AAR already supplies `libc++_shared.so`. StableAR's vision AAR excludes its duplicate copy, preventing `mergeDebugNativeLibs` collisions. CI checks that the StableAR vision AAR does not package another shared STL.
 
-Do not optimize this by reintroducing borrowed cross-call pointers. The shipping solution should make LiteRT output memory directly consumable by native matching, using persistent native/host buffers or a supported zero-copy buffer type.
+The learned matcher was split from the OpenCV frontend at `e461e81...`:
+- `StableAR::xfeat` — XFeat preprocessing/matching/C ABI, no OpenCV;
+- `StableAR::vision` — classical LK/ORB OpenCV frontend;
+- Android JNI explicitly links both;
+- Apple can build XFeat without OpenCV.
 
-The CPU fallback is not a performance target for this XFeat graph. Production policy should prefer LiteRT GPU and fall back to the existing OpenCV tracker when XFeat GPU initialization/inference is unavailable.
+## CI evidence
 
-No code in this checkpoint gives ML authority to mutate world anchors directly. XFeat returns image-space evidence plus score/ambiguity/reliability/sigma; geometry must gate corrections.
+Fully green software baseline:
+- commit `147abb6d32d5bb98cc23c8ae31cb54d8de59fbb2`
+- workflow run #33 / `34625962958`
+- Linux native, Android AAR/reference demo, Apple and Unity all green.
 
-## CI state
+Shared staged-template C++ contract was green in later native-linux CI.
 
-The pre-XFeat Android CI failure at head `0fad1fb...` was diagnosed from the uploaded Android diagnostics artifact. Native Linux, Apple and Unity jobs were green; Android failed only on the explicit-constructor Clang error described above.
+For code checkpoint `e461e81c375e3875237ab0286718af1d4a4f7939`, workflow run #39 / `34628410948` is the authoritative verification run. Its Apple job is already green, proving device+simulator XFeat XCFramework compilation; inspect final Linux/Android status before marking the whole checkpoint green.
 
-After the fixes/runtime commits, GitHub Actions run `34619815226` for head `07811d...` was still pending at the time this checkpoint was written because the immediately previous run was being superseded by branch concurrency. Do not record this checkpoint as CI-green until the newest run completes.
+## Apple runtime decision
 
-## Precise next steps
+`StableARXFeatNative.xcframework` is the portable matcher, **not** XFeat neural execution yet.
 
-1. Let the newest `stablear-multiplatform` run complete. If Android fails, download the `stablear-android-diagnostics-*` artifact and fix the exact compiler/Gradle/LiteRT issue rather than guessing.
-2. Once Android assembles, inspect `native-vision-android-release.aar` and assert that `assets/models/xfeat.tflite` exists and matches the pinned SHA-256. Add that assertion to CI.
-3. Add an Android instrumentation/device smoke test that initializes `CompiledModel(GPU)`, runs one deterministic fixture frame, verifies output shapes/finiteness, and performs one known local match.
-4. Add a build/test parity fixture proving Kotlin preprocessing matches `prepareXFeatInput` numerically.
-5. Replace the prototype descriptor `FloatArray` roundtrip with a native/persistent LiteRT buffer path. Preserve frame lifetime and thread ownership contracts.
-6. Wire XFeat observations into the existing StableAR held-out reprojection/depth acceptance pipeline. Carry source frame id, timestamp, epoch/generation and `XFeatMatch.sigma_px` into observation metrics.
-7. Admit new view templates only after independent geometric acceptance; never learn directly from the tracker's own unchecked prediction.
-8. Add the iOS adapter using the same `.tflite` artifact and the same shared C++ matcher. Prefer LiteRT Metal/GPU where supported; keep ARKit as geometry authority.
-9. Benchmark on real Android hardware: inference time, total frame processing time, descriptor transfer/copy time, matcher time, memory bandwidth, thermals, and tracking accuracy versus existing LK/ORB.
-10. Test the real target failures: oblique viewpoint, 180-degree orbit, temporary occlusion, repeated texture, low texture, specular surfaces, motion blur, depth dropout, and ARCore relocalization jumps.
+Current LiteRT documentation advertises iOS CPU and Metal. However 2026 upstream issue history includes physical-device Metal accelerator registration/packaging failures and GPU FP16 numerical failures on some graphs/devices. This is not proof that XFeat itself fails, but it changes the release policy:
 
-## Resume rule
+1. iOS CPU backend establishes reference output parity first.
+2. Metal is tried only behind capability/runtime checks.
+3. Run finite-output + parity self-test on the pinned XFeat graph.
+4. Fall back to CPU automatically on accelerator creation, inference, finiteness or parity failure.
+5. Never publish one universal Metal latency number.
 
-Before continuing, read `sdk/STATUS.md`, `sdk/WORKLOG.md`, this checkpoint, and the newest GitHub Actions run for `stablear/multiplatform-sdk`. Do not touch the frozen Android-only reference product or unrelated branches.
+Useful upstream references:
+- https://github.com/google-ai-edge/LiteRT
+- https://github.com/google-ai-edge/LiteRT/issues/8787
+- https://github.com/google-ai-edge/LiteRT/issues/9249
+- https://github.com/google-ai-edge/LiteRT/issues/6745
+
+## Remaining technical risks
+
+- Android still copies the ~307k-float dense descriptor output through `FloatArray`/JNI each inference; replace only after parity is frozen.
+- No physical smartphone A/B data yet for false locks, occlusion/reacquisition, thermal behavior or power.
+- No calibrated learned-correspondence covariance model yet; current `sigmaPx` is deliberately conservative.
+- Generic StableAR observation fields are still partly LK-named; make the source/quality type explicit additively without casually changing C ABI layouts.
+- Current material-point solver corrects only depth along the immutable original ray. Tangential correction requires the planned bounded fixed-lag local optimizer.
+- iOS `.tflite` runtime is pending even though the portable matcher now builds for Apple.
+
+## Next exact work
+
+1. Finish run #39 and fix any red Linux/Android job before extending code.
+2. Add deterministic recorded-frame parity fixtures and physical Android A/B harness.
+3. Replace Android descriptor-map copies with a native/persistent buffer path after parity.
+4. Integrate iOS LiteRT CPU runtime, then guarded/self-tested Metal acceleration, reusing `StableARXFeatNative`.
+5. Introduce source-aware visual-evidence quality semantics additively.
+6. Implement fixed-lag local point/surfel optimization.
+7. Add capability-aware multi-camera/temporal factors.
+
+No current result justifies a physical mm/cm accuracy claim or guaranteed mobile FPS.

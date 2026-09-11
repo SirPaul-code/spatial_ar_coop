@@ -3,213 +3,195 @@
 Last updated: 2026-09-11
 Branch: `stablear/multiplatform-sdk`
 Scope: local static-material attachment stability above host ARCore / ARKit / OpenXR VIO.
+Documented code checkpoint: `e461e81c375e3875237ab0286718af1d4a4f7939`
 
 ## Decision
 
-Add **XFeat as an optional learned-correspondence frontend**, not as a replacement for host VIO and not as an unconstrained source of anchor motion.
+Use **XFeat as an optional learned-correspondence frontend**. Do not replace host VIO and do not let ML directly mutate an anchor.
 
-Production direction:
+Production fusion remains:
 
-1. Host AR runtime owns camera pose, IMU fusion, world tracking and relocalization.
-2. LK remains the cheapest high-rate local visual tracker.
-3. XFeat runs at a lower/adaptive cadence and supplies robust learned local correspondence and reacquisition evidence.
-4. ORB + homography remains a no-ML fallback/reacquisition path.
-5. StableAR geometry is the only component allowed to change an attachment estimate. Exact frame identity, epoch/generation checks, parallax gates, uncertainty, bounded travel and held-out validation remain mandatory.
-6. XFeat templates are never learned from the tracker's own unverified match. A template is admitted only after independent StableAR geometric acceptance.
+```text
+ARCore / ARKit / OpenXR host pose
+             |
+      predicted material UV
+             |
+       +-----+-----+
+       |           |
+     LK/ORB      XFeat
+       |           |
+       +--- visual evidence ---+
+                               |
+                       StableAR geometry
+                  uncertainty/parallax/travel
+                    + held-out validation
+                               |
+                      corrected attachment
+```
 
-This deliberately avoids `ML pixel -> directly move world anchor`.
+LK is the cheapest high-rate local tracker. XFeat is the learned local correspondence/reacquisition source. ORB remains a no-ML fallback. StableAR geometry is the sole correction authority.
 
-## Why XFeat first
+## Why XFeat
 
-The official XFeat project targets hardware-constrained visual correspondence and explicitly calls out resource-constrained robotics, navigation and AR use cases. It produces compact 64-D descriptors and is Apache-2.0.
+XFeat was designed for lightweight local correspondence on constrained hardware. The chosen LiteRT re-authoring is small, dense and suitable for arbitrary tapped pixels rather than requiring a detector keypoint exactly under the tap.
 
-Sources:
+Pinned candidate now used by the Android build:
+- upstream revision `bd421aad1ce6d25dc172cd9579cc13b9da21356f`;
+- `xfeat.tflite` 1,414,480 bytes;
+- SHA-256 `6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df`;
+- Apache-2.0;
+- input `[1,480,640,1]` Float32 grayscale after per-image InstanceNorm;
+- descriptors `[1,64,60,80]`;
+- reliability `[1,1,60,80]`.
+
+References:
 - https://github.com/verlab/accelerated_features
 - https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
 - https://huggingface.co/litert-community/xfeat-litert
 
-The LiteRT-community re-authoring documents:
-- input `[1,480,640,1]`, grayscale, host-side per-image InstanceNorm;
-- dense descriptors `[1,64,60,80]`;
-- keypoint logits `[1,65,60,80]`;
-- reliability `[1,1,60,80]`.
+## Runtime measurements: never hard-code one number
 
-StableAR deliberately uses the dense descriptor map around an arbitrary tapped material point. The tap does not need to coincide with a detector keypoint.
+Published XFeat LiteRT measurements vary sharply by device/runtime/backend. Values around sub-millisecond have been reported in one Pixel 8a setup, while other GPU paths are tens of milliseconds; recent Galaxy measurements are around a few milliseconds on Adreno while a tested NPU route can be dramatically slower.
 
-## Performance: do not hard-code one benchmark
+Therefore StableAR should eventually benchmark candidate accelerators on the actual device/model/runtime combination and cache a correctness-qualified backend choice. Backend name (`GPU`, `NPU`) is not evidence of speed or correctness.
 
-The model card's roughly 0.4 ms Pixel 8a result is a specific LiteRT CompiledModel/GPU measurement, not a universal guarantee. The same published model-card data shows roughly 4.1-4.3 ms GPU on a Galaxy S26 with LiteRT 2.2.0 and substantially worse results for the tested NPU path.
+## Dense arbitrary-tap matching
 
-Therefore StableAR must:
-- initialize/compile the model once;
-- reuse tensor buffers;
-- benchmark supported backends on the real device;
-- cache a backend decision per device/runtime/model build;
-- prefer measured latency and correctness over `GPU`/`NPU` labels;
-- degrade to LK/ORB if ML is unavailable or thermally inappropriate.
+StableAR samples the dense 64-D descriptor map at arbitrary image coordinates using the XFeat/grid-sample coordinate convention rather than nearest `pixel/8`.
 
-LiteRT references:
-- https://ai.google.dev/edge/litert
-- https://ai.google.dev/edge/litert/next/android_cpp_sdk
-- https://github.com/google-ai-edge/LiteRT
-
-## Model provenance / commercial gate
-
-Do not silently vendor a mutable model download into a commercial SDK.
-
-Observed candidate provenance at research time:
-- repository revision: `bd421aad1ce6d25dc172cd9579cc13b9da21356f`;
-- `xfeat.tflite` size: 1,414,480 bytes;
-- SHA-256: `6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df`.
-
-Before shipping, pin the exact revision/file, preserve Apache-2.0/NOTICE attribution, reproduce parity against official XFeat on representative fixtures, verify Android+iOS tensor ordering/shapes, and archive the approved model as a controlled release artifact. The model binary is **not vendored in this checkpoint**.
-
-## Descriptor sampling detail
-
-Do not approximate official XFeat sampling as nearest `pixel / 8`.
-
-Official `InterpolateSparse2d` normalizes image coordinates then uses `grid_sample(..., align_corners=false)`. The equivalent continuous feature coordinate is:
+Equivalent continuous feature coordinate for an image coordinate is:
 
 `feature = pixel * feature_extent / (image_extent - 1) - 0.5`
 
-StableAR mirrors this coordinate transform and bilinearly samples all 64 descriptor channels, then L2-normalizes the sampled vector. Unsafe border samples are rejected instead of inventing padded descriptors.
+All 64 channels are bilinearly sampled and L2-normalized. Border samples that cannot be represented safely are rejected.
 
-References:
-- https://github.com/verlab/accelerated_features/blob/main/modules/interpolator.py
-- https://github.com/verlab/accelerated_features/blob/main/modules/xfeat.py
+A root is a reliability-filtered **5x5 descriptor patch**, not one descriptor. Partial occlusion/reflection can therefore invalidate only part of the fingerprint.
 
-## Implemented runtime-neutral matcher
+## Search / rejection
 
-`sdk/native-vision/include/stablear/xfeat.hpp` and `src/xfeat.cpp` implement the shared matcher without owning a neural runtime.
+The host-projected material UV bounds the search. Current defaults:
+- search radius: 64 model pixels;
+- coarse step: 8 px;
+- local refinement: 1 px;
+- min descriptor cosine: 0.82;
+- min valid/inlier samples: 12;
+- distinct second-peak margin: 0.025;
+- local patch-consensus radius: 3 px;
+- max templates: 8.
 
-### Root fingerprint
+A match is rejected when local descriptor support is weak or when another spatially distinct peak is too competitive. XFeat reports score, second score, margin, reliability, consensus residual, sigma and source template serial.
 
-At attachment creation, capture a reliability-filtered descriptor patch around the material point. Default is 5x5 descriptor samples with 8 px image spacing; at least 12 valid samples are required. This is intentionally stronger than one descriptor because partial occlusion, reflections or local weak texture can invalidate only part of the fingerprint.
+## Coordinate / uncertainty semantics
 
-### Bounded search
+The neural graph always sees 640x480. ARCore/StableAR may use a different CPU-image raster.
 
-The host supplies the predicted image location from current host pose + StableAR attachment state. Search is bounded around that prediction (default +/-64 px), with coarse 8 px scanning and 1 px local refinement.
+Android now maps source coordinates to/from the model raster with the same half-pixel resize convention used by preprocessing. Semantics are intentionally split:
+- observed `x/y`: source CPU-image pixels;
+- `sigmaPx`: conservative source-image pixel uncertainty for geometry;
+- XFeat descriptor patch-consensus residual: fixed 640x480 model pixels, used only as matcher-quality evidence.
 
-Candidate score combines cosine similarity, reference/current reliability, valid patch coverage and inlier fraction. Repetitive texture is rejected using a distinct-spatial-second-peak margin.
+Do not scale the descriptor-consensus residual into source pixels and then compare it with LK's fixed forward/backward thresholds. Those metrics are not the same physical quantity.
 
-### Template bank
+Long-term, visual evidence should gain an additive source-aware quality type instead of overloading LK-named fields; preserve existing C ABI layouts while doing this.
 
-Each attachment has a bounded template bank (default max 8). Optional view direction and scale choose/reweight useful templates. Similar view directions replace only with equal-or-better-quality samples.
+## Anti-drift learning
 
-Critical anti-drift rule: no automatic self-learning. `addTemplate()` is explicit and should only be called after independent StableAR acceptance.
+The most important template-bank rule is now implemented:
 
-### Confidence
+**A successful XFeat match is not sufficient to learn a template.**
 
-The XFeat frontend reports best score, second-best distinct score, margin, mean reliability, descriptor consensus residual, conservative pixel sigma and template serial.
+Flow:
 
-Do **not** pretend XFeat descriptor-consensus residual equals LK forward/backward optical-flow error. Before geometry wiring, StableAR needs source-aware visual evidence metrics.
+`match -> stage exact current-frame patch -> StableAR held-out/geometric acceptance -> commit or discard`
 
-## Shared preprocessing
+Staging snapshots only the small local descriptor patch while that exact inference map is current. The opaque token is inert. One pending candidate exists per attachment; a newer stage invalidates the older token. Commit requires the same attachment id and never reads whichever descriptor map is current later.
 
-`prepareXFeatInput()` provides deterministic cross-platform preprocessing:
-- bilinear resize to 640x480;
-- Float32 grayscale;
-- per-image `(x - mean) / sqrt(var + 1e-5)`.
+This prevents self-confirming descriptor drift and async frame-mismatch poisoning.
 
-The checkpoint tests normalization numerically. The actual `.tflite` graph has not yet been executed by CI/device code.
+## Viewpoint bank
 
-## Target runtime architecture
+Accepted templates now carry geometric metadata computed in the anchor frame:
+- direction: normalized target-to-current-camera vector;
+- scale: `rootTargetCameraZ / currentTargetCameraZ`, clamped to `[0.5, 2.0]`.
 
-```text
-ARCore / ARKit / OpenXR
-        | host pose + exact timestamp
-        v
- predicted material UV -------------------------+
-        |                                       |
-        |                       camera grayscale|
-        |                                       v
-        |                                XFeat LiteRT
-        |                                       |
-        |                            dense 64D + reliability
-        |                                       |
-        +-------------------------> XFeatLocalTracker
-                                           |
-                                     observed UV + confidence
-                                           |
-LK / ORB evidence --------------------------+
-                                           v
-                                 source-aware observation
-                                           |
-                                  StableAR local geometry
-                                           |
-                       parallax/covariance/travel/held-out gates
-                                           v
-                                   StableAttachment
-```
+Direction is used to deduplicate near-identical viewpoints. Relative scale adjusts descriptor-patch offsets. Root identity remains immutable.
 
-Rendering stays host-pose driven at display cadence. ML does not need to run at 60/90/120 Hz.
+Further improvement after physical measurements can rank templates by angular proximity, but do not add an unvalidated angle prior that suppresses a visually stronger valid template.
 
-## Android plan
+## Android state
 
-Use LiteRT `CompiledModel` on a dedicated bounded worker. Required shipping properties:
-- persistent model + persistent/reusable buffers;
-- latest-frame-wins bounded scheduling; lifecycle/control commands cannot be dropped;
-- exact `frame_id`, timestamp, epoch and attachment generation travel with each inference job;
-- avoid unbounded `FloatArray` churn;
-- prefer native/C++ buffers so descriptor output reaches `XFeatLocalTracker` without Kotlin round trips;
-- runtime backend benchmarking and fallback;
-- keep ML optional.
+Actual LiteRT execution is implemented:
+- persistent `CompiledModel`;
+- persistent tensors;
+- GPU attempt + CPU fallback;
+- exact pinned model asset/hash verification;
+- exact grayscale source timestamp;
+- source/model coordinate conversion;
+- source-space sigma;
+- no inference when no attachments exist;
+- staged multi-view admission;
+- LK/ORB fallback.
 
-A Kotlin `readFloat()` bring-up path is acceptable for parity testing but not the final zero-copy path because the descriptor tensor alone is ~307k floats per frame.
+Current correctness prototype still reads the dense output into Kotlin `FloatArray` then crosses JNI. The descriptor tensor alone is roughly 307k floats per inference, so a native/shared buffer path is the obvious shipping optimization **after** output parity is frozen.
 
-## iOS plan
+## Portable C++ / Apple state
 
-Use the same shared C++ preprocessing/matcher. LiteRT supports iOS CPU/Metal paths; backend selection remains behind an adapter so runtime details can change without changing StableAR geometry. Do not assume a beta delegate is universally available.
+XFeat matching no longer depends on OpenCV. `StableAR::xfeat` contains preprocessing, descriptor matching, staged admission and C ABI. `StableAR::vision` contains the optional OpenCV LK/ORB frontend.
 
-References:
-- https://ai.google.dev/edge/litert/ios
-- https://ai.google.dev/edge/litert/ios/gpu
+At code checkpoint `e461e81...`, Apple builds an independent `StableARXFeatNative.xcframework` for iPhoneOS and simulator. Workflow run #39 Apple job is green. This proves the portable matcher builds for Apple; it does not yet execute `xfeat.tflite` on iOS.
 
-## Multi-camera / temporal multi-view
+## iOS LiteRT research update
 
-XFeat fits the broader observation-graph design. A physical camera or temporal keyframe should contribute another calibrated observation, not create a separate stereo-only anchor type.
+LiteRT documentation/repository currently advertises iOS CPU and Metal support, but 2026 upstream issues show that third-party physical-device deployment has had real Metal accelerator registration/prebuilt architecture failures, and another current issue reports FP16 GPU numerical failure on a different graph/device.
 
-Future observation records should carry sensor identity, exact sensor timestamp, intrinsics/distortion, camera pose/extrinsics, observed pixel, evidence source and source-specific covariance/quality. Spatial phone-camera baseline is useful mainly at close ranges; temporal device motion can provide a much larger triangulation baseline.
+Relevant upstream material:
+- https://github.com/google-ai-edge/LiteRT
+- https://github.com/google-ai-edge/LiteRT/issues/8787
+- https://github.com/google-ai-edge/LiteRT/issues/9249
+- https://github.com/google-ai-edge/LiteRT/issues/6745
 
-## Geometry upgrade after XFeat
+This does **not** prove XFeat fails on Metal. It does mean production StableAR must use:
+1. CPU as the correctness baseline;
+2. optional Metal creation;
+3. deterministic finite-output/parity self-test for the pinned XFeat graph;
+4. automatic CPU fallback;
+5. no universal Metal latency claim.
 
-The current `RayRefiner` is deliberately conservative but only corrects depth along the immutable original click ray. Once correspondence quality improves, that becomes a major mathematical ceiling.
+Do not redesign around legacy `tflite::Interpreter` only to avoid current packaging friction; upstream now treats that API as maintenance-only.
 
-Next estimator should be a **bounded fixed-lag local optimizer**, not another global SLAM:
-- optimize material point or local surfel in anchor coordinates;
-- optionally tiny per-keyframe pose deltas with strong priors to host VIO;
-- reprojection factors from LK/XFeat/ORB/multi-camera observations;
-- metric depth/plane/surfel factors where available;
-- robust M-estimator/outlier handling;
-- anisotropic/source-aware covariance;
-- marginalize old keyframes;
-- preserve travel limits, epoch/generation checks and held-out validation.
+## Next estimator ceiling
 
-This permits small tangential as well as depth corrections without fighting ARCore/ARKit global tracking.
+Better image correspondence exposes the current mathematical limit: StableAR's existing `RayRefiner` corrects only depth along the immutable original clicked ray.
 
-## Validation before any claim
+For maximum material attachment stability, next estimator should be a bounded **fixed-lag local optimizer**, not another global SLAM:
+- material point/surfel in anchor coordinates;
+- optional tiny per-keyframe pose deltas with strong host-VIO priors;
+- reprojection factors from LK/XFeat/ORB;
+- metric depth/plane/surfel factors;
+- source-aware covariance;
+- robust loss/outlier rejection;
+- bounded keyframes and marginalization;
+- existing travel/epoch/generation/held-out protections.
 
-A/B at minimum:
+That is what will allow small tangential XYZ correction without fighting ARCore/ARKit.
+
+## Multi-camera / temporal extension
+
+Do not create a stereo-specific anchor. Use a capability-aware observation graph where each camera/keyframe/depth source contributes a calibrated observation carrying sensor identity, exact sensor timestamp, intrinsics/distortion, extrinsics/pose and source covariance.
+
+Spatial phone-camera stereo is strongest at close service distances. Temporal movement can create much larger triangulation baselines. Multi-camera should therefore be optional evidence, not mandatory hardware.
+
+## Validation before claims
+
+Physical A/B set:
 - host anchor only;
-- LK only;
-- LK + ORB;
-- LK + XFeat;
-- LK + XFeat + template bank;
-- later fixed-lag and multi-camera variants.
+- LK;
+- LK+ORB;
+- XFeat learned correspondence;
+- XFeat + accepted multi-view bank;
+- later fixed-lag estimator;
+- later multi-camera/temporal factors.
 
-Sequences: low/repetitive texture, specular surfaces, illumination/exposure changes, motion blur, partial/full occlusion and reacquisition, 20/45/70+ degree viewpoint changes, scale/distance changes, close service scenes and thermal soak.
+Test low/repetitive texture, specular surfaces, exposure changes, blur, partial/full occlusion and reacquisition, 20/45/70+ degree viewpoint changes, distance/scale changes and thermal soak.
 
-Measure image reprojection stability, independent world-space material-point drift, false-lock rate, reacquisition correctness, latency, CPU/GPU, memory, battery and thermal behavior. Synthetic tests or model-card benchmarks do not justify mm/cm or FPS claims.
-
-## Next implementation steps
-
-1. CI the runtime-neutral matcher and contract tests.
-2. Add source-aware visual evidence representation while retaining ABI compatibility.
-3. Add pinned model manifest + deterministic parity fixtures.
-4. Implement Android LiteRT C++ CompiledModel worker with persistent buffers and bounded scheduling.
-5. Wire calibrated XFeat evidence through StableAR held-out geometry.
-6. Admit templates only after accepted held-out evidence.
-7. Port the same runtime adapter to iOS/Metal.
-8. Implement bounded fixed-lag material-point/surfel optimizer.
-9. Add capability-aware multi-camera/temporal observations.
-10. Run physical A/B validation before changing platform/commercial performance status.
+Measure independent material-point reprojection/world error, false locks, reacquisition correctness, latency, memory, CPU/GPU, battery and thermal behavior. CI and model-card benchmarks are not physical accuracy evidence.
