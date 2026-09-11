@@ -81,6 +81,10 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
     private var handle = NativeXFeat.create().also { check(it != 0L) }
     private var descriptors = FloatArray(0)
     private var reliability = FloatArray(0)
+    // Descriptor maps always live in the 640x480 model raster. Public coordinates stay in the
+    // exact source CPU-image raster used by ARCore/StableAR, so retain its dimensions per frame.
+    private var sourceWidth = 0
+    private var sourceHeight = 0
 
     init {
         check(inputs.size == 1) { "XFeat expected one input, got ${inputs.size}" }
@@ -104,51 +108,88 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         reliability = outputs[2].readFloat()
         check(descriptors.size == DESCRIPTOR_ELEMENTS) { "Unexpected XFeat descriptor count ${descriptors.size}" }
         check(reliability.size == RELIABILITY_ELEMENTS) { "Unexpected XFeat reliability count ${reliability.size}" }
-        return NativeXFeat.beginFrame(handle, frameId, descriptors, reliability)
+        val accepted = NativeXFeat.beginFrame(handle, frameId, descriptors, reliability)
+        if (accepted) {
+            sourceWidth = width
+            sourceHeight = height
+        } else {
+            sourceWidth = 0
+            sourceHeight = 0
+        }
+        return accepted
     }
 
-    /** Captures the immutable root signature from the most recently inferred frame. */
+    /** Captures the immutable root signature from the most recently inferred source exposure. */
     fun addRoot(id: Long, x: Double, y: Double): Boolean {
         require(id > 0 && x.isFinite() && y.isFinite())
         requireCurrentMap()
-        return NativeXFeat.addRoot(h(), id, descriptors, reliability, x, y)
+        val p = sourceToModel(x, y)
+        return NativeXFeat.addRoot(h(), id, descriptors, reliability, p.first, p.second)
     }
 
     /** Explicit only: caller must admit templates after independent geometric/held-out acceptance. */
     fun addTemplate(id: Long, x: Double, y: Double, view: XFeatView = XFeatView()): Boolean {
         require(id > 0 && x.isFinite() && y.isFinite())
         requireCurrentMap()
+        val p = sourceToModel(x, y)
         return NativeXFeat.addTemplate(
-            h(), id, descriptors, reliability, x, y, view.hasDirection,
+            h(), id, descriptors, reliability, p.first, p.second, view.hasDirection,
             view.directionX ?: 0.0, view.directionY ?: 0.0, view.directionZ ?: 0.0,
             view.scale, view.quality,
         )
     }
 
+    /** Predicted and returned coordinates are both in the current source CPU-image raster. */
     fun track(id: Long, predictedX: Double, predictedY: Double, view: XFeatView = XFeatView()): XFeatImageMatch? {
         require(id > 0 && predictedX.isFinite() && predictedY.isFinite())
+        requireCurrentMap()
+        val predicted = sourceToModel(predictedX, predictedY)
         val v = NativeXFeat.track(
-            h(), id, predictedX, predictedY, view.hasDirection,
+            h(), id, predicted.first, predicted.second, view.hasDirection,
             view.directionX ?: 0.0, view.directionY ?: 0.0, view.directionZ ?: 0.0,
             view.scale, view.quality,
         ) ?: return null
         if (v.size != 11 || v.any { !it.isFinite() }) return null
+        val source = modelToSource(v[0], v[1])
+        // The model raster can be anisotropically resized. Use the larger axis scale for scalar
+        // residual/uncertainty so geometry never receives an artificially optimistic pixel sigma.
+        val errorScale = max(sourceWidth.toDouble() / INPUT_WIDTH, sourceHeight.toDouble() / INPUT_HEIGHT)
         return XFeatImageMatch(
-            x = v[0], y = v[1], inliers = v[2].toInt(), medianReprojectionPx = v[3],
+            x = source.first, y = source.second, inliers = v[2].toInt(),
+            medianReprojectionPx = v[3] * errorScale,
             score = v[4], secondBestScore = v[5], scoreMargin = v[6], meanReliability = v[7],
-            sigmaPx = v[8], templateSerial = v[9].toLong(),
+            sigmaPx = v[8] * errorScale, templateSerial = v[9].toLong(),
             method = NativeVisionMethod.entries.getOrElse(v[10].toInt()) { NativeVisionMethod.NONE },
         )
     }
 
     fun remove(id: Long) { require(id > 0); NativeXFeat.remove(h(), id) }
-    fun clear() { NativeXFeat.clear(h()); descriptors = FloatArray(0); reliability = FloatArray(0) }
+    fun clear() {
+        NativeXFeat.clear(h())
+        descriptors = FloatArray(0)
+        reliability = FloatArray(0)
+        sourceWidth = 0
+        sourceHeight = 0
+    }
 
     private fun requireCurrentMap() {
-        check(descriptors.size == DESCRIPTOR_ELEMENTS && reliability.size == RELIABILITY_ELEMENTS) {
-            "Call beginFrame before capturing XFeat templates"
+        check(descriptors.size == DESCRIPTOR_ELEMENTS && reliability.size == RELIABILITY_ELEMENTS &&
+            sourceWidth > 1 && sourceHeight > 1) {
+            "Call beginFrame before capturing or tracking XFeat templates"
         }
     }
+
+    private fun sourceToModel(x: Double, y: Double): Pair<Double, Double> =
+        Pair(
+            (x + 0.5) * INPUT_WIDTH / sourceWidth - 0.5,
+            (y + 0.5) * INPUT_HEIGHT / sourceHeight - 0.5,
+        )
+
+    private fun modelToSource(x: Double, y: Double): Pair<Double, Double> =
+        Pair(
+            (x + 0.5) * sourceWidth / INPUT_WIDTH - 0.5,
+            (y + 0.5) * sourceHeight / INPUT_HEIGHT - 0.5,
+        )
 
     override fun close() {
         check(Thread.currentThread() === owner)
@@ -160,6 +201,8 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         outputs.forEach { it.close() }
         inputs.forEach { it.close() }
         model.close()
+        sourceWidth = 0
+        sourceHeight = 0
     }
 }
 
