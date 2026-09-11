@@ -116,19 +116,23 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
                     val affine=floatArrayOf(map[0],map[1],map[2]-map[0],map[3]-map[1],map[4]-map[0],map[5]-map[1])
                     presented=Displayed(sample,affine,width,height)
                     val gray=sample.gray
-                    if(gray!=null && busy.compareAndSet(false,true)) {
+                    if(gray!=null) {
                         val contexts=sdk.engine.snapshots().mapNotNull { sdk.context(it.id,sample,frame) }
-                        val predictions=contexts.associate { c -> c.id to sdk.engine.snapshot(c.id)?.let {
-                            c.frame.intrinsics.project(c.cameraInAnchor.inverse().point(it.pointInAnchor())) } }
-                        val generation=lifecycle.get()
-                        worker.execute {
-                            try {
-                                tracker.beginFrame(gray.timestampNs,gray.bytes,gray.width,gray.height)
-                                contexts.forEach { c ->
-                                    if(generation==lifecycle.get()) answers.add(Result(generation,c,tracker.track(c.id,predictions[c.id])))
-                                }
-                            } catch(_: Exception) { /* Verification must never stop camera tracking. */ }
-                            finally { busy.set(false) }
+                        // No material attachment means no useful learned observation. Avoid waking LiteRT/GPU
+                        // just because the camera produced a new frame; this saves thermal and battery budget.
+                        if(contexts.isNotEmpty() && busy.compareAndSet(false,true)) {
+                            val predictions=contexts.associate { c -> c.id to sdk.engine.snapshot(c.id)?.let {
+                                c.frame.intrinsics.project(c.cameraInAnchor.inverse().point(it.pointInAnchor())) } }
+                            val generation=lifecycle.get()
+                            worker.execute {
+                                try {
+                                    tracker.beginFrame(gray.timestampNs,gray.bytes,gray.width,gray.height)
+                                    contexts.forEach { c ->
+                                        if(generation==lifecycle.get()) answers.add(Result(generation,c,tracker.track(c.id,predictions[c.id])))
+                                    }
+                                } catch(_: Exception) { /* Verification must never stop camera tracking. */ }
+                                finally { busy.set(false) }
+                            }
                         }
                     }
                 }
