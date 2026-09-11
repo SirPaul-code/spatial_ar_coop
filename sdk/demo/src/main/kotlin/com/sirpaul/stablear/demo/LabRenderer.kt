@@ -27,7 +27,7 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
     private val lifecycle=AtomicLong(1)
     private data class Displayed(val sample: CameraSample,val viewToImage: FloatArray,val width: Int,val height: Int)
     private data class Tap(val displayed: Displayed,val x: Float,val y: Float)
-    private data class Result(val lifecycle: Long,val context: ObservationContext,val match: ImageMatch?)
+    private data class Result(val lifecycle: Long,val context: ObservationContext,val match: DemoVisionMatch?)
     @Volatile private var presented: Displayed?=null
     private val tap=AtomicReference<Tap?>(null)
     private val answers=ConcurrentLinkedQueue<Result>()
@@ -68,16 +68,29 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
                 sdk.trackingLost(); presented=null; reason="Tracking paused: ${frame.camera.trackingFailureReason}"
                 report(start,sdk); return
             }
+            val templateResolutions=ArrayList<Triple<Long,Long,Boolean>>()
             while(true) {
                 val result=answers.poll() ?: break
-                if(result.lifecycle!=lifecycle.get()) continue
-                val c=result.context; val match=result.match
-                if(match==null) { sdk.engine.visibility(c.id,false); continue }
+                val staged=result.match?.templateCandidateToken ?: 0L
+                if(result.lifecycle!=lifecycle.get()) {
+                    if(staged>0) templateResolutions.add(Triple(result.context.id,staged,false))
+                    continue
+                }
+                val c=result.context; val visual=result.match
+                if(visual==null) { sdk.engine.visibility(c.id,false); continue }
+                val match=visual.image
                 val o=VisualObservation(c.frame.id,c.root.epoch,c.root.anchorId,c.generation,
                     c.frame.cameraTimestampNs,c.frame.capturedNs,c.cameraInAnchor,c.frame.intrinsics,
                     match.pixel,match.inliers,match.forwardBackwardPx,match.medianReprojectionPx,match.sigmaPx)
                 val decision=sdk.observe(c.id,o); reason="${match.method}: ${decision.reason}"
                 if(decision.accepted) corrections++
+                if(staged>0) templateResolutions.add(Triple(c.id,staged,decision.accepted))
+            }
+            // Resolve staged descriptors before the next inference task. Accepted tokens contain the
+            // exact held-out frame patch; rejected/stale evidence can never enter the template bank.
+            if(templateResolutions.isNotEmpty()) {
+                val resolutions=templateResolutions.toList()
+                worker.execute { resolutions.forEach { (id,token,accepted) -> tracker.resolveTemplate(id,token,accepted) } }
             }
             tap.getAndSet(null)?.let { command ->
                 val a=command.displayed.viewToImage

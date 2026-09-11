@@ -17,6 +17,9 @@ internal object NativeXFeat {
     external fun addTemplate(handle: Long, id: Long, descriptors: FloatArray, reliability: FloatArray, x: Double, y: Double, hasViewDirection: Boolean, vx: Double, vy: Double, vz: Double, scale: Double, quality: Double): Boolean
     external fun beginFrame(handle: Long, frameId: Long, descriptors: FloatArray, reliability: FloatArray): Boolean
     external fun track(handle: Long, id: Long, predictedX: Double, predictedY: Double, hasViewDirection: Boolean, vx: Double, vy: Double, vz: Double, scale: Double, quality: Double): DoubleArray?
+    external fun stageTemplate(handle: Long, id: Long, x: Double, y: Double, hasViewDirection: Boolean, vx: Double, vy: Double, vz: Double, scale: Double, quality: Double): Long
+    external fun commitStagedTemplate(handle: Long, id: Long, token: Long): Boolean
+    external fun discardStagedTemplate(handle: Long, id: Long, token: Long)
     external fun remove(handle: Long, id: Long)
     external fun clear(handle: Long)
 }
@@ -127,7 +130,7 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         return NativeXFeat.addRoot(h(), id, descriptors, reliability, p.first, p.second)
     }
 
-    /** Explicit only: caller must admit templates after independent geometric/held-out acceptance. */
+    /** Direct admission for an already independently verified caller. Prefer stage/commit asynchronously. */
     fun addTemplate(id: Long, x: Double, y: Double, view: XFeatView = XFeatView()): Boolean {
         require(id > 0 && x.isFinite() && y.isFinite())
         requireCurrentMap()
@@ -137,6 +140,31 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
             view.directionX ?: 0.0, view.directionY ?: 0.0, view.directionZ ?: 0.0,
             view.scale, view.quality,
         )
+    }
+
+    /**
+     * Copies only a local descriptor patch from this exact inferred frame. It is not active until
+     * commitStagedTemplate is called after independent StableAR geometric/held-out acceptance.
+     */
+    fun stageTemplate(id: Long, x: Double, y: Double, view: XFeatView = XFeatView()): Long {
+        require(id > 0 && x.isFinite() && y.isFinite())
+        requireCurrentMap()
+        val p = sourceToModel(x, y)
+        return NativeXFeat.stageTemplate(
+            h(), id, p.first, p.second, view.hasDirection,
+            view.directionX ?: 0.0, view.directionY ?: 0.0, view.directionZ ?: 0.0,
+            view.scale, view.quality,
+        )
+    }
+
+    fun commitStagedTemplate(id: Long, token: Long): Boolean {
+        require(id > 0 && token > 0)
+        return NativeXFeat.commitStagedTemplate(h(), id, token)
+    }
+
+    fun discardStagedTemplate(id: Long, token: Long) {
+        require(id > 0 && token > 0)
+        NativeXFeat.discardStagedTemplate(h(), id, token)
     }
 
     /** Predicted and returned coordinates are both in the current source CPU-image raster. */

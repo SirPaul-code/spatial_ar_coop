@@ -3,8 +3,14 @@ package com.sirpaul.stablear.demo
 import android.content.Context
 import com.sirpaul.stablear.core.V2
 import com.sirpaul.stablear.nativevision.XFeatLiteRtTracker
+import com.sirpaul.stablear.nativevision.XFeatView
 import com.sirpaul.stablear.vision.ImageMatch
 import com.sirpaul.stablear.vision.LocalSurfaceTracker
+
+internal data class DemoVisionMatch(
+    val image: ImageMatch,
+    val templateCandidateToken: Long = 0L,
+)
 
 /** Reference integration for the lab app: XFeat/LiteRT first, LK/ORB fallback. */
 internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
@@ -67,19 +73,30 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
         return learnedAdded || classical
     }
 
-    fun track(id: Long, predicted: V2?): ImageMatch? {
+    fun track(id: Long, predicted: V2?): DemoVisionMatch? {
         if (predicted != null) {
             val ml = xfeat
             if (ml != null) {
                 try {
                     ml.track(id, predicted.x, predicted.y)?.let { m ->
-                        return ImageMatch(
-                            V2(m.x, m.y),
-                            m.inliers,
-                            m.medianReprojectionPx,
-                            m.medianReprojectionPx,
-                            "XFEAT_LITERT",
-                            m.sigmaPx,
+                        // Snapshot the exact current patch now, while this inference map is still current.
+                        // The token is inert until the AR thread independently accepts the observation.
+                        val token = ml.stageTemplate(
+                            id,
+                            m.x,
+                            m.y,
+                            XFeatView(quality = m.meanReliability.coerceIn(0.0, 1.0)),
+                        )
+                        return DemoVisionMatch(
+                            ImageMatch(
+                                V2(m.x, m.y),
+                                m.inliers,
+                                m.medianReprojectionPx,
+                                m.medianReprojectionPx,
+                                "XFEAT_LITERT",
+                                m.sigmaPx,
+                            ),
+                            token,
                         )
                     }
                 } catch (_: Throwable) {
@@ -87,7 +104,19 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
                 }
             }
         }
-        return fallback.track(id, predicted)
+        return fallback.track(id, predicted)?.let { DemoVisionMatch(it) }
+    }
+
+    /** Must run on the same vision worker that owns the LiteRT/XFeat tracker. */
+    fun resolveTemplate(id: Long, token: Long, accepted: Boolean) {
+        if (token <= 0) return
+        val ml = xfeat ?: return
+        try {
+            if (accepted) ml.commitStagedTemplate(id, token)
+            else ml.discardStagedTemplate(id, token)
+        } catch (_: Throwable) {
+            disableLearned(ml)
+        }
     }
 
     fun remove(id: Long) {
