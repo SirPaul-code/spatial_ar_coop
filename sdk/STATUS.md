@@ -3,34 +3,38 @@
 Last updated: 2026-09-11
 Target branch: `stablear/multiplatform-sdk`
 Frozen Android reference: `research_sdk@38978da448b6610606e9145367b9b31328bb5cc0`
-Current documented code checkpoint: `e461e81c375e3875237ab0286718af1d4a4f7939`
+Latest software-verified code checkpoint: `e461e81c375e3875237ab0286718af1d4a4f7939`
+Verification: workflow run #39 / `34628410948` — **fully green**
 
 ## Read this first
 
-StableAR is a **local static-material attachment stability layer above a host AR/XR runtime**. ARCore/ARKit/OpenXR remain responsible for VIO, IMU fusion, world tracking and relocalization. StableAR owns exact-frame evidence, local metric surface/depth evidence, immutable material-point identity, visual correspondence, uncertainty and bounded correction.
+StableAR is a **local static-material attachment stability layer above host AR/XR VIO/SLAM**. ARCore/ARKit/OpenXR own camera pose, IMU fusion, world tracking and relocalization. StableAR owns exact-frame evidence, local metric depth/surface evidence, immutable material-point identity, visual correspondence, uncertainty and bounded correction.
 
 Work only on `stablear/multiplatform-sdk`. Do not modify the frozen Android-only reference or product branches. Canonical StableAR camera coordinates are right-handed `+X right, +Y down, +Z forward`.
 
-## Verified baselines
+## CI status
 
-- `147abb6d32d5bb98cc23c8ae31cb54d8de59fbb2` — workflow run #33 / `34625962958` fully green across scope, Linux native, Android AAR/reference demo, Apple and Unity. This includes pinned Android XFeat LiteRT runtime, source/model coordinate correction, exact source timestamp and source-space sigma.
-- `125bf04b6538d7622b2b0d8956d57fceb06e52bc` — safe staged XFeat template API/contract added; later native-linux run #36 verified the shared C++ contract green.
-- `57623c948241340d7a9ac1c6fbbbc3edc83df442` — Android end-to-end staged template admission after StableAR acceptance.
-- `405f9477ea470cce62bd611511b0609cbc260896` — separates fixed-640x480 XFeat matcher-quality residuals from source-image geometry units.
-- `dba74bba90c098a3340a990d84288a490227e1da` — feeds target-to-camera view direction plus conservative root-depth/current-depth scale to XFeat.
-- `e461e81c375e3875237ab0286718af1d4a4f7939` — isolates XFeat matcher from OpenCV and builds an Apple device+simulator XFeat XCFramework. Workflow run #39 / `34628410948` is the verification run for this code checkpoint; inspect its final status before upgrading the checkpoint to fully green.
+Code checkpoint `e461e81c375e3875237ab0286718af1d4a4f7939` passed the complete `stablear-multiplatform` workflow run #39 (`34628410948`):
 
-All branch moves must remain non-force.
+- scope / frozen-product isolation: PASS;
+- native Linux static/shared/package consumer: PASS;
+- sanitizers + warnings-as-errors: PASS;
+- OpenCV classical vision + XFeat C++/C contracts: PASS;
+- OpenXR coordinate contract: PASS;
+- entitlement/export contract: PASS;
+- Android native core AAR: PASS;
+- Android XFeat/OpenCV vision AAR: PASS;
+- original Android reference/demo buildability: PASS;
+- Android exact XFeat model payload + no duplicate StableAR `libc++_shared.so`: PASS;
+- Apple core + XFeat device/simulator XCFramework build: PASS;
+- ARKit Swift typecheck: PASS;
+- Unity ABI: PASS.
 
-## Native core — DONE / software-verified
+This is software/build verification only. It is not a physical accuracy, FPS, thermal or battery claim.
 
-`sdk/native` contains the C++20 geometry/session core and C ABI v1: rigid geometry, intrinsics, bounded exact-frame history/freeze leases, immutable root identity, robust inverse-depth/local-surface initialization, original-ray refinement, parallax/uncertainty/travel gates, held-out commit validation, epoch/generation/timestamp rejection and platform-neutral anchor storage.
+## XFeat decision and model pin
 
-This remains **software-verified only**. No CI result is a physical mm/cm accuracy claim.
-
-## Learned correspondence — XFeat
-
-Decision: **XFeat + StableAR geometry** is the first mobile ML backend. It supplements LK/ORB and host VIO; it never directly moves an anchor.
+**XFeat + StableAR geometry** is the first mobile learned-correspondence backend. It supplements LK/ORB and host VIO; it never directly moves an attachment.
 
 Pinned model:
 - upstream: `litert-community/xfeat-litert`;
@@ -40,102 +44,96 @@ Pinned model:
 - SHA-256: `6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df`;
 - license: Apache-2.0;
 - input: Float32 `[1,480,640,1]`, grayscale + per-image InstanceNorm;
-- dense descriptors: `[1,64,60,80]`; reliability: `[1,1,60,80]`.
+- descriptors: `[1,64,60,80]`; reliability: `[1,1,60,80]`.
 
-`sdk/models/xfeat/manifest.json` is the build-time integrity source. Android AAR inspection verifies the packaged model hash/size.
+`sdk/models/xfeat/manifest.json` is the build integrity source and Android CI verifies the packaged model.
 
-### Shared matcher — implemented
+## Shared matcher — implemented and CI green
 
-`sdk/native-vision` now provides an OpenCV-independent `StableAR::xfeat` target and the existing optional `StableAR::vision` LK/ORB target.
+`sdk/native-vision` exposes:
+- `StableAR::xfeat` — OpenCV-independent XFeat preprocessing/matching/staged-template C ABI;
+- `StableAR::vision` — optional classical LK/ORB OpenCV frontend.
 
-XFeat matcher properties:
-- arbitrary tapped point through bilinear 64-D dense descriptor sampling;
-- official XFeat-style normalized/grid-sample coordinate convention, not naive nearest `pixel/8`;
-- reliability-filtered 5x5 local descriptor fingerprint;
-- bounded host-prediction search, coarse-to-fine refinement;
-- distinct second-peak ambiguity rejection;
-- patch-consensus/inlier validation;
-- conservative sigma output;
-- bounded max-8 template bank;
-- target-to-camera view metadata and perspective scale support;
-- immutable original root.
+XFeat matcher implements arbitrary tapped points, bilinear 64-D dense descriptor sampling using XFeat/grid-sample coordinate semantics, a reliability-filtered 5x5 local fingerprint, bounded host-prediction search, coarse-to-fine refinement, distinct second-peak ambiguity rejection, patch consensus/inliers, conservative sigma, immutable root identity and a bounded max-8 view template bank.
 
-### Anti-drift template admission — implemented
+## Anti-drift template admission — implemented
 
-Do **not** automatically self-learn from a tracker match.
+Never self-learn directly from an XFeat match.
 
-Current flow is:
+Current path:
 
-`XFeat match -> stage exact-frame local patch -> StableAR geometric/held-out decision -> commit OR discard token`
+`XFeat match -> stage exact-frame descriptor patch -> StableAR geometric/held-out decision -> commit OR discard`
 
-Staging copies the local descriptor patch while the exact inference map is current. At most one candidate exists per attachment. A newer stage invalidates the older token. Commit checks both attachment id and token. Changing the current frame before commit does not change the staged descriptor snapshot. Remove/reset purge pending candidates.
+Properties:
+- one pending candidate per attachment;
+- newer stage invalidates older token;
+- attachment id and token must both match;
+- commit uses the descriptor snapshot captured at stage time even if the current frame has changed;
+- rejected/stale observations are discarded;
+- remove/reset purges pending candidates.
 
-The C++ contract explicitly tests stale token, wrong attachment, frame-change-before-commit and removal cases.
+The shared C++ contract tests these conditions.
 
-## Android / ARCore — source/CI complete, physical validation pending
+## Android / ARCore — source + CI complete, physical validation pending
 
-Android learned path exists in `sdk/native-vision-android` and the lab demo:
-- LiteRT `CompiledModel` is persistent;
-- input/output tensor buffers are persistent;
-- GPU is attempted first, CPU is the fallback;
-- exact grayscale image timestamp is the visual frame identity;
-- source CPU-image coordinates are mapped to/from fixed 640x480 model coordinates with half-pixel resize convention;
-- `x/y` and `sigmaPx` returned to StableAR are source-image units;
-- XFeat local descriptor-consensus residual remains in fixed model-raster units and is only a matcher-quality gate;
-- no inference is scheduled when there are zero active attachments;
-- XFeat staged template resolution runs on the same owner worker;
-- LK/ORB remains fallback;
-- AAR excludes a duplicate StableAR `libc++_shared.so`; the official OpenCV AAR supplies the shared STL in the current packaging;
-- CI verifies the exact model asset and absence of a second StableAR STL copy.
+Implemented:
+- persistent LiteRT `CompiledModel` and tensor buffers;
+- GPU attempt + CPU fallback;
+- exact grayscale image timestamp as visual frame identity;
+- source CPU-image <-> fixed 640x480 model half-pixel coordinate mapping;
+- source-image `x/y` and source-image `sigmaPx` for geometry;
+- XFeat descriptor-consensus residual retained in fixed model-raster units only as matcher quality;
+- no LiteRT inference when there are zero active attachments;
+- staged template commit/discard on the same vision worker;
+- geometric target-to-camera view direction;
+- perspective scale `rootTargetCameraZ/currentTargetCameraZ`, clamped `[0.5,2.0]`;
+- LK/ORB fallback;
+- exact model hash/size AAR integrity check;
+- StableAR vision AAR excludes duplicate `libc++_shared.so`; current packaging uses the OpenCV AAR's shared STL copy.
 
-Known Android prototype limitation: descriptor/reliability outputs still use public `FloatArray` readback plus JNI copying. Correctness first; shipping path should move to native/shared buffers to reduce ~307k-float-per-frame copies and GC/memory bandwidth.
+Known prototype limitation: dense descriptor/reliability output still crosses LiteRT -> Kotlin `FloatArray` -> JNI. The descriptor map is roughly 307k floats per inference. Replace this with native/persistent buffers only after parity is frozen.
 
-## Apple / ARKit — geometry + portable XFeat matcher compile path, LiteRT execution pending
+## Apple / ARKit — portable XFeat matcher CI green, neural runtime pending
 
-Existing `StableARNative.xcframework` contains the StableAR core and ARKit Swift adapter remains host-owned.
+`build_xcframework.sh` now creates for both iPhoneOS and simulator:
+- `StableARNative.xcframework` — StableAR core;
+- `StableARXFeatNative.xcframework` — OpenCV-independent XFeat matcher/C ABI.
 
-At code checkpoint `e461e81...`, XFeat no longer requires OpenCV at CMake configure time. `build_xcframework.sh` also builds `stablear_xfeat` for `iphoneos` and `iphonesimulator` and creates `StableARXFeatNative.xcframework`. This is the shared matcher only; the actual `.tflite` execution runtime is not yet integrated on Apple.
+Run #39 Apple is green, so this portable learned matcher is genuinely Apple-buildable. The actual `xfeat.tflite` execution runtime is **not yet integrated on iOS**.
 
-Current 2026 LiteRT research says iOS CPU and Metal are supported in product documentation, but there have also been physical-device/prebuilt/accelerator-registration and FP16 GPU issues. Therefore Apple runtime policy is:
-1. CPU correctness baseline first;
-2. Metal preferred only after runtime registration + finite-output + parity self-test on the actual device/runtime/model;
-3. automatic CPU fallback on any accelerator failure or invalid output;
+2026 LiteRT research shows official iOS CPU/Metal support statements but also recent third-party physical-device accelerator/prebuilt/registration and FP16 GPU issues. Apple runtime policy is therefore:
+1. CPU correctness/parity baseline;
+2. Metal optional after successful creation plus finite-output/parity self-test on the pinned XFeat model;
+3. automatic CPU fallback on accelerator/inference/parity failure;
 4. no universal Metal performance claim.
 
-Do not introduce the legacy `tflite::Interpreter` API as the new StableAR architecture merely to bypass current packaging friction; LiteRT upstream now treats it as maintenance-only.
-
-## Viewpoint-aware template bank
-
-For each observation, the Android lab computes in anchor coordinates:
-- view direction = normalized `(cameraPositionInAnchor - materialPointInAnchor)`;
-- perspective scale = `rootPointCameraZ / currentPointCameraZ`, conservatively clamped to `[0.5, 2.0]`.
-
-The scale adjusts descriptor-patch offsets between views. Direction allows the bounded bank to replace same-direction templates rather than fill all 8 slots with near-identical views. This is geometric metadata, not ML inference.
+Do not redesign the SDK around legacy `tflite::Interpreter` merely to avoid current packaging friction; upstream treats that path as maintenance-only.
 
 ## Geometry ceiling
 
-Current StableAR correction is still **1D along the immutable original clicked ray**. Better correspondence improves the evidence, but it cannot correct tangential material-point error.
+Current StableAR material correction remains **1D along the immutable original click ray**. Better XFeat correspondence improves evidence but cannot correct tangential XYZ error.
 
-Next accuracy upgrade should be a bounded fixed-lag local optimizer in anchor coordinates, not a second global SLAM:
-- material point or local surfel state;
-- optional tiny per-keyframe pose deltas with strong host-VIO priors;
+Next mathematical upgrade should be a bounded fixed-lag local material-point/surfel optimizer in anchor coordinates:
+- optional tiny keyframe pose deltas with strong host-VIO priors;
 - source-aware reprojection factors from LK/XFeat/ORB/multi-camera observations;
-- metric depth/surface factors;
-- robust loss and anisotropic covariance;
+- metric depth/plane/surfel factors;
+- robust loss + anisotropic covariance;
 - bounded keyframes/marginalization;
-- existing travel, epoch/generation and held-out protections.
+- existing travel/epoch/generation/held-out protections.
 
-## Multi-camera / temporal observations
+## Multi-camera / temporal roadmap
 
-Roadmap remains a capability-aware observation graph, not a stereo-specific anchor type. Physical camera observations, temporal keyframes, raw depth/ToF/LiDAR/mesh and visual correspondence should all carry exact sensor timestamp, intrinsics/extrinsics, sensor identity and calibrated covariance. Spatial phone-camera baseline is most useful close up; temporal motion can provide a much larger baseline.
+Use a capability-aware observation graph, not a stereo-specific anchor type. Physical cameras, temporal keyframes, depth/ToF/LiDAR/mesh and learned/classical correspondence should contribute calibrated observations carrying sensor identity, exact timestamp, intrinsics/distortion, extrinsics/pose and source covariance.
 
-## Claims that are NOT yet allowed
+Spatial phone-camera baseline is most useful close up; temporal device motion can provide a much larger baseline.
+
+## Claims that remain forbidden
 
 - no physical mm/cm stability/accuracy claim;
-- no guaranteed XFeat latency/FPS claim from model-card data;
+- no guaranteed XFeat latency/FPS from upstream benchmarks;
 - no measured thermal/battery claim;
-- no proof of correctness after long occlusion/reacquisition on real phones;
-- no iOS LiteRT runtime/device parity yet;
+- no real-device proof of long-occlusion reacquisition yet;
+- no iOS XFeat LiteRT runtime/device parity yet;
 - no Quest physical validation;
 - no full 3D/tangential correction yet;
 - no moving/deforming-object guarantee;
@@ -143,13 +141,13 @@ Roadmap remains a capability-aware observation graph, not a stereo-specific anch
 
 ## Exact next-agent procedure
 
-1. Fetch live `stablear/multiplatform-sdk` HEAD and read `AGENTS.md`, this file, `TRACKING_RESEARCH.md`, `WORKLOG.md`, `VALIDATION.md` and `sdk/checkpoints/XFEAT_LITERT_ANDROID_2026-09-11.md`.
-2. Inspect workflow run #39 (`34628410948`) for code checkpoint `e461e81...`; fix any regression before extending the runtime.
-3. Retain Android physical A/B validation as the immediate correctness gate: host-only vs LK/ORB vs XFeat, including rotations, distance changes, low/repetitive texture, blur, lighting, occlusion/reacquisition and thermal soak.
-4. Replace Android FloatArray/JNI descriptor-map copies with a native/persistent buffer path only after output parity is locked.
-5. Integrate Apple LiteRT behind a replaceable runtime adapter: CPU baseline, Metal self-test, fail-closed/fallback behavior. Reuse `StableARXFeatNative`; do not duplicate matching logic in Swift.
-6. Clean up source-aware visual evidence semantics additively; do not change existing C ABI struct layouts casually.
+1. Fetch live branch HEAD and read `sdk/AGENTS.md`, this file, `TRACKING_RESEARCH.md`, `WORKLOG.md`, `VALIDATION.md` and `sdk/checkpoints/XFEAT_LITERT_ANDROID_2026-09-11.md`.
+2. Treat `e461e81c375e3875237ab0286718af1d4a4f7939` + run #39 as the latest fully software-verified code checkpoint. Later commits may be documentation-only; inspect the live diff before code changes.
+3. Immediate correctness gate: physical Android A/B harness — host-only vs LK/ORB vs XFeat — across viewpoint/distance changes, low/repetitive texture, blur, lighting, occlusion/reacquisition and thermal soak.
+4. Freeze deterministic captured-frame parity fixtures, then replace Android FloatArray/JNI descriptor copies with native/persistent buffers.
+5. Integrate Apple LiteRT behind a replaceable runtime adapter: CPU baseline, Metal self-test/fallback, reuse `StableARXFeatNative`, no Swift matcher duplication.
+6. Introduce source-aware visual-evidence quality semantics additively; do not casually change existing C ABI struct layouts.
 7. Implement the bounded fixed-lag local point/surfel optimizer.
-8. Then add capability-aware physical multi-camera/temporal observations and run device validation before updating claims.
+8. Add capability-aware physical multi-camera/temporal observations and repeat device validation before upgrading claims.
 
-No synthetic test, CI run or upstream benchmark alone justifies a physical accuracy, FPS or commercial-performance claim.
+No synthetic test, CI run or upstream benchmark alone justifies physical accuracy, FPS or commercial-performance claims.
