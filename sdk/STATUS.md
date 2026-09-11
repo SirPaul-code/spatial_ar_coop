@@ -1,132 +1,135 @@
 # StableAR multiplatform SDK handoff/status
 
-Last updated: 2026-09-10
+Last updated: 2026-09-11
 Target branch: `stablear/multiplatform-sdk`
 Frozen Android reference: `research_sdk@38978da448b6610606e9145367b9b31328bb5cc0`
+Starting HEAD for the XFeat checkpoint: `8e5c00392a1de803399235e1c1fa210336f90baf`
 
 ## Read this first
 
 StableAR is a **local material-attachment stability layer above a host AR/XR runtime**. It is not a replacement SLAM engine and it is not a two-device synchronization system. ARCore/ARKit/OpenXR keep owning VIO/world tracking. StableAR owns exact-frame history, local metric surface fitting, immutable target identity, visual evidence gating and bounded correction state.
 
-Do not change `research_sdk`, ShowMe branches or unrelated products while working on this branch. The Android-only Kotlin SDK remains the current physical reference and can be integrated into ShowMe independently of the native port.
+Work only on `stablear/multiplatform-sdk`. Do not modify `research_sdk`, ShowMe branches or unrelated products. The frozen Android-only reference remains independently usable.
 
 Canonical StableAR camera coordinates are right-handed: `+X right, +Y down, +Z forward`.
 
-## Checkpoints already on this branch
+## Existing checkpoints
 
 - `66b200005948c43b3d82a861930dd56da91fb5fe` — native C++20 core + C ABI v1.
 - `67d627cdae8a63185c34db8ced35e5af61f8e4bf` — durable handoff/branch rules + entitlement tooling.
-- `edf7ed4701ce7d4d3cd5c6fdd3fcadf0d3b3897e` — shared OpenCV visual-tracker source/C ABI.
+- `edf7ed4701ce7d4d3cd5c6fdd3fcadf0d3b3897e` — shared OpenCV visual tracker source/C ABI.
 - `40b1d34e9c7990e56809382b381ff6f9f6e43f39` — Android/ARCore native AAR/JNI source.
 - `2faf3b035c7f538846d3ec5dfaa7a15d7231f091` — separate native OpenCV Android AAR source.
 - `09a5fd02e70ace512f9673d25082fd9cfe37fa45` — Apple XCFramework/Swift/ARKit source.
 - `267f81e9e043ceec31cffc970521a3b8f95b9a45` — generic OpenXR session-local adapter source.
 - `8526b441be137d9fbbb63c63412c798d8c47c6f9` — Unity P/Invoke/UPM source + LP64 ABI contract.
+- `8e5c00392a1de803399235e1c1fa210336f90baf` — OpenCV Android Prefab package fix; previous multiplatform workflow checkpoint is green.
 
-All ref moves were non-force updates.
+All branch moves must be non-force unless an explicit recovery procedure says otherwise.
 
-## DONE and locally verified
+## Native core — DONE / software-verified
 
-### Native C++ core (`sdk/native`)
+`sdk/native` implements rigid geometry/intrinsics/presentation mapping, robust inverse-depth surface fitting, bounded anchor-relative frame history/freeze leases, immutable original root, multi-view original-ray refinement, parallax/visual/uncertainty/travel gates, held-out commit validation, epoch/generation/timestamp rejection, lifecycle state, platform-neutral `AnchorStore`, static/shared CMake packaging and C ABI v1.
 
-Implemented: rigid geometry/intrinsics/presentation mapping; robust inverse-depth local surface fitting; bounded anchor-relative frame history/freeze leases; immutable original root; multi-view original-ray depth refinement; parallax/visual/uncertainty/travel gates; held-out commit validation; epoch/generation/timestamp rejection; lifecycle state; platform-neutral `AnchorStore`; static/shared CMake packaging; installed `find_package(StableAR 0.2)` package; stable C ABI v1.
+Previous local/CI gates include static/shared build, package consumer, C smoke, sanitizers, warnings-as-errors and native contract tests. These are software invariants, **not physical accuracy measurements**.
 
-Latest local gate:
+## Shared native vision
 
-```text
-native static build: PASS
-native shared build: PASS
-C ABI smoke: PASS
-installed CMake package consumer: PASS
-ASan + UBSan: PASS
--Wall -Wextra -Wpedantic -Werror: PASS
-native contract: PASS, 8 suites / 2087 assertions
-root sdk CMake/CTest discovery: PASS, 2/2 tests
-```
+### Existing OpenCV path — compile-tested
 
-These are synthetic/software invariant tests, **not physical accuracy measurements**.
+`sdk/native-vision` already has immutable-root LK forward/backward fast tracking plus ORB/RANSAC/homography reacquisition. Visual tracking only proposes evidence; geometry remains correction authority. The Android vision AAR uses OpenCV 4.12.0.
 
-### Entitlement/licensing engineering
+### XFeat learned-correspondence frontend — NEW checkpoint, CI pending
 
-`STABLEAR1.<payload>.<signature>` uses canonical product/customer/app/platform/features/nbf/exp/grace claims and a P-256 ECDSA/SHA-256 signature boundary. Parser rejects malformed/unknown/duplicate/missing claims, wrong product/platform/app/feature, invalid times, oversized input, bad signatures and expiry; offline grace is capped at 31 days and expiry arithmetic is overflow-safe. Development P-256 issuer/signature contract passes locally.
+Research decision: use **XFeat + StableAR geometry**, not TAPIR/CoTracker as the first mobile backend and not XFeat as a replacement VIO.
 
-A real decoder regression was found during reconstruction (valid token rejected as malformed); the base64url decoder was replaced and native/P-256 tests are green again.
+Implemented in the new checkpoint:
+- runtime-neutral shared C++ `XFeatLocalTracker`;
+- deterministic 640x480 grayscale + per-image InstanceNorm preprocessing;
+- exact coordinate-aware bilinear sampling of the 64-D descriptor map rather than nearest `pixel/8`;
+- reliability-filtered 5x5 local descriptor fingerprint around an arbitrary tap;
+- host-prediction-bounded coarse-to-fine search;
+- distinct spatial second-peak ambiguity rejection;
+- descriptor consensus and conservative pixel sigma;
+- bounded explicit multi-view template bank;
+- anti-drift rule: no automatic template self-learning;
+- additive C ABI and deterministic C++ contract test.
 
-Entitlement enforcement is **not the legal licence**. Production private keys must remain server/KMS/HSM side and commercial rights require SDK/EULA terms. See `COMMERCIALIZATION.md`.
+Local pre-commit checks passed under `-Wall -Wextra -Wpedantic -Werror`; public C header also compiled as C11; deterministic XFeat matcher/preprocessing contract passed.
 
-### Local wrapper/source checks completed
+The actual LiteRT graph is **not yet executed by this checkpoint** and the model binary is intentionally not vendored yet. Read `TRACKING_RESEARCH.md` and `WORKLOG.md` before continuing.
 
-- Android core JNI: host-JDK JNI syntax compile with `-Wall -Wextra -Wpedantic -Werror` — PASS.
-- Android pure Kotlin `NativeStableAr` façade — local Kotlin compile PASS.
-- Native-vision Android JNI syntax compile — PASS.
-- Native-vision pure Kotlin wrapper — local Kotlin compile PASS.
-- Apple pure `StableARSession.swift` C-ABI façade — local Swift typecheck PASS.
-- SDK-only private-repo export tool — PASS; forbidden root `showme/`, `android/`, `server/`, `research_sdk/` do not leak.
-- Multiplatform workflow YAML parse — PASS.
+## XFeat model/runtime decision
 
-## IMPLEMENTED SOURCE, CI TOOLCHAIN VALIDATION PENDING
+Candidate model provenance observed during research:
+- LiteRT-community XFeat revision `bd421aad1ce6d25dc172cd9579cc13b9da21356f`;
+- `xfeat.tflite` size 1,414,480 bytes;
+- SHA-256 `6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df`;
+- input 480x640 grayscale + host InstanceNorm;
+- dense output 64x60x80 plus reliability/keypoint outputs.
 
-These modules are now source-complete enough for CI compilation, but must not be called platform-ready until their corresponding CI job passes.
+Do not ship from mutable upstream `main`. Pin and archive an approved model artifact, preserve notices, and add deterministic parity fixtures first.
 
-### Shared native vision (`sdk/native-vision`)
+Do not advertise one latency number. Published device/backend measurements vary materially. Shipping runtime must compile once, reuse buffers, benchmark available delegates on-device and fall back to LK/ORB when ML is unavailable, slower or thermally undesirable.
 
-Optional OpenCV front-end with immutable root, LK forward/backward fast path and ORB/RANSAC/homography root reacquisition plus C ABI. Image matching only proposes evidence; C++ geometry remains correction authority. Local container lacked OpenCV development headers, so actual CMake/OpenCV compilation is delegated to Linux CI.
+## Android / ARCore
 
-### Android / ARCore (`sdk/native-android`)
+`sdk/native-android` provides host-owned ARCore session integration, exact frame timestamp/intrinsics/pose capture, raw/smoothed/point-cloud depth sampling and native StableAR lifecycle. Keep ARCore/session access on the owner AR/render thread.
 
-NDK/JNI + typed Kotlin session + host-owned `ArCoreNativeAdapter`; no second camera/session. ARCore camera axes are converted once; raw/smoothed/point-cloud depth source timestamps are preserved. JNI rejects null handles; Kotlin blocks use after close; `observe()` returns actual correction-commit status. Android entitlement verifies P-256 and binds to package + signing-certificate SHA-256. Real Gradle/NDK/ARCore compile is pending CI.
+For XFeat, next Android work is a **dedicated bounded vision worker** using LiteRT `CompiledModel` with persistent tensors. Latest-frame work may coalesce; lifecycle/control commands must not be dropped. Every result must retain exact source frame id/timestamp/epoch/generation. Avoid shipping a Kotlin `FloatArray` copy path for the ~307k-float descriptor tensor; use native/C++ buffers in the final path.
 
-### Android native vision (`sdk/native-vision-android`)
+## Apple / ARKit
 
-Separate AAR links OpenCV 4.12.0 and native vision ABI, intentionally separated from core for size/provenance auditing. Real Android Prefab/native link is pending CI.
+Existing Apple source contains C-ABI façade, host-owned ARKit adapter, optional scene depth and XCFramework build path. XFeat should reuse the same shared C++ preprocessing/matcher. Put LiteRT CPU/Metal execution behind a replaceable adapter; do not let Apple runtime details duplicate StableAR geometry.
 
-### Apple / ARKit (`sdk/apple`)
+## OpenXR / Meta
 
-Device+simulator core XCFramework builder, Swift C-ABI façade, host-owned ARKit/ARAnchor adapter, optional `sceneDepth`/smoothed fallback and CryptoKit P-256 verifier are present. `stablear_c.h` copy is kept byte-identical to native public C header. Actual Xcode/iOS ARKit/CryptoKit compile is pending macOS CI. Do not imply unrestricted visionOS camera access.
+Existing generic OpenXR adapter remains host-pose/session-local. Quest-specific RGB/depth/camera APIs remain optional host inputs rather than core dependencies. Physical Quest validation remains required.
 
-### OpenXR / Meta (`sdk/openxr`)
+## Unity
 
-Generic OpenXR adapter stores session-local anchors as `XR_REFERENCE_SPACE_TYPE_LOCAL` child spaces and locates them against the host local space at host-supplied `XrTime`. Camera conversion is OpenXR view -> StableAR canonical camera. RGB/depth are host inputs; Quest-specific camera/environment-depth APIs do not contaminate core. Linux OpenXR compile and physical Quest 3/3S validation are pending.
+Existing Unity package/PInvoke boundary and coordinate conversion remain unchanged. Learned correspondence belongs below Unity in the shared/native platform layer; do not implement a second matcher in C#.
 
-### Unity (`sdk/unity`)
+## Geometry limitation / next accuracy ceiling
 
-UPM source package/PInvoke C ABI, `IAnchorStore` host callbacks and explicit Unity left-handed <-> StableAR right-handed coordinate conversion are present. LP64 managed ABI expected sizes are captured in an executable .NET contract. Managed compile/ABI execution is pending CI/Unity engine validation.
+Current `RayRefiner` corrects **one scalar depth along the immutable original clicked ray**. This is deliberately safe but cannot correct tangential material-point error.
 
-## CI / packaging next gate
+After XFeat evidence is calibrated, next estimator should be a bounded fixed-lag local optimizer in anchor coordinates, not a second global SLAM: material point/surfel state, optional tiny pose deltas strongly prior-constrained to host VIO, source-aware reprojection factors, metric depth/surface factors, robust loss, bounded history/marginalization and the existing travel/held-out/epoch/generation protections.
 
-The next checkpoint adds `.github/workflows/stablear-multiplatform.yml` plus root Gradle/CMake wiring. Required jobs:
+## Multi-camera / temporal observations
 
-1. `scope`: prove only `sdk/**` + the StableAR workflow changed from frozen base.
-2. `native-linux`: static/shared core, CMake package consumer, symbols, ASan/UBSan/Werror, OpenCV tracker, OpenXR adapter, entitlement, SDK-only export.
-3. `android`: NDK core AAR + OpenCV vision AAR + lint while retaining buildability of the original Kotlin reference modules.
-4. `apple`: iOS device+simulator XCFramework + Swift/ARKit/CryptoKit typecheck.
-5. `unity-abi`: .NET compile + LP64 struct-layout contract.
+Do not create a separate stereo-only anchor type. The roadmap is a capability-aware observation graph: physical cameras, temporal keyframes, raw depth/ToF/LiDAR/mesh and LK/XFeat/ORB observations all contribute calibrated evidence with sensor identity, exact timestamp, intrinsics/extrinsics and source-specific covariance. Spatial phone-camera baseline is strongest close up; temporal motion may provide much larger baseline.
 
-After CI, update this file with the exact workflow run, failing/fixed jobs and final commit SHA.
-
-## Known limitations that must remain explicit
+## Known limitations that must stay explicit
 
 - static material/surface attachments only;
-- current correction is 1D along the immutable original clicked ray, not a full fixed-lag factor graph;
+- current correction remains 1D along original ray until fixed-lag optimizer lands;
+- XFeat matcher is locally software-tested but actual pinned LiteRT graph/runtime parity is pending;
+- no calibrated XFeat-to-pixel covariance yet;
 - no moving/deforming-object solution;
 - no arbitrary cross-session map persistence contract yet;
 - no calibrated device covariance;
-- no measured smartphone/Quest CPU/GPU/thermal/battery/motion-to-photon data;
+- no measured smartphone/Quest CPU/GPU/thermal/battery/motion-to-photon claim for the new ML path;
 - no independent physical mm/cm ground-truth claim;
 - initial absolute depth can be biased even when attachment looks visually stable;
-- native OpenCV redistribution is not commercially cleared until exact bundled third-party provenance/notices are reconciled;
-- Google/Apple/Meta platform terms and owner SDK/EULA terms remain commercial release gates.
+- model/OpenCV/platform redistribution and notices must be cleared before commercial release;
+- Google/Apple/Meta terms and owner SDK/EULA remain release gates.
 
-## Existing Android-only path remains usable NOW
+## Existing Android-only path remains usable
 
-Do not remove or block `research_sdk@38978da...`. Its Kotlin `sdk/core`, `sdk/arcore`, `sdk/vision`, `sdk/demo` are the current physically observed Android reference and can be integrated into ShowMe immediately. Migrating ShowMe to native C++ should happen only after native Android physical A/B parity.
+Do not remove or block `research_sdk@38978da448b6610606e9145367b9b31328bb5cc0`. Its Kotlin Android implementation remains the physical reference and can be integrated independently. Native migration should follow physical A/B parity.
 
-## Next agent start point
+## Exact next-agent procedure
 
-1. Read this file plus `AGENTS.md`, `MULTIPLATFORM.md`, `COMMERCIALIZATION.md`, `VERSIONING.md`, `VALIDATION.md`.
-2. Work only on `stablear/multiplatform-sdk`.
-3. Fetch live branch head before every write; never force-update it to discard another agent's work.
-4. Run native gate first; fix core before adapters if red.
-5. Run/fix the multiplatform CI until compile/typecheck jobs are green.
-6. Do physical Android/iOS/Quest validation before upgrading those platforms from compile-tested to device-tested.
-7. Update this file after every meaningful checkpoint.
+1. Read `AGENTS.md`, this file, `TRACKING_RESEARCH.md`, `WORKLOG.md`, `MULTIPLATFORM.md`, `COMMERCIALIZATION.md`, `VERSIONING.md`, `VALIDATION.md`.
+2. Work only on `stablear/multiplatform-sdk` and fetch live HEAD before writes.
+3. Check the workflow run for the XFeat checkpoint. Fix any native-linux/native-vision regression before adding runtime code.
+4. Add source-aware visual evidence metrics; do not map XFeat consensus residual into LK forward/backward semantics.
+5. Add a pinned model manifest, license/NOTICE data and deterministic XFeat input/output parity fixtures.
+6. Implement Android LiteRT C++ `CompiledModel` worker with persistent tensors and bounded scheduling.
+7. Wire only calibrated XFeat observations through StableAR geometry, then admit new templates after independent held-out acceptance.
+8. Add iOS LiteRT/Metal adapter over the same C++ matcher.
+9. Implement bounded fixed-lag local point/surfel optimizer and then capability-aware multi-camera observations.
+10. Run physical Android/iOS/Quest A/B validation before upgrading claims or platform status.
+
+No synthetic test, CI run or model-card benchmark alone justifies a physical accuracy, FPS or commercial-performance claim.

@@ -26,7 +26,11 @@ set(_kind STATIC)
 if(STABLEAR_VISION_BUILD_SHARED)
   set(_kind SHARED)
 endif()
-add_library(stablear_vision ${_kind} src/vision.cpp src/vision_c.cpp)
+add_library(stablear_vision ${_kind}
+  src/vision.cpp
+  src/vision_c.cpp
+  src/xfeat.cpp
+  src/xfeat_c.cpp)
 add_library(StableAR::vision ALIAS stablear_vision)
 target_include_directories(stablear_vision PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -45,4 +49,8 @@ if(STABLEAR_VISION_BUILD_TESTS)
   set_target_properties(stablear_vision_c_smoke PROPERTIES LINKER_LANGUAGE CXX)
   target_link_libraries(stablear_vision_c_smoke PRIVATE stablear_vision)
   add_test(NAME stablear_vision_c_smoke COMMAND stablear_vision_c_smoke)
+
+  add_executable(stablear_xfeat_contract tests/xfeat_contract.cpp)
+  target_link_libraries(stablear_xfeat_contract PRIVATE stablear_vision)
+  add_test(NAME stablear_xfeat_contract COMMAND stablear_xfeat_contract)
 endif()
