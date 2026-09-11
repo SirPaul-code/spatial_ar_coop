@@ -3,21 +3,11 @@ package com.sirpaul.stablear.demo
 import android.content.Context
 import com.sirpaul.stablear.core.V2
 import com.sirpaul.stablear.nativevision.XFeatLiteRtTracker
+import com.sirpaul.stablear.vision.ImageMatch
 import com.sirpaul.stablear.vision.LocalSurfaceTracker
 
 /** Reference integration for the lab app: XFeat/LiteRT first, LK/ORB fallback. */
 internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
-    data class Match(
-        val pixel: V2,
-        val inliers: Int,
-        val reprojectionPx: Double,
-        val forwardBackwardPx: Double,
-        val sigmaPx: Double,
-        val method: String,
-        val score: Double? = null,
-        val scoreMargin: Double? = null,
-    )
-
     private val fallback = LocalSurfaceTracker()
     private val ids = linkedSetOf<Long>()
     private var xfeatAttempted = false
@@ -72,18 +62,18 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
         return learnedAdded || classical
     }
 
-    fun track(id: Long, predicted: V2?): Match? {
+    fun track(id: Long, predicted: V2?): ImageMatch? {
         if (predicted != null) {
             val ml = xfeat
             if (ml != null) {
                 try {
                     ml.track(id, predicted.x, predicted.y)?.let { m ->
-                        return Match(
-                            pixel = V2(m.x, m.y), inliers = m.inliers,
-                            reprojectionPx = m.medianReprojectionPx,
-                            forwardBackwardPx = m.medianReprojectionPx,
-                            sigmaPx = m.sigmaPx, method = "XFEAT_LITERT",
-                            score = m.score, scoreMargin = m.scoreMargin,
+                        return ImageMatch(
+                            V2(m.x, m.y),
+                            m.inliers,
+                            m.medianReprojectionPx,
+                            m.medianReprojectionPx,
+                            "XFEAT_LITERT"
                         )
                     }
                 } catch (_: Throwable) {
@@ -91,8 +81,7 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
                 }
             }
         }
-        val m = fallback.track(id, predicted) ?: return null
-        return Match(m.pixel, m.inliers, m.medianReprojectionPx, m.forwardBackwardPx, 1.0, m.method)
+        return fallback.track(id, predicted)
     }
 
     fun remove(id: Long) {
