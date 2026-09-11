@@ -75,7 +75,7 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
                 if(match==null) { sdk.engine.visibility(c.id,false); continue }
                 val o=VisualObservation(c.frame.id,c.root.epoch,c.root.anchorId,c.generation,
                     c.frame.cameraTimestampNs,c.frame.capturedNs,c.cameraInAnchor,c.frame.intrinsics,
-                    match.pixel,match.inliers,match.forwardBackwardPx,match.medianReprojectionPx)
+                    match.pixel,match.inliers,match.forwardBackwardPx,match.medianReprojectionPx,match.sigmaPx)
                 val decision=sdk.observe(c.id,o); reason="${match.method}: ${decision.reason}"
                 if(decision.accepted) corrections++
             }
@@ -89,7 +89,7 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
                     val gray=command.displayed.sample.gray
                     if(p==null) reason="No supported surface at this pixel. Move sideways and retry."
                     else if(gray!=null) {
-                        worker.execute { tracker.add(p.attachment.id,gray.bytes,gray.width,gray.height,pixel) }
+                        worker.execute { tracker.add(p.attachment.id,gray.timestampNs,gray.bytes,gray.width,gray.height,pixel) }
                         reason="Anchored. XFeat/LiteRT preferred; LK/ORB fallback. Move sideways for verification."
                     } else reason="Anchored with depth; visual reference unavailable."
                 }
