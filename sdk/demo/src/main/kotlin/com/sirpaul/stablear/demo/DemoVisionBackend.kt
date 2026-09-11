@@ -42,17 +42,22 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
     }
 
     /** Captures immutable root evidence from the exact placement exposure for both backends. */
-    fun add(id: Long, gray: ByteArray, width: Int, height: Int, pixel: V2): Boolean {
+    fun add(id: Long, frameId: Long, gray: ByteArray, width: Int, height: Int, pixel: V2): Boolean {
+        require(frameId > 0)
         val classical = fallback.add(id, gray, width, height, pixel)
         var learnedAdded = false
         val ml = learned()
         if (ml != null) {
             try {
-                if (ml.beginFrame(rootFrameId(id, gray), gray, width, height)) {
+                // Never synthesize visual frame identities: this is the actual CPU-image timestamp
+                // belonging to the placement exposure retained by the ARCore adapter.
+                if (ml.beginFrame(frameId, gray, width, height)) {
                     learnedAdded = ml.addRoot(id, pixel.x, pixel.y)
                 }
                 currentGray?.let { live ->
-                    if (currentFrameId != Long.MIN_VALUE) ml.beginFrame(currentFrameId, live, currentWidth, currentHeight)
+                    if (currentFrameId != Long.MIN_VALUE && currentFrameId != frameId) {
+                        ml.beginFrame(currentFrameId, live, currentWidth, currentHeight)
+                    }
                 }
             } catch (_: Throwable) {
                 disableLearned(ml)
@@ -73,7 +78,8 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
                             m.inliers,
                             m.medianReprojectionPx,
                             m.medianReprojectionPx,
-                            "XFEAT_LITERT"
+                            "XFEAT_LITERT",
+                            m.sigmaPx,
                         )
                     }
                 } catch (_: Throwable) {
@@ -106,7 +112,4 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
         runCatching { ml.close() }
         if (xfeat === ml) xfeat = null
     }
-
-    private fun rootFrameId(id: Long, gray: ByteArray): Long =
-        ((id shl 32) xor gray.contentHashCode().toLong()).and(Long.MAX_VALUE).coerceAtLeast(1L)
 }
