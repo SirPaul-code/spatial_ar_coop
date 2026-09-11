@@ -1,0 +1,22 @@
+StableAR reference demo — third-party notices
+
+XFeat / Accelerated Features
+Copyright the XFeat authors and contributors.
+Upstream: https://github.com/verlab/accelerated_features
+License: Apache License 2.0.
+The LiteRT-converted XFeat model used by this demo is distributed by litert-community/xfeat-litert and is marked Apache-2.0.
+
+Google LiteRT
+Copyright Google LLC and contributors.
+Upstream: https://github.com/google-ai-edge/LiteRT
+License: Apache License 2.0.
+
+OpenCV
+Copyright OpenCV contributors.
+Upstream: https://opencv.org/
+License: Apache License 2.0 for the 4.x distribution used by this demo.
+
+Google Play Services for AR (ARCore)
+Provided by Google LLC. ARCore is a host/platform dependency and is subject to Google's applicable terms and privacy policy; it is not relicensed by StableAR.
+
+This notice is informational for the research demo. A commercial StableAR distribution must ship the applicable complete third-party license texts and preserve any upstream NOTICE/attribution material required by the exact dependency versions included in that distribution.
