@@ -1,7 +1,10 @@
 #include "stablear/vision_c.h"
 #include "stablear/xfeat.hpp"
 
-struct stablear_xfeat_tracker { stablear::vision::XFeatLocalTracker tracker; };
+struct stablear_xfeat_tracker {
+    stablear_xfeat_tracker() : tracker(stablear::vision::XFeatPolicy{}) {}
+    stablear::vision::XFeatLocalTracker tracker;
+};
 
 namespace {
 stablear::vision::XFeatMapView mapView(const float* descriptors,const float* reliability,int cw,int ch,int iw,int ih){
@@ -17,7 +20,7 @@ stablear::vision::XFeatView xview(int has,double x,double y,double z,double scal
 }
 
 extern "C" {
-stablear_xfeat_tracker* stablear_xfeat_create(void){try{return new stablear_xfeat_tracker{};}catch(...){return nullptr;}}
+stablear_xfeat_tracker* stablear_xfeat_create(void){try{return new stablear_xfeat_tracker();}catch(...){return nullptr;}}
 void stablear_xfeat_destroy(stablear_xfeat_tracker*t){delete t;}
 int stablear_xfeat_add_root(stablear_xfeat_tracker*t,uint64_t id,const float*d,const float*r,int cw,int ch,int iw,int ih,double x,double y){if(!t||!id||!d)return 0;try{return t->tracker.add(id,mapView(d,r,cw,ch,iw,ih),{x,y})?1:0;}catch(...){return 0;}}
 int stablear_xfeat_add_template(stablear_xfeat_tracker*t,uint64_t id,const float*d,const float*r,int cw,int ch,int iw,int ih,double x,double y,int has,double vx,double vy,double vz,double scale,double quality){if(!t||!id||!d)return 0;try{return t->tracker.addTemplate(id,mapView(d,r,cw,ch,iw,ih),{x,y},xview(has,vx,vy,vz,scale,quality))?1:0;}catch(...){return 0;}}
