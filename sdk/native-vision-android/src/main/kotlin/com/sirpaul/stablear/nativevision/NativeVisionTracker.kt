@@ -11,7 +11,7 @@ internal object NativeVision {
     external fun clear(handle:Long)
 }
 
-enum class NativeVisionMethod { NONE, LK_ROOT, ORB_ROOT }
+enum class NativeVisionMethod { NONE, LK_ROOT, ORB_ROOT, XFEAT_PATCH }
 data class NativeImageMatch(val x:Double,val y:Double,val inliers:Int,val medianReprojectionPx:Double,val forwardBackwardPx:Double,val method:NativeVisionMethod)
 
 /** One instance belongs to one bounded CV worker thread. */
