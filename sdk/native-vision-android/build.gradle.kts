@@ -51,6 +51,17 @@ android {
     sourceSets.getByName("main").assets.srcDir(xfeatAssetDir)
     externalNativeBuild { cmake { path=file("src/main/cpp/CMakeLists.txt"); version="3.22.1" } }
     compileOptions { sourceCompatibility=JavaVersion.VERSION_17; targetCompatibility=JavaVersion.VERSION_17 }
+    // OpenCV's official AAR already supplies the single libc++_shared runtime required by
+    // opencv_java4 and this JNI library. Do not publish a second NDK copy from StableAR:
+    // consuming apps otherwise fail mergeDebugNativeLibs (or, with older AGP, can silently
+    // pick an arbitrary libc++ build). The final commercial packaging should continue toward
+    // the Android NDK middleware recommendation of one JNI implementation library with a
+    // tightly controlled native ABI.
+    packaging {
+        jniLibs {
+            excludes += "**/libc++_shared.so"
+        }
+    }
 }
 kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }
 
