@@ -8,9 +8,6 @@ if(NOT TARGET StableAR::stablear)
   add_subdirectory(../native stablear-native EXCLUDE_FROM_ALL)
 endif()
 
-# Desktop OpenCV normally exposes OpenCV_LIBS. Android Prefab generated from the
-# official org.opencv:opencv AAR exposes package `opencv`, module `opencv_java4`,
-# hence target opencv::opencv_java4. Keep the other names for local/custom builds.
 if(TARGET opencv::opencv_java4)
   set(STABLEAR_OPENCV_LIBS opencv::opencv_java4)
 elseif(TARGET OpenCV::opencv_java4)
@@ -30,6 +27,7 @@ add_library(stablear_vision ${_kind}
   src/vision.cpp
   src/vision_c.cpp
   src/xfeat.cpp
+  src/xfeat_tracker.cpp
   src/xfeat_c.cpp)
 add_library(StableAR::vision ALIAS stablear_vision)
 target_include_directories(stablear_vision PUBLIC
