@@ -5,6 +5,7 @@ import android.opengl.*
 import com.google.ar.core.*
 import com.sirpaul.stablear.arcore.*
 import com.sirpaul.stablear.core.*
+import com.sirpaul.stablear.nativevision.XFeatView
 import com.sirpaul.stablear.vision.*
 import java.nio.*
 import java.util.concurrent.*
@@ -28,6 +29,7 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
     private data class Displayed(val sample: CameraSample,val viewToImage: FloatArray,val width: Int,val height: Int)
     private data class Tap(val displayed: Displayed,val x: Float,val y: Float)
     private data class Result(val lifecycle: Long,val context: ObservationContext,val match: DemoVisionMatch?)
+    private data class VisionHint(val predicted: V2?,val view: XFeatView)
     @Volatile private var presented: Displayed?=null
     private val tap=AtomicReference<Tap?>(null)
     private val answers=ConcurrentLinkedQueue<Result>()
@@ -134,14 +136,31 @@ class LabRenderer(private val context: Context,private val status: (String)->Uni
                         // No material attachment means no useful learned observation. Avoid waking LiteRT/GPU
                         // just because the camera produced a new frame; this saves thermal and battery budget.
                         if(contexts.isNotEmpty() && busy.compareAndSet(false,true)) {
-                            val predictions=contexts.associate { c -> c.id to sdk.engine.snapshot(c.id)?.let {
-                                c.frame.intrinsics.project(c.cameraInAnchor.inverse().point(it.pointInAnchor())) } }
+                            val hints=contexts.associate { c ->
+                                val snapshot=sdk.engine.snapshot(c.id)
+                                val point=snapshot?.pointInAnchor()
+                                val pointNow=point?.let { c.cameraInAnchor.inverse().point(it) }
+                                val pointRoot=point?.let { c.root.cameraInAnchor.inverse().point(it) }
+                                val predicted=pointNow?.let { c.frame.intrinsics.project(it) }
+                                val direction=point?.let { p ->
+                                    val targetToCamera=c.cameraInAnchor.t-p
+                                    if(targetToCamera.norm()>1e-6) targetToCamera.unit() else null
+                                }
+                                // Template offset scale follows perspective size relative to the immutable
+                                // root exposure. Clamp aggressively: descriptor matching handles appearance,
+                                // while this hint must never explode a local patch because of pose/depth noise.
+                                val rawScale=if(pointNow!=null && pointRoot!=null && pointNow.z>.05 && pointRoot.z>.05)
+                                    pointRoot.z/pointNow.z else 1.0
+                                val view=XFeatView(direction?.x,direction?.y,direction?.z,rawScale.coerceIn(.5,2.0),1.0)
+                                c.id to VisionHint(predicted,view)
+                            }
                             val generation=lifecycle.get()
                             worker.execute {
                                 try {
                                     tracker.beginFrame(gray.timestampNs,gray.bytes,gray.width,gray.height)
                                     contexts.forEach { c ->
-                                        if(generation==lifecycle.get()) answers.add(Result(generation,c,tracker.track(c.id,predictions[c.id])))
+                                        val hint=hints[c.id] ?: VisionHint(null,XFeatView())
+                                        if(generation==lifecycle.get()) answers.add(Result(generation,c,tracker.track(c.id,hint.predicted,hint.view)))
                                     }
                                 } catch(_: Exception) { /* Verification must never stop camera tracking. */ }
                                 finally { busy.set(false) }
