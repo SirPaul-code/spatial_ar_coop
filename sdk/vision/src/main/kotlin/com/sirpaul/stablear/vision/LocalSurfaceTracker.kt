@@ -11,8 +11,9 @@ import kotlin.math.*
 /** Caller owns the single bounded worker. No model weights, detector boxes or screen smoothing. */
 // forwardBackwardPx is measured LK cycle error, or ORB symmetric-transfer error.
 // method distinguishes them; a missing check is never represented as a measured zero.
+// sigmaPx is the front-end's conservative image-space uncertainty used by StableAR geometry.
 data class ImageMatch(val pixel: V2,val inliers: Int,val medianReprojectionPx: Double,
-    val forwardBackwardPx: Double,val method: String)
+    val forwardBackwardPx: Double,val method: String,val sigmaPx: Double=1.0)
 
 class LocalSurfaceTracker : AutoCloseable {
     private data class Reference(val image: Mat,val pixel: V2,val corners: MatOfPoint2f,
