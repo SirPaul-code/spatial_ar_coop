@@ -31,7 +31,7 @@ class LabActivity : Activity() {
         val layout=FrameLayout(this)
         view=LabSurfaceView(this) { x,y -> renderer.tap(x,y) }.apply { setEGLContextClientVersion(2); preserveEGLContextOnPause=true }
         status=TextView(this).apply { textSize=15f; setPadding(24,20,24,20); setBackgroundColor(0xCC14202B.toInt()) }
-        renderer=LabRenderer({ message -> runOnUiThread { status.text=message } }, { @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation })
+        renderer=LabRenderer(applicationContext,{ message -> runOnUiThread { status.text=message } }, { @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation })
         view.setRenderer(renderer)
         layout.addView(view)
         layout.addView(status,FrameLayout.LayoutParams(-1,-2,Gravity.TOP))
