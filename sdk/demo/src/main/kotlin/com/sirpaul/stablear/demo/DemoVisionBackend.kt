@@ -55,11 +55,7 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
         val ml = learned()
         if (ml != null) {
             try {
-                // Never synthesize visual frame identities: this is the actual CPU-image timestamp
-                // belonging to the placement exposure retained by the ARCore adapter.
-                if (ml.beginFrame(frameId, gray, width, height)) {
-                    learnedAdded = ml.addRoot(id, pixel.x, pixel.y)
-                }
+                if (ml.beginFrame(frameId, gray, width, height)) learnedAdded = ml.addRoot(id, pixel.x, pixel.y)
                 currentGray?.let { live ->
                     if (currentFrameId != Long.MIN_VALUE && currentFrameId != frameId) {
                         ml.beginFrame(currentFrameId, live, currentWidth, currentHeight)
@@ -73,26 +69,22 @@ internal class DemoVisionBackend(private val context: Context) : AutoCloseable {
         return learnedAdded || classical
     }
 
-    fun track(id: Long, predicted: V2?): DemoVisionMatch? {
+    fun track(id: Long, predicted: V2?, view: XFeatView = XFeatView()): DemoVisionMatch? {
         if (predicted != null) {
             val ml = xfeat
             if (ml != null) {
                 try {
-                    ml.track(id, predicted.x, predicted.y)?.let { m ->
-                        // Snapshot the exact current patch now, while this inference map is still current.
-                        // The token is inert until the AR thread independently accepts the observation.
-                        val token = ml.stageTemplate(
-                            id,
-                            m.x,
-                            m.y,
-                            XFeatView(quality = m.meanReliability.coerceIn(0.0, 1.0)),
-                        )
+                    ml.track(id, predicted.x, predicted.y, view)?.let { m ->
+                        val candidateView = view.copy(quality = m.meanReliability.coerceIn(0.0, 1.0))
+                        val token = ml.stageTemplate(id, m.x, m.y, candidateView)
                         return DemoVisionMatch(
                             ImageMatch(
                                 V2(m.x, m.y),
                                 m.inliers,
-                                m.medianReprojectionPx,
-                                m.medianReprojectionPx,
+                                // These two legacy quality gates remain in the fixed XFeat model raster.
+                                // Geometric pixel uncertainty is separately carried by sigmaPx in source pixels.
+                                m.consensusPxAtModelScale,
+                                m.consensusPxAtModelScale,
                                 "XFEAT_LITERT",
                                 m.sigmaPx,
                             ),

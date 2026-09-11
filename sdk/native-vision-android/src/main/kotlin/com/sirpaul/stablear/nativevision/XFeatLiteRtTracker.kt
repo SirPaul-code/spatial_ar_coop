@@ -36,14 +36,17 @@ data class XFeatView(
 }
 
 data class XFeatImageMatch(
+    /** Source CPU-image coordinates used by ARCore/StableAR geometry. */
     val x: Double,
     val y: Double,
     val inliers: Int,
-    val medianReprojectionPx: Double,
+    /** XFeat patch-consensus residual in the fixed 640x480 model raster, not source-image pixels. */
+    val consensusPxAtModelScale: Double,
     val score: Double,
     val secondBestScore: Double,
     val scoreMargin: Double,
     val meanReliability: Double,
+    /** Conservative uncertainty mapped back to the source CPU-image raster. */
     val sigmaPx: Double,
     val templateSerial: Long,
     val method: NativeVisionMethod,
@@ -84,8 +87,6 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
     private var handle = NativeXFeat.create().also { check(it != 0L) }
     private var descriptors = FloatArray(0)
     private var reliability = FloatArray(0)
-    // Descriptor maps always live in the 640x480 model raster. Public coordinates stay in the
-    // exact source CPU-image raster used by ARCore/StableAR, so retain its dimensions per frame.
     private var sourceWidth = 0
     private var sourceHeight = 0
 
@@ -100,7 +101,6 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         return handle
     }
 
-    /** Runs XFeat for a grayscale frame and makes its descriptor map the current matcher frame. */
     fun beginFrame(frameId: Long, gray: ByteArray, width: Int, height: Int): Boolean {
         require(frameId > 0 && width > 1 && height > 1 && gray.size == width * height)
         h()
@@ -122,7 +122,6 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         return accepted
     }
 
-    /** Captures the immutable root signature from the most recently inferred source exposure. */
     fun addRoot(id: Long, x: Double, y: Double): Boolean {
         require(id > 0 && x.isFinite() && y.isFinite())
         requireCurrentMap()
@@ -130,7 +129,6 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         return NativeXFeat.addRoot(h(), id, descriptors, reliability, p.first, p.second)
     }
 
-    /** Direct admission for an already independently verified caller. Prefer stage/commit asynchronously. */
     fun addTemplate(id: Long, x: Double, y: Double, view: XFeatView = XFeatView()): Boolean {
         require(id > 0 && x.isFinite() && y.isFinite())
         requireCurrentMap()
@@ -142,10 +140,6 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         )
     }
 
-    /**
-     * Copies only a local descriptor patch from this exact inferred frame. It is not active until
-     * commitStagedTemplate is called after independent StableAR geometric/held-out acceptance.
-     */
     fun stageTemplate(id: Long, x: Double, y: Double, view: XFeatView = XFeatView()): Long {
         require(id > 0 && x.isFinite() && y.isFinite())
         requireCurrentMap()
@@ -167,7 +161,7 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         NativeXFeat.discardStagedTemplate(h(), id, token)
     }
 
-    /** Predicted and returned coordinates are both in the current source CPU-image raster. */
+    /** Predicted and returned point coordinates are both in the current source CPU-image raster. */
     fun track(id: Long, predictedX: Double, predictedY: Double, view: XFeatView = XFeatView()): XFeatImageMatch? {
         require(id > 0 && predictedX.isFinite() && predictedY.isFinite())
         requireCurrentMap()
@@ -179,12 +173,12 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         ) ?: return null
         if (v.size != 11 || v.any { !it.isFinite() }) return null
         val source = modelToSource(v[0], v[1])
-        // The model raster can be anisotropically resized. Use the larger axis scale for scalar
-        // residual/uncertainty so geometry never receives an artificially optimistic pixel sigma.
+        // Sigma participates in source-image reprojection geometry, so map it back conservatively.
+        // Patch consensus is only a matcher-quality metric and intentionally remains in 640x480 units.
         val errorScale = max(sourceWidth.toDouble() / INPUT_WIDTH, sourceHeight.toDouble() / INPUT_HEIGHT)
         return XFeatImageMatch(
             x = source.first, y = source.second, inliers = v[2].toInt(),
-            medianReprojectionPx = v[3] * errorScale,
+            consensusPxAtModelScale = v[3],
             score = v[4], secondBestScore = v[5], scoreMargin = v[6], meanReliability = v[7],
             sigmaPx = v[8] * errorScale, templateSerial = v[9].toLong(),
             method = NativeVisionMethod.entries.getOrElse(v[10].toInt()) { NativeVisionMethod.NONE },
@@ -207,17 +201,15 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         }
     }
 
-    private fun sourceToModel(x: Double, y: Double): Pair<Double, Double> =
-        Pair(
-            (x + 0.5) * INPUT_WIDTH / sourceWidth - 0.5,
-            (y + 0.5) * INPUT_HEIGHT / sourceHeight - 0.5,
-        )
+    private fun sourceToModel(x: Double, y: Double): Pair<Double, Double> = Pair(
+        (x + 0.5) * INPUT_WIDTH / sourceWidth - 0.5,
+        (y + 0.5) * INPUT_HEIGHT / sourceHeight - 0.5,
+    )
 
-    private fun modelToSource(x: Double, y: Double): Pair<Double, Double> =
-        Pair(
-            (x + 0.5) * sourceWidth / INPUT_WIDTH - 0.5,
-            (y + 0.5) * sourceHeight / INPUT_HEIGHT - 0.5,
-        )
+    private fun modelToSource(x: Double, y: Double): Pair<Double, Double> = Pair(
+        (x + 0.5) * sourceWidth / INPUT_WIDTH - 0.5,
+        (y + 0.5) * sourceHeight / INPUT_HEIGHT - 0.5,
+    )
 
     override fun close() {
         check(Thread.currentThread() === owner)
