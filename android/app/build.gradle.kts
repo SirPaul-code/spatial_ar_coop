@@ -36,8 +36,8 @@ android {
         applicationId = "com.sirpaul.spatialarcoop"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "1.2.1"
+        versionCode = 15
+        versionName = "1.3.0-stablear"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["arcoreApiKey"] = arcoreApiKey
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${defaultServerUrl.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
@@ -164,7 +164,12 @@ tasks.named("preBuild").configure {
 }
 
 dependencies {
-    implementation("com.google.ar:core:1.54.0")
+    implementation(project(":core"))
+    implementation(project(":arcore"))
+    implementation(project(":vision"))
+    implementation(project(":native-vision-android"))
+
+    implementation("com.google.ar:core:1.56.0")
     implementation("com.google.mediapipe:tasks-vision:0.10.35")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
@@ -177,7 +182,7 @@ dependencies {
     implementation("com.google.android.material:material:1.13.0")
 
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlin:kotlin-test:1.9.24")
+    testImplementation("org.jetbrains.kotlin:kotlin-test:2.3.20")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
 }
