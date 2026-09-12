@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fresh/no-map-runtime-poc
+      - integration/p2p-stablear
   pull_request:
 
 permissions:
@@ -27,8 +28,8 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Install Android SDK + StableAR native toolchain
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
 
       - run: chmod +x android/gradlew
 
@@ -38,6 +39,15 @@ jobs:
         run: |
           set -o pipefail
           ./gradlew --no-daemon testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease 2>&1 | tee ../android-build.log
+
+      - name: Verify StableAR payload in integrated APK
+        if: github.ref == 'refs/heads/integration/p2p-stablear'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          unzip -l "$APK" | grep -F 'assets/models/xfeat.tflite'
+          unzip -l "$APK" | grep -F 'lib/arm64-v8a/libstablear_vision_jni.so'
 
       - name: Verify stable APK signatures
         shell: bash
@@ -129,3 +139,32 @@ jobs:
             --latest \
             --title "Spatial Sync — latest signed build" \
             --notes-file RELEASE_NOTES.md
+
+      - name: Publish P2P StableAR integration prerelease
+        if: github.event_name == 'push' && github.ref == 'refs/heads/integration/p2p-stablear'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp android/app/build/outputs/apk/debug/app-debug.apk SpatialSync-P2P-StableAR-debug.apk
+          cp android/app/build/outputs/apk/release/app-release.apk SpatialSync-P2P-StableAR-release.apk
+          sha256sum SpatialSync-P2P-StableAR-debug.apk SpatialSync-P2P-StableAR-release.apk > P2P-STABLEAR-SHA256SUMS.txt
+          cat > P2P_STABLEAR_RELEASE_NOTES.md <<EOF
+          Direct phone-to-phone Spatial Sync build with the current StableAR SDK injected only into static material-target refinement.
+
+          Source: \`integration/p2p-stablear\` at \`$GITHUB_SHA\`.
+
+          - Based on the physically tuned P2P baseline \`a5970e9be7fef9434dbf2e681274dc56c9462fe4\`.
+          - Wi-Fi Aware/NDP/TCP transport, P2P shared-world alignment and vehicle tracking remain product-owned.
+          - Initial static POI placement still uses the proven ARCore plane/point/depth selection.
+          - StableAR receives that exact point/pixel as a depth prior and runs XFeat/LiteRT with LK/ORB fallback plus held-out geometric acceptance.
+          - Remote POIs use the existing fail-closed sender-frame bootstrap until a local StableAR material root can be armed.
+          - The original \`latest-dev\` release is intentionally not moved by this integration branch.
+          EOF
+          gh release delete p2p-stablear-latest --cleanup-tag -y || true
+          gh release create p2p-stablear-latest SpatialSync-P2P-StableAR-release.apk SpatialSync-P2P-StableAR-debug.apk P2P-STABLEAR-SHA256SUMS.txt apk-signature.txt \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Spatial Sync P2P + StableAR — latest" \
+            --notes-file P2P_STABLEAR_RELEASE_NOTES.md
