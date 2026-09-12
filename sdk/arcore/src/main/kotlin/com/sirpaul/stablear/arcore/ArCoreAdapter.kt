@@ -52,9 +52,29 @@ class ArCoreAdapter(private val session: Session,private val clock: ()->Long=Sys
     fun freeze(frameId: Long): FrameRef? { owner(); return history.freeze(frameId) }
     fun unfreeze(frameId: Long) { owner(); history.unfreeze(frameId) }
     fun place(sample: CameraSample,pixel: V2): Placement? {
+        owner(); val fit=SurfaceFitter.fit(sample.ref.intrinsics,pixel,sample.depth) ?: return null
+        return placeWithFit(sample,pixel,fit)
+    }
+    /**
+     * Seed StableAR from a host-owned metric depth/raycast instead of requiring StableAR's local
+     * depth surface fitter to succeed. The immutable material identity is still the exact root pixel;
+     * only the initial metric depth/uncertainty comes from the host. This is intended for integrations
+     * that already have a trusted ARCore hit, plane, custom depth estimator or domain-specific raycast.
+     *
+     * `conditionalSigmaM` is the host's declared uncertainty model. StableAR does not reinterpret an
+     * ARCore confidence byte as metres and does not claim this value is calibrated covariance.
+     */
+    fun placeWithDepthPrior(sample: CameraSample,pixel: V2,depthM: Double,conditionalSigmaM: Double,
+        evidence: Set<EvidenceId> = emptySet()): Placement? {
+        owner()
+        if(!sample.ref.intrinsics.contains(pixel) || depthM !in .15..8.0 ||
+            !conditionalSigmaM.isFinite() || conditionalSigmaM<=0.0) return null
+        val fit=SurfaceFit(depthM,conditionalSigmaM,0,0.0,evidence,listOf(0.0,0.0,1.0/depthM))
+        return placeWithFit(sample,pixel,fit)
+    }
+    private fun placeWithFit(sample: CameraSample,pixel: V2,fit: SurfaceFit): Placement? {
         owner(); if(attachments.size>=64) return null
         val cameraNow=history.currentWorldFromCamera(sample.ref) ?: return null
-        val fit=SurfaceFitter.fit(sample.ref.intrinsics,pixel,sample.depth) ?: return null
         val world=cameraNow.point(sample.ref.intrinsics.ray(pixel)*fit.depth)
         val anchor=try { session.createAnchor(Rigid(world).arPose()) } catch(_: Exception) { return null }
         try {
