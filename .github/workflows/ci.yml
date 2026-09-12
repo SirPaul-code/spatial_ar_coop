@@ -73,12 +73,27 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
       - name: StableAR benchmark scorer contract
         run: python3 -m unittest discover -s sdk/benchmark -p 'test_*.py'
+      - name: Seed exact pinned XFeat model from StableAR release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/model-seed
+          gh release download stablear-android-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'StableAR-Lab-latest.apk' \
+            --dir build/model-seed
+          unzip -p build/model-seed/StableAR-Lab-latest.apk assets/models/xfeat.tflite > build/model-seed/xfeat.tflite
+          test "$(stat -c%s build/model-seed/xfeat.tflite)" = 1414480
+          echo '6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df  build/model-seed/xfeat.tflite' | sha256sum -c -
       - name: Unit tests and debug APK
         working-directory: android
         env:
           ARCORE_API_KEY: UNCONFIGURED
           DEFAULT_SERVER_URL: http://10.0.2.2:8080
           DEFAULT_API_TOKEN: ''
+          STABLEAR_XFEAT_MODEL: ${{ github.workspace }}/build/model-seed/xfeat.tflite
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
