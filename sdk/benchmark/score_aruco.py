@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score StableAR and an unrefined ARCore baseline against an independent ArUco image target."""
+"""Score StableAR and an unrefined ARCore baseline against independent image ground truth."""
 
 from __future__ import annotations
 
@@ -9,14 +9,17 @@ import json
 import math
 import random
 import statistics
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 try:
     import cv2  # type: ignore
+    import numpy as np  # type: ignore
 except Exception:  # pragma: no cover - optional for pre-labelled datasets
     cv2 = None
+    np = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class Sample:
     stable_y: float | None
     fx: float | None = None
     fy: float | None = None
+    ground_truth_mode: str = "prelabelled"
 
 
 def _bool(value: str | None, default: bool = True) -> bool:
@@ -49,11 +53,15 @@ def _number(value: str | None) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _aruco_center(path: Path, dictionary_name: str, marker_id: int) -> tuple[float, float] | None:
-    if cv2 is None:
+def _require_opencv() -> None:
+    if cv2 is None or np is None:
         raise RuntimeError(
-            "OpenCV is required when gt_x/gt_y are absent. Install opencv-contrib-python."
+            "OpenCV is required when gt_x/gt_y are absent. Install numpy and opencv-contrib-python."
         )
+
+
+def _aruco_corners(path: Path, dictionary_name: str, marker_id: int):
+    _require_opencv()
     image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         return None
@@ -69,32 +77,82 @@ def _aruco_center(path: Path, dictionary_name: str, marker_id: int) -> tuple[flo
         corners, ids, _ = aruco.detectMarkers(image, dictionary)
     if ids is None:
         return None
-    flat_ids = [int(v) for v in ids.flatten()]
-    for index, value in enumerate(flat_ids):
-        if value != marker_id:
-            continue
-        points = corners[index].reshape(-1, 2)
-        return float(points[:, 0].mean()), float(points[:, 1].mean())
+    for index, value in enumerate(int(v) for v in ids.flatten()):
+        if value == marker_id:
+            return corners[index].reshape(4, 2).astype("float32")
     return None
+
+
+def _root_material_uv(session: Path, dictionary_name: str, marker_id: int):
+    """Map the exact tapped root pixel into the physical marker's planar coordinate frame."""
+    root_path = session / "root.json"
+    if not root_path.is_file():
+        return None
+    config = json.loads(root_path.read_text(encoding="utf-8"))
+    image_name = str(config.get("image_path", "")).strip()
+    x = _number(str(config.get("pixel_x", "")))
+    y = _number(str(config.get("pixel_y", "")))
+    if not image_name or x is None or y is None:
+        return None
+    corners = _aruco_corners(session / image_name, dictionary_name, marker_id)
+    if corners is None:
+        return None
+    unit = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype="float32")
+    transform = cv2.getPerspectiveTransform(corners, unit)
+    point = np.array([[[x, y]]], dtype="float32")
+    uv = cv2.perspectiveTransform(point, transform)[0, 0]
+    if not np.isfinite(uv).all():
+        return None
+    # A small margin tolerates tapping on the black border while rejecting an unrelated scene point.
+    if uv[0] < -0.20 or uv[0] > 1.20 or uv[1] < -0.20 or uv[1] > 1.20:
+        return None
+    return uv.astype("float32")
+
+
+def _marker_ground_truth(
+    path: Path,
+    dictionary_name: str,
+    marker_id: int,
+    root_uv,
+) -> tuple[float, float] | None:
+    corners = _aruco_corners(path, dictionary_name, marker_id)
+    if corners is None:
+        return None
+    if root_uv is None:
+        center = corners.mean(axis=0)
+        return float(center[0]), float(center[1])
+    unit = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype="float32")
+    transform = cv2.getPerspectiveTransform(unit, corners)
+    point = cv2.perspectiveTransform(np.array([[root_uv]], dtype="float32"), transform)[0, 0]
+    return float(point[0]), float(point[1])
 
 
 def load_samples(session: Path, dictionary_name: str, marker_id: int) -> list[Sample]:
     csv_path = session / "frames.csv"
     if not csv_path.is_file():
         raise FileNotFoundError(f"Missing {csv_path}")
+
+    # Preferred field ground truth: save the exact root camera exposure/pixel. Offline scoring
+    # expresses that clicked material point in the marker's planar coordinates, then reprojects the
+    # same physical point from independently detected marker corners in every later frame.
+    root_uv = _root_material_uv(session, dictionary_name, marker_id)
+    marker_mode = "aruco_root_homography" if root_uv is not None else "aruco_center"
+
     result: list[Sample] = []
     with csv_path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             gt_x = _number(row.get("gt_x"))
             gt_y = _number(row.get("gt_y"))
+            ground_truth_mode = "prelabelled"
             if gt_x is None or gt_y is None:
                 image_path = row.get("image_path", "").strip()
                 if not image_path:
                     continue
-                detected = _aruco_center(session / image_path, dictionary_name, marker_id)
+                detected = _marker_ground_truth(session / image_path, dictionary_name, marker_id, root_uv)
                 if detected is None:
                     continue
                 gt_x, gt_y = detected
+                ground_truth_mode = marker_mode
 
             stock_valid = _bool(row.get("stock_valid"), True)
             stable_valid = _bool(row.get("stable_valid"), True)
@@ -118,6 +176,7 @@ def load_samples(session: Path, dictionary_name: str, marker_id: int) -> list[Sa
                     stable_y=stable_y,
                     fx=_number(row.get("fx")),
                     fy=_number(row.get("fy")),
+                    ground_truth_mode=ground_truth_mode,
                 )
             )
     return result
@@ -192,6 +251,7 @@ def score(samples: Sequence[Sample], threshold_px: float = 12.0) -> dict:
     paired_count = len(paired_delta)
     return {
         "marker_visible_frames": len(samples),
+        "ground_truth_modes": dict(Counter(sample.ground_truth_mode for sample in samples)),
         "threshold_px": threshold_px,
         "stock_arcore": _candidate_metrics(stock_errors, len(samples), threshold_px),
         "stablear": _candidate_metrics(stable_errors, len(samples), threshold_px),
