@@ -32,6 +32,7 @@ internal class StableArBenchmarkRecorder(
 
     private val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "stablear-benchmark") }
     private val pending = AtomicInteger(0)
+    private val rootWritten = AtomicBoolean(false)
     private val directory: File? = if (enabled) {
         val root = context.getExternalFilesDir("stablear-benchmark") ?: context.filesDir
         File(root, "session-${System.currentTimeMillis()}").apply { mkdirs() }
@@ -48,6 +49,37 @@ internal class StableArBenchmarkRecorder(
             writer = BufferedWriter(OutputStreamWriter(FileOutputStream(csv), Charsets.UTF_8)).also {
                 it.write("timestamp_ns,phase,image_path,fx,fy,stock_x,stock_y,stock_valid,stable_x,stable_y,stable_valid,stable_method,stable_latency_ms,accepted_corrections,tracking_state\n")
                 it.flush()
+            }
+        }
+    }
+
+    /** Save the exact clicked exposure/pixel so offline ArUco scoring can follow that material point. */
+    fun recordRoot(gray: GrayImage, intrinsics: Intrinsics, pixel: V2) {
+        if (!enabled || closed || !rootWritten.compareAndSet(false, true)) return
+        pending.incrementAndGet()
+        worker.execute {
+            try {
+                val dir = directory ?: return@execute
+                val image = resizeGray(gray.bytes, gray.width, gray.height, OUT_WIDTH, OUT_HEIGHT)
+                FileOutputStream(File(dir, "root.pgm")).use { out ->
+                    out.write("P5\n$OUT_WIDTH $OUT_HEIGHT\n255\n".toByteArray(Charsets.US_ASCII))
+                    out.write(image)
+                }
+                val scaled = scalePoint(pixel, gray.width, gray.height)
+                val sx = OUT_WIDTH.toDouble() / gray.width
+                val sy = OUT_HEIGHT.toDouble() / gray.height
+                File(dir, "root.json").writeText(
+                    "{\n" +
+                        "  \"image_path\": \"root.pgm\",\n" +
+                        "  \"pixel_x\": ${fmt(scaled.x)},\n" +
+                        "  \"pixel_y\": ${fmt(scaled.y)},\n" +
+                        "  \"fx\": ${fmt(intrinsics.fx * sx)},\n" +
+                        "  \"fy\": ${fmt(intrinsics.fy * sy)}\n" +
+                        "}\n",
+                    Charsets.UTF_8
+                )
+            } finally {
+                pending.decrementAndGet()
             }
         }
     }

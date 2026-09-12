@@ -125,7 +125,10 @@ internal class StableArCoordinator(
         val id = placement.attachment.id
         states[id] = MarkerState(markerId, expiresAtMs, broadcast = true)
         markerToAttachment[markerId] = id
-        if (benchmarkAttachmentId == null) benchmarkAttachmentId = id
+        if (benchmarkAttachmentId == null) {
+            benchmarkAttachmentId = id
+            benchmark.recordRoot(gray, sample.ref.intrinsics, pixel)
+        }
         worker.execute {
             runCatching { backend().add(id, gray.timestampNs, gray.bytes, gray.width, gray.height, pixel) }
         }
