@@ -1,0 +1,7 @@
+<resources>
+    <string name="startup_status">StableAR Lab\nTap a textured surface. Move sideways to verify depth.\nNo server or second device required.</string>
+    <string name="camera_permission_needed">Camera permission is required. Enable it in Android app settings, then return.</string>
+    <string name="ar_unavailable">AR unavailable: %1$s: %2$s</string>
+    <string name="export_failed">Export failed: %1$s</string>
+    <string name="camera_accessibility">AR camera. Activate to place an annotation at the centre of the view.</string>
+</resources>

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(StableARPackageConsumer LANGUAGES CXX)
+find_package(StableAR 0.2 REQUIRED CONFIG)
+add_executable(stablear_package_consumer main.cpp)
+target_link_libraries(stablear_package_consumer PRIVATE StableAR::stablear)
+target_compile_features(stablear_package_consumer PRIVATE cxx_std_20)

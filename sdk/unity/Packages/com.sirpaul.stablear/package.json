@@ -1,0 +1,8 @@
+{
+  "name": "com.sirpaul.stablear",
+  "version": "0.2.0-preview.1",
+  "displayName": "StableAR",
+  "description": "Native StableAR material-attachment bindings for Unity/AR Foundation/OpenXR hosts.",
+  "unity": "2022.3",
+  "keywords": ["ar", "xr", "tracking", "openxr"]
+}
