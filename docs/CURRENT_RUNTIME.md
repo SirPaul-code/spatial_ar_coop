@@ -1,10 +1,37 @@
-# Current runtime continuation — 2026-09-09
+# Current runtime continuation — 2026-09-12
 
 This file is the authoritative short delta on top of `docs/AGENT_CONTEXT.md`.
 
+## Active integration continuation
+
+For the current StableAR product-integration work, the explicit working branch is `integration/p2p-stablear`. It is 14+ commits ahead of, and not behind, the protected direct-P2P product baseline `fresh/no-map-runtime-poc@a5970e9be7fef9434dbf2e681274dc56c9462fe4`.
+
+The integration preserves the physically tuned direct-phone product boundaries: `WifiAwarePeerTransport`, V6 peer framing, acquisition startup, `AlignmentCoordinator`, shared-world solvers and dynamic-vehicle ownership remain product-owned. StableAR is injected only into **static material POI refinement**.
+
+StableAR source provenance on this branch is exact: the complete `/sdk` subtree has Git tree SHA `4076558f24f8454a88791dc121ba3937424b0547`, the same tree as `stablear/multiplatform-sdk@59ec2cb952008c3c7b92843ee5088a466a967cc7` at the integration checkpoint. See `docs/STABLEAR_P2P_INTEGRATION.md` for the detailed flow and package gates.
+
+Current runtime integration fixes that must survive future edits:
+
+- product ARCore hit/depth selection remains the initial static-POI authority, avoiding the standalone SDK's stricter close-range `SurfaceFitter` as a placement prerequisite;
+- `StableArP2pBridge` seeds StableAR through `placeWithDepthPrior` using the exact CPU-image pixel and host-trusted z-depth;
+- XFeat/LiteRT is preferred, LK/ORB is fallback, and XFeat template candidates are committed only after StableAR geometric/held-out acceptance;
+- a depth-prior-only StableAR attachment is **not** authoritative until immutable visual root evidence is actually captured; `worldPoint()` stays fail-closed until then;
+- if product/legacy surface bootstrap obtains a newer trusted point before StableAR visual evidence arms, the dormant StableAR seed is replaced rather than preserving stale geometry;
+- remote POIs use the existing fail-closed visual/metric bootstrap until receiver-local StableAR root evidence is available;
+- cars remain dynamic P2P tracks and must never become StableAR attachments.
+
+Latest runtime checkpoint before this documentation update:
+
+- `1e25835f86fb8ed72ebfee5ebc8b7e453b3a837b` — `fix(p2p): keep dormant StableAR seeds fail-closed`.
+- `ec5cbfeba5ae306587cb643ed202f2854be9173a` — removed two Android `Range` lint blockers in `BirdEyeWorldView` without disabling lint or changing spatial architecture.
+
+Final release gate for this integration is the `spatial-sync-v3-ci` workflow on the **current integration branch HEAD**. It must pass unit tests, debug/release lint, debug/release assembly, StableAR XFeat/native payload checks, stable APK signature verification and `p2p-stablear-latest` prerelease publication. Do not call the integration release-ready from an older/cancelled run.
+
+Physical validation remains required after software/package CI: two-phone CREATE/JOIN/LOCKED regression check, local and remote static POI orbit/distance/occlusion tests, and confirmation that vehicle behavior is unchanged. CI is not a cm/mm accuracy claim.
+
 ## Branch and protected baseline
 
-Working branch: `fresh/no-map-runtime-poc`.
+Product baseline branch: `fresh/no-map-runtime-poc`.
 
 The physically useful baseline immediately before this iteration is:
 
@@ -56,7 +83,7 @@ The edge snap is specifically intended for the user's request to look at the act
 
 ## Important exact implementation boundaries
 
-Files intentionally changed by this vehicle/precision iteration:
+Files intentionally changed by the vehicle/precision baseline iteration:
 
 - `ArRenderer.kt`
 - `VehicleDetector.kt`
@@ -67,7 +94,7 @@ Files intentionally changed by this vehicle/precision iteration:
 - `VehicleTrackPolicyTest.kt` (new)
 - handoff docs
 
-Files intentionally **not** changed:
+Files intentionally **not** changed by the StableAR integration:
 
 - `AlignmentCoordinator.kt`
 - `WifiAwarePeerTransport.kt`
