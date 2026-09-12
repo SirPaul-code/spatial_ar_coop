@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { parseClientMessage, ProtocolError, validateClientIdentity, PROTOCOL_VERSION } from './protocol.mjs';
 
-const RETAINED_CAR_TTL_MS = 120_000;
+const CAR_VISIBILITY_GRACE_MS = 650;
 
 export class RealtimeHub {
   constructor({
@@ -15,12 +15,12 @@ export class RealtimeHub {
   }) {
     this.logger = logger;
     this.trackTtlMs = trackTtlMs;
-    this.retainedCarTtlMs = Math.max(trackTtlMs, RETAINED_CAR_TTL_MS);
     this.authorize = authorize;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.heartbeatTimeoutMs = Math.max(heartbeatTimeoutMs, heartbeatIntervalMs * 2);
     this.rooms = new Map();
     this.tracks = new Map();
+    this.trackEvidence = new Map();
     this.poses = new Map();
     this.statuses = new Map();
     this.wss = new WebSocketServer({ noServer: true, maxPayload });
@@ -41,10 +41,6 @@ export class RealtimeHub {
       rooms: this.rooms.size,
       clients: [...this.rooms.values()].reduce((sum, room) => sum + room.size, 0),
       tracks: [...this.tracks.values()].reduce((sum, tracks) => sum + tracks.size, 0),
-      retainedCars: [...this.tracks.values()].reduce(
-        (sum, tracks) => sum + [...tracks.values()].filter((track) => isRetainedCar(track)).length,
-        0
-      ),
       poses: this.poses.size
     };
   }
@@ -97,6 +93,7 @@ export class RealtimeHub {
     });
     this.rooms.clear();
     this.tracks.clear();
+    this.trackEvidence.clear();
     this.poses.clear();
     this.statuses.clear();
   }
@@ -164,6 +161,7 @@ export class RealtimeHub {
     switch (message.type) {
       case 'track_batch': {
         const roomTracks = this.tracks.get(identity.mapId) ?? new Map();
+        const evidence = this.trackEvidence.get(identity.mapId) ?? new Map();
         const receivedAt = Date.now();
         const normalized = message.tracks.map((track) => ({
           ...track,
@@ -176,22 +174,47 @@ export class RealtimeHub {
         if (message.replaceSource) {
           const incomingKeys = new Set(normalized.map((track) => track.key));
           for (const [key, track] of roomTracks) {
-            if (track.sourceId !== identity.clientId || incomingKeys.has(key)) continue;
-            // Cars are presentation/live-ops objects rather than one-frame detector overlays. Keep
-            // their last known shared-site state when the originating detector loses them, then
-            // expire them after a bounded memory window. Other classes keep realtime semantics.
-            if (isRetainedCar(track) && receivedAt - track.serverReceivedAtMs <= this.retainedCarTtlMs) continue;
-            roomTracks.delete(key);
-            expired.push(key);
+            if (track.sourceId === identity.clientId && !incomingKeys.has(key)) {
+              roomTracks.delete(key);
+              evidence.delete(key);
+              expired.push(key);
+            }
+          }
+          for (const [key, state] of evidence) {
+            if (state.sourceId === identity.clientId && !incomingKeys.has(key)) evidence.delete(key);
           }
         }
 
-        for (const track of normalized) roomTracks.set(track.key, track);
+        for (const track of normalized) {
+          if (track.label === 'car') {
+            const previous = evidence.get(track.key);
+            const hitCount = Math.max(0, Number(track.hitCount) || 0);
+            const evidenceAdvanced = !previous || hitCount > previous.hitCount;
+            const state = {
+              sourceId: identity.clientId,
+              hitCount: Math.max(hitCount, previous?.hitCount ?? 0),
+              lastEvidenceAtMs: evidenceAdvanced ? receivedAt : previous.lastEvidenceAtMs
+            };
+            evidence.set(track.key, state);
+
+            // Android deliberately keeps a short local motion hypothesis across missed detector
+            // frames. Do not mistake those repeated predictions for a live observation. A car is
+            // renderable only while at least one source is still advancing accepted evidence.
+            if (receivedAt - state.lastEvidenceAtMs > CAR_VISIBILITY_GRACE_MS) {
+              if (roomTracks.delete(track.key)) expired.push(track.key);
+              continue;
+            }
+          }
+          roomTracks.set(track.key, track);
+        }
+
         if (roomTracks.size) this.tracks.set(identity.mapId, roomTracks);
         else this.tracks.delete(identity.mapId);
+        if (evidence.size) this.trackEvidence.set(identity.mapId, evidence);
+        else this.trackEvidence.delete(identity.mapId);
 
         if (expired.length) {
-          this.#broadcast(identity.mapId, { type: 'tracks_expired', trackKeys: expired, serverTimeMs: receivedAt });
+          this.#broadcast(identity.mapId, { type: 'tracks_expired', trackKeys: [...new Set(expired)], serverTimeMs: receivedAt });
         }
         this.#broadcast(identity.mapId, {
           type: 'track_batch',
@@ -199,7 +222,7 @@ export class RealtimeHub {
           sequence: message.sequence,
           serverReceivedAtMs: receivedAt,
           replaceSource: message.replaceSource,
-          tracks: normalized
+          tracks: normalized.filter((track) => roomTracks.has(track.key))
         });
         // A successful websocket write on Android only means the frame entered OkHttp's send queue.
         // Explicitly acknowledge the batch after validation/storage so field diagnostics can
@@ -207,8 +230,8 @@ export class RealtimeHub {
         this.#send(socket, {
           type: 'track_ack',
           sequence: message.sequence,
-          accepted: normalized.length,
-          expired: expired.length,
+          accepted: normalized.filter((track) => roomTracks.has(track.key)).length,
+          expired: [...new Set(expired)].length,
           serverTimeMs: receivedAt
         });
         break;
@@ -239,10 +262,13 @@ export class RealtimeHub {
   #expireTracks() {
     const now = Date.now();
     for (const [mapId, roomTracks] of this.tracks) {
+      const evidence = this.trackEvidence.get(mapId);
       const expired = [];
       for (const [key, track] of roomTracks) {
-        const ttlMs = isRetainedCar(track) ? this.retainedCarTtlMs : this.trackTtlMs;
-        if (now - track.serverReceivedAtMs > ttlMs) {
+        const lastEvidenceAtMs = track.label === 'car' ? evidence?.get(key)?.lastEvidenceAtMs : null;
+        const staleCar = track.label === 'car' && lastEvidenceAtMs != null && now - lastEvidenceAtMs > CAR_VISIBILITY_GRACE_MS;
+        const staleTransport = now - track.serverReceivedAtMs > this.trackTtlMs;
+        if (staleCar || staleTransport) {
           roomTracks.delete(key);
           expired.push(key);
         }
@@ -281,6 +307,23 @@ export class RealtimeHub {
     const room = this.rooms.get(identity.mapId);
     room?.delete(socket);
     if (room?.size === 0) this.rooms.delete(identity.mapId);
+
+    const roomTracks = this.tracks.get(identity.mapId);
+    const evidence = this.trackEvidence.get(identity.mapId);
+    const expired = [];
+    for (const [key, track] of roomTracks ?? []) {
+      if (track.sourceId !== identity.clientId) continue;
+      roomTracks.delete(key);
+      evidence?.delete(key);
+      expired.push(key);
+    }
+    for (const [key, state] of evidence ?? []) {
+      if (state.sourceId === identity.clientId) evidence.delete(key);
+    }
+    if (roomTracks?.size === 0) this.tracks.delete(identity.mapId);
+    if (evidence?.size === 0) this.trackEvidence.delete(identity.mapId);
+    if (expired.length) this.#broadcast(identity.mapId, { type: 'tracks_expired', trackKeys: expired, serverTimeMs: Date.now() });
+
     this.poses.delete(`${identity.mapId}:${identity.clientId}`);
     this.statuses.delete(`${identity.mapId}:${identity.clientId}`);
     this.#broadcast(identity.mapId, { type: 'presence', action: 'left', ...identity });
@@ -299,8 +342,4 @@ export class RealtimeHub {
   }
 
   #error(socket, code, message) { this.#send(socket, { type: 'error', code, message }); }
-}
-
-function isRetainedCar(track) {
-  return String(track?.label ?? '').toLowerCase() === 'car';
 }
