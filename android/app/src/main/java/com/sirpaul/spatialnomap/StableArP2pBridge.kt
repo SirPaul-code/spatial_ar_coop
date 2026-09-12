@@ -125,14 +125,19 @@ class StableArP2pBridge(private val context: Context) {
         trackingWasGood = true
         drainResults()
 
-        if (productToAttachment.isEmpty() || busy.get() || frame.timestamp <= 0L ||
+        // A placed depth prior is not enough to run vision. Wait until the exact root exposure was
+        // actually captured by XFeat or the classical fallback; otherwise a failed async root add
+        // would burn camera/LiteRT work forever and could make a dormant attachment look authoritative.
+        if (visualRoots.isEmpty() || busy.get() || frame.timestamp <= 0L ||
             frame.timestamp == lastCameraTimestampNs
         ) return
 
         val sample = sdk.capture(frame) ?: return
         lastCameraTimestampNs = frame.timestamp
         val gray = sample.gray ?: return
-        val contexts = attachmentToProduct.keys.mapNotNull { sdk.context(it, sample, frame) }
+        val contexts = attachmentToProduct.keys
+            .filter { it in visualRoots }
+            .mapNotNull { sdk.context(it, sample, frame) }
         if (contexts.isEmpty() || !busy.compareAndSet(false, true)) return
 
         val hints = contexts.associate { context ->
@@ -198,10 +203,12 @@ class StableArP2pBridge(private val context: Context) {
     ): Boolean {
         owner()
         applyPendingReset()
-        if (productToAttachment.containsKey(productTargetId)) return true
         if (worldPoint.size < 3 || !worldPoint.take(3).all(Float::isFinite)) return false
         val sdk = adapter ?: return false
         if (frame.camera.trackingState != TrackingState.TRACKING || frame.timestamp <= 0L) return false
+
+        val existingAttachmentId = productToAttachment[productTargetId]
+        if (existingAttachmentId != null && existingAttachmentId in visualRoots) return true
 
         val sample = sdk.capture(frame) ?: return false
         lastCameraTimestampNs = frame.timestamp
@@ -217,6 +224,17 @@ class StableArP2pBridge(private val context: Context) {
             ?: sample.ref.intrinsics.project(cameraPoint)
             ?: return false
         if (!sample.ref.intrinsics.contains(pixel)) return false
+
+        // A dormant attachment means the async immutable-root capture failed or has not armed yet.
+        // When the host/legacy surface bootstrap has since produced a newer trusted point, replace the
+        // dormant seed instead of returning success and later letting an obsolete point become active.
+        if (existingAttachmentId != null) {
+            productToAttachment.remove(productTargetId)
+            attachmentToProduct.remove(existingAttachmentId)
+            visualRoots.remove(existingAttachmentId)
+            runCatching { sdk.remove(existingAttachmentId) }
+            queueWorker { backend().remove(existingAttachmentId) }
+        }
 
         // Conservative integration prior, not a claim that ARCore exposes calibrated covariance.
         val sigmaM = max(.015, min(.06, depthM * .015))
@@ -258,9 +276,14 @@ class StableArP2pBridge(private val context: Context) {
         return id in visualRoots
     }
 
+    /**
+     * A depth-prior-only attachment is deliberately not authoritative. Until immutable visual root
+     * evidence is armed, callers must keep rendering/using their existing product ARCore anchor.
+     */
     fun worldPoint(productTargetId: Long): FloatArray? {
         owner()
         val attachmentId = productToAttachment[productTargetId] ?: return null
+        if (attachmentId !in visualRoots) return null
         val p = adapter?.worldPoint(attachmentId) ?: return null
         return floatArrayOf(p.x.toFloat(), p.y.toFloat(), p.z.toFloat())
     }
