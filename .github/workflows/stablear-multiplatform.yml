@@ -145,6 +145,10 @@ jobs:
                   raise SystemExit(f'StableAR vision AAR must not package libc++_shared.so: {duplicate_stl}')
           print('PASS: pinned XFeat model payload and no duplicate StableAR shared STL')
           PY
+      - name: Fingerprint Android demo APK
+        run: |
+          test -f sdk/demo/build/outputs/apk/debug/demo-debug.apk
+          sha256sum sdk/demo/build/outputs/apk/debug/demo-debug.apk | tee stablear-demo-apk.sha256
       - name: Android diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -168,6 +172,16 @@ jobs:
             native-android-aar.txt
             native-vision-aar.txt
           retention-days: 14
+      - name: Publish installable StableAR demo APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stablear-demo-apk-${{ github.sha }}
+          path: |
+            sdk/demo/build/outputs/apk/debug/demo-debug.apk
+            stablear-demo-apk.sha256
+          if-no-files-found: error
+          retention-days: 14
 
   apple:
     needs: scope
@@ -185,10 +199,13 @@ jobs:
             sdk/apple/Sources/StableARApple/ARKitStableARAdapter.swift \
             sdk/apple/Sources/StableARApple/StableAREntitlement.swift
           test -d build/apple/StableARNative.xcframework
+          test -d build/apple/StableARXFeatNative.xcframework
       - uses: actions/upload-artifact@v4
         with:
           name: stablear-apple-preview-${{ github.sha }}
-          path: build/apple/StableARNative.xcframework
+          path: |
+            build/apple/StableARNative.xcframework
+            build/apple/StableARXFeatNative.xcframework
           retention-days: 14
 
   unity-abi:
