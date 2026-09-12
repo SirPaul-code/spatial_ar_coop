@@ -100,16 +100,16 @@ class ArRenderer(
     private val clearTargetsRequested = AtomicBoolean(false)
     private val trackingGate = TrackingStabilityGate(acquireMs = 300L, lossMs = 1000L)
     private val targetLock = Any()
+    private val stableAr = StableArP2pBridge(context)
 
     private val vehicleDetector = VehicleDetector(context)
     private val pendingVehicleDetections = AtomicReference<List<VehicleDetector.Vehicle>?>(null)
     private val pendingVehicleError = AtomicReference<String?>(null)
 
     /**
-     * Surface resolution is intentionally separate from ARCore. ARCore keeps the
-     * marker stable frame-to-frame; this verifier periodically proves that the
-     * anchor is still attached to the original texture + metric surface and repairs
-     * it if the local VIO world has drifted.
+     * Legacy surface bootstrap remains only as a fail-closed fallback and as the first local visual
+     * bootstrap for a remote POI. Once StableAR has immutable local root evidence for a target, this
+     * resolver no longer competes with it. Shared-world alignment never enters either path.
      */
     private val surfaceResolverExecutor = Executors.newSingleThreadExecutor()
     private val surfaceResolveBusy = AtomicBoolean(false)
@@ -176,6 +176,7 @@ class ArRenderer(
         sessionResumed = false
         session = null
         textureBoundSession = null
+        stableAr.invalidateAsync()
         pendingTap.set(null)
         remoteTargetRequests.clear()
         surfaceCorrections.clear()
@@ -194,6 +195,7 @@ class ArRenderer(
     fun close() {
         vehicleDetector.close()
         surfaceResolverExecutor.shutdownNow()
+        stableAr.closeWorkersAsync()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -219,6 +221,7 @@ class ArRenderer(
                 s.setCameraTextureName(background.textureId)
                 textureBoundSession = s
                 s.setDisplayGeometry(rotationProvider(), width, height)
+                stableAr.onSession(s)
             }
             if (!sessionResumed || session !== s) return
 
@@ -227,8 +230,12 @@ class ArRenderer(
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
-            if (clearTargetsRequested.getAndSet(false)) detachAnchorsAndTracks()
+            if (clearTargetsRequested.getAndSet(false)) {
+                stableAr.clearOnOwnerThread()
+                detachAnchorsAndTracks()
+            }
             applyRemoteTargetRequests(s, tracking)
+            stableAr.onFrame(frame)
 
             when (trackingGate.update(tracking, SystemClock.elapsedRealtime())) {
                 true -> status("AR tracking")
@@ -237,7 +244,8 @@ class ArRenderer(
             }
             if (!tracking) return
 
-            applySurfaceCorrections(s)
+            applyStableArRefinements()
+            applySurfaceCorrections(s, frame)
             handleTap(s, frame, camera)
             captureIfDue(frame, camera)
             maybeDetectVehicles(s, frame, camera)
@@ -324,6 +332,9 @@ class ArRenderer(
         }
         val owner = usernameProvider()
         val point = newAnchor.pose.translation
+        val stableSeeded = runCatching {
+            stableAr.seedFromWorldPoint(frame, id, point, imagePixel)
+        }.getOrDefault(false)
 
         val referenceFrame = FrameCapture.capture(
             frame = frame,
@@ -339,20 +350,28 @@ class ArRenderer(
                 dims.getOrElse(1) { captured.intrinsics.height }.coerceAtLeast(1)
             SurfaceTargetReference(captured, floatArrayOf(imagePixel[0] * sx, imagePixel[1] * sy))
         }
+        val pointToSend = stableAr.worldPoint(id) ?: point
 
         val sent = if (surfaceReference != null) {
             lastCaptureNs = System.nanoTime()
-            coordinator.sendSurfacePoi(id, point, owner, surfaceReference.frame)
+            coordinator.sendSurfacePoi(id, pointToSend, owner, surfaceReference.frame)
         } else {
-            coordinator.sendPoi(id, point, owner)
+            coordinator.sendPoi(id, pointToSend, owner)
         }
 
         if (sent) {
             synchronized(targetLock) {
                 localTargets[id] = LocalTarget(newAnchor, owner, surfaceReference)
             }
-            status(if (surfaceReference != null) "POI sent • surface lock armed" else "POI sent")
+            status(
+                when {
+                    stableSeeded -> "POI sent • StableAR/XFeat material lock armed"
+                    surfaceReference != null -> "POI sent • surface lock armed"
+                    else -> "POI sent"
+                },
+            )
         } else {
+            if (stableSeeded) stableAr.remove(id)
             runCatching { newAnchor.detach() }
             status("Target blocked: spatial alignment is not ready")
         }
@@ -370,6 +389,7 @@ class ArRenderer(
 
             if (request.point == null) {
                 val removed = synchronized(targetLock) { remoteTargets.remove(request.id) }
+                stableAr.remove(request.id)
                 SurfaceTargetRegistry.remove(request.id)
                 runCatching { removed?.anchor?.detach() }
                 continue
@@ -520,12 +540,14 @@ class ArRenderer(
         val jobs = ArrayList<SurfaceResolveJob>()
         synchronized(targetLock) {
             localTargets.forEach { (id, target) ->
+                if (stableAr.visualTrackingActive(id)) return@forEach
                 val ref = target.surface ?: return@forEach
                 if (target.anchor.trackingState == TrackingState.TRACKING) {
                     jobs += SurfaceResolveJob(id, true, ref, target.anchor.pose.translation.copyOf())
                 }
             }
             remoteTargets.forEach { (id, target) ->
+                if (stableAr.visualTrackingActive(id)) return@forEach
                 val ref = target.surface ?: return@forEach
                 if (target.anchor.trackingState == TrackingState.TRACKING) {
                     jobs += SurfaceResolveJob(id, false, ref, target.anchor.pose.translation.copyOf())
@@ -559,15 +581,16 @@ class ArRenderer(
         }
     }
 
-    private fun applySurfaceCorrections(session: Session) {
+    private fun applySurfaceCorrections(session: Session, frame: Frame) {
         while (true) {
             val correction = surfaceCorrections.poll() ?: break
-            if (correction.local) applyLocalSurfaceCorrection(session, correction)
-            else applyRemoteSurfaceCorrection(session, correction)
+            if (correction.local) applyLocalSurfaceCorrection(session, frame, correction)
+            else applyRemoteSurfaceCorrection(session, frame, correction)
         }
     }
 
-    private fun applyLocalSurfaceCorrection(session: Session, correction: SurfaceCorrection) {
+    private fun applyLocalSurfaceCorrection(session: Session, frame: Frame, correction: SurfaceCorrection) {
+        if (stableAr.visualTrackingActive(correction.id)) return
         val target = synchronized(targetLock) { localTargets[correction.id] } ?: return
         val oldPoint = target.anchor.pose.translation
         val coarse = correction.result
@@ -582,6 +605,7 @@ class ArRenderer(
             target.surfaceVerified = true
             target.pendingCorrection = null
             target.correctionVotes = 0
+            runCatching { stableAr.seedFromWorldPoint(frame, correction.id, result.pointWorld) }
             return
         }
         if (!voteForCorrection(target, result.pointWorld, result.confidence, result.visualInliers, delta)) return
@@ -595,6 +619,7 @@ class ArRenderer(
         val refreshed = SurfaceTargetReference(correction.currentFrame, result.matchedPixel.copyOf())
         target.surface = refreshed
         runCatching { old.detach() }
+        runCatching { stableAr.seedFromWorldPoint(frame, correction.id, result.pointWorld) }
 
         val now = System.currentTimeMillis()
         if (delta >= SURFACE_RESHARE_MIN_M && now - target.lastSurfaceShareMs >= SURFACE_RESHARE_INTERVAL_MS) {
@@ -603,7 +628,8 @@ class ArRenderer(
         }
     }
 
-    private fun applyRemoteSurfaceCorrection(session: Session, correction: SurfaceCorrection) {
+    private fun applyRemoteSurfaceCorrection(session: Session, frame: Frame, correction: SurfaceCorrection) {
+        if (stableAr.visualTrackingActive(correction.id)) return
         val target = synchronized(targetLock) { remoteTargets[correction.id] } ?: return
         val oldPoint = target.anchor.pose.translation
         val coarse = correction.result
@@ -618,6 +644,7 @@ class ArRenderer(
             target.surfaceVerified = true
             target.pendingCorrection = null
             target.correctionVotes = 0
+            runCatching { stableAr.seedFromWorldPoint(frame, correction.id, result.pointWorld) }
             return
         }
         if (!voteForCorrection(target, result.pointWorld, result.confidence, result.visualInliers, delta)) return
@@ -630,6 +657,34 @@ class ArRenderer(
         target.correctionVotes = 0
         target.surface = SurfaceTargetReference(correction.currentFrame, result.matchedPixel.copyOf())
         runCatching { old.detach() }
+        runCatching { stableAr.seedFromWorldPoint(frame, correction.id, result.pointWorld) }
+    }
+
+    private fun applyStableArRefinements() {
+        val now = System.currentTimeMillis()
+        for (refinement in stableAr.drainRefinements()) {
+            val local = synchronized(targetLock) { localTargets[refinement.productTargetId] }
+            if (local != null) {
+                local.surfaceVerified = true
+                if (now - local.lastSurfaceShareMs < SURFACE_RESHARE_INTERVAL_MS) continue
+                val delta = pointDistance(local.anchor.pose.translation, refinement.worldPoint)
+                if (!delta.isFinite() || delta < SURFACE_RESHARE_MIN_M) continue
+                local.lastSurfaceShareMs = now
+                val sent = local.surface?.let { reference ->
+                    coordinator.sendSurfacePoi(
+                        refinement.productTargetId,
+                        refinement.worldPoint,
+                        local.owner,
+                        reference.frame,
+                    )
+                } ?: coordinator.sendPoi(refinement.productTargetId, refinement.worldPoint, local.owner)
+                if (sent) status("POI refined • StableAR material lock")
+            } else {
+                synchronized(targetLock) {
+                    remoteTargets[refinement.productTargetId]?.surfaceVerified = true
+                }
+            }
+        }
     }
 
     private fun voteForCorrection(
@@ -826,17 +881,33 @@ class ArRenderer(
             localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size,
         )
         for ((id, target) in localSnapshot) {
-            projectAnchor(
-                camera, target.anchor, id, "YOU • ${shortTargetId(id)}",
-                coordinator.quality().confidence, true, view, projection,
-            )?.let { projected += it }
+            val stablePoint = stableAr.worldPoint(id)
+            if (stablePoint != null) {
+                projectPoint(
+                    camera, stablePoint, id, "YOU • ${shortTargetId(id)}",
+                    coordinator.quality().confidence, true, view, projection, null,
+                )?.let { projected += it }
+            } else {
+                projectAnchor(
+                    camera, target.anchor, id, "YOU • ${shortTargetId(id)}",
+                    coordinator.quality().confidence, true, view, projection,
+                )?.let { projected += it }
+            }
         }
         for ((id, target) in remoteSnapshot) {
             val owner = target.owner.ifBlank { "PEER" }
-            projectAnchor(
-                camera, target.anchor, id, "$owner • ${shortTargetId(id)}",
-                target.confidence, false, view, projection,
-            )?.let { projected += it }
+            val stablePoint = stableAr.worldPoint(id)
+            if (stablePoint != null) {
+                projectPoint(
+                    camera, stablePoint, id, "$owner • ${shortTargetId(id)}",
+                    target.confidence, false, view, projection, null,
+                )?.let { projected += it }
+            } else {
+                projectAnchor(
+                    camera, target.anchor, id, "$owner • ${shortTargetId(id)}",
+                    target.confidence, false, view, projection,
+                )?.let { projected += it }
+            }
         }
         for ((id, target) in localVehicleSnapshot) {
             projectDynamicTarget(camera, target, id, "${target.label} • YOU", true, now, view, projection)
