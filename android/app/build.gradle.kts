@@ -70,9 +70,11 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            buildConfigField("boolean", "STABLEAR_BENCHMARK_DEFAULT", "true")
         }
         release {
             isMinifyEnabled = false
+            buildConfigField("boolean", "STABLEAR_BENCHMARK_DEFAULT", "false")
             signingConfig = signingConfigs.findByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
