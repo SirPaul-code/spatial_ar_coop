@@ -39,6 +39,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopencv-dev libopenxr-dev pkg-config
           python3 -m pip install -r sdk/licensing/requirements.txt
+      - name: Independent benchmark scorer contract
+        run: python3 -m unittest discover -s sdk/benchmark -p 'test_*.py'
       - name: Native static contract
         run: |
           cmake -S sdk/native -B build/native-static -DSTABLEAR_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
