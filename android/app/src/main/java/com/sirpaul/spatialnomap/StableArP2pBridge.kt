@@ -55,6 +55,7 @@ class StableArP2pBridge(private val context: Context) {
     private var adapter: ArCoreAdapter? = null
     private val productToAttachment = LinkedHashMap<Long, Long>()
     private val attachmentToProduct = LinkedHashMap<Long, Long>()
+    private val activeAttachments = ConcurrentHashMap.newKeySet<Long>()
     private val visualRoots = ConcurrentHashMap.newKeySet<Long>()
 
     private val worker = Executors.newSingleThreadExecutor { task ->
@@ -87,6 +88,7 @@ class StableArP2pBridge(private val context: Context) {
         lifecycle.incrementAndGet()
         results.clear()
         refinements.clear()
+        activeAttachments.clear()
         visualRoots.clear()
         productToAttachment.clear()
         attachmentToProduct.clear()
@@ -231,6 +233,7 @@ class StableArP2pBridge(private val context: Context) {
         if (existingAttachmentId != null) {
             productToAttachment.remove(productTargetId)
             attachmentToProduct.remove(existingAttachmentId)
+            activeAttachments.remove(existingAttachmentId)
             visualRoots.remove(existingAttachmentId)
             runCatching { sdk.remove(existingAttachmentId) }
             queueWorker { backend().remove(existingAttachmentId) }
@@ -242,6 +245,7 @@ class StableArP2pBridge(private val context: Context) {
         val attachmentId = placed.attachment.id
         productToAttachment[productTargetId] = attachmentId
         attachmentToProduct[attachmentId] = productTargetId
+        activeAttachments += attachmentId
 
         val gray = sample.gray
         if (gray != null) {
@@ -258,7 +262,9 @@ class StableArP2pBridge(private val context: Context) {
                         pixel,
                     )
                 }.getOrDefault(false)
-                if (added && generation == lifecycle.get()) visualRoots += attachmentId
+                if (added && generation == lifecycle.get() && attachmentId in activeAttachments) {
+                    visualRoots += attachmentId
+                }
             }
         }
         return true
@@ -292,6 +298,7 @@ class StableArP2pBridge(private val context: Context) {
         owner()
         val attachmentId = productToAttachment.remove(productTargetId) ?: return
         attachmentToProduct.remove(attachmentId)
+        activeAttachments.remove(attachmentId)
         visualRoots.remove(attachmentId)
         runCatching { adapter?.remove(attachmentId) }
         queueWorker { backend().remove(attachmentId) }
@@ -303,6 +310,7 @@ class StableArP2pBridge(private val context: Context) {
         ids.forEach { runCatching { adapter?.remove(it) } }
         productToAttachment.clear()
         attachmentToProduct.clear()
+        activeAttachments.clear()
         visualRoots.clear()
         results.clear()
         refinements.clear()
@@ -321,6 +329,8 @@ class StableArP2pBridge(private val context: Context) {
 
     fun closeWorkersAsync() {
         lifecycle.incrementAndGet()
+        activeAttachments.clear()
+        visualRoots.clear()
         results.clear()
         refinements.clear()
         queueWorker {
@@ -337,6 +347,7 @@ class StableArP2pBridge(private val context: Context) {
         runCatching { adapter?.reset() }
         productToAttachment.clear()
         attachmentToProduct.clear()
+        activeAttachments.clear()
         visualRoots.clear()
         results.clear()
         refinements.clear()
