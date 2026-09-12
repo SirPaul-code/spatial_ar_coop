@@ -33,9 +33,9 @@ Production distribution should come from `sdk/tools/export_multiplatform_sdk.py`
 
 `sdk/licensing` implements the intended entitlement pattern:
 
-1. the vendor keeps the Ed25519 issuer/private signing key outside customer artifacts;
+1. the vendor keeps the **ECDSA P-256 private issuer key** outside customer artifacts;
 2. customer/runtime artifacts contain only public verification material;
-3. signed detached entitlements carry product/customer/expiry/features as appropriate;
+3. `STABLEAR1` tokens sign canonical claims with ECDSA-P256/SHA-256 and bind product/customer/application/platform/features/time window;
 4. key rotation is explicit and versioned;
 5. runtime validation can be offline without a network call on every frame.
 
@@ -60,7 +60,7 @@ A commercial binary release must not be marked cleared until all of the followin
 - code signing/reproducible artifact checks completed;
 - entitlement issuer private key held only in KMS/HSM or an isolated issuer service;
 - release artifacts built from CI, hashed and linked to their source commit;
-- `commercialReleaseCleared` changed only by an explicit release approval process.
+- any `commercialReleaseCleared`-style release flag changed only by an explicit owner release approval process.
 
 ## Comparative performance evidence
 
@@ -81,16 +81,21 @@ Do not advertise numerical superiority from:
 
 Ground truth is independent from StableAR. The preferred field mode records the exact tapped root exposure/pixel, detects the four corners of a printed ArUco marker offline, maps the tap into marker-plane coordinates by homography, then reprojects that same physical material point from independently detected marker corners in every later frame. XFeat/LK/ORB output is never used as truth.
 
+`score_aruco.py` scores one physical run. `aggregate_runs.py` is the commercial evidence gate: it treats an **independently captured run as the statistical unit** and cluster-bootstraps run-level paired improvement. It deliberately does not treat adjacent video frames as independent evidence.
+
 A comparative claim such as "lower p95 attachment error than stock ARCore" is publishable only for the tested scenario/device class when retained physical data shows:
 
 - independent `aruco_root_homography` ground truth or stronger external calibrated tracking;
-- enough paired visible frames and independent runs for p95 to be meaningful;
-- StableAR p95 screen-space material-point error lower than stock ARCore;
-- bootstrap 95% CI for mean paired improvement entirely above zero;
-- false-lock rate within the product threshold;
+- enough paired visible frames **and enough independent runs** for the published scope;
+- StableAR pooled p95 screen-space material-point error lower than stock ARCore;
+- 95% run-cluster bootstrap CI for mean paired improvement entirely above zero;
+- a high fraction of independent runs with positive paired improvement;
+- false-lock rate within the configured product threshold and not materially worse than Stock ARCore;
 - availability reported rather than hiding lost predictions;
 - latency/thermal conditions reported alongside accuracy;
 - raw sessions retained for reproduction.
+
+The default `aggregate_runs.py` engineering gate requires five eligible independent runs, 500 total paired frames, 30 paired frames per eligible run, at least 90% StableAR availability, at most a two-percentage-point availability drop versus Stock ARCore, at most 2% false-lock rate, at least 80% positive runs, lower StableAR pooled p95, and a positive lower 95% cluster-CI bound. These defaults are protocol parameters, not universal scientific constants; any published benchmark must record the exact gate configuration.
 
 A first claim should be deliberately narrow, for example:
 
