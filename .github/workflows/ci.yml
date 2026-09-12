@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - 'android/**'
+      - 'sdk/**'
       - 'server/**'
       - 'scripts/**'
       - 'docker-compose.yml'
@@ -12,6 +13,7 @@ on:
   pull_request:
     paths:
       - 'android/**'
+      - 'sdk/**'
       - 'server/**'
       - 'scripts/**'
       - 'docker-compose.yml'
@@ -53,9 +55,9 @@ jobs:
         run: docker build -t spatial-ar-coop-server:ci ./server
 
   android:
-    name: Android tests + debug APK
+    name: Android + StableAR integration + debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
@@ -66,9 +68,11 @@ jobs:
       - uses: android-actions/setup-android@v4
         with:
           cmdline-tools-version: 11076708
-      - name: Install Android SDK packages
-        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Install Android/StableAR native toolchain
+        run: sdkmanager 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - uses: gradle/actions/setup-gradle@v6
+      - name: StableAR benchmark scorer contract
+        run: python3 -m unittest discover -s sdk/benchmark -p 'test_*.py'
       - name: Unit tests and debug APK
         working-directory: android
         env:
@@ -78,14 +82,26 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
+      - name: Inspect integrated APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find android/app/build/outputs/apk/debug -name '*.apk' -print -quit)"
+          test -n "$APK"
+          unzip -l "$APK" | tee integrated-apk.txt
+          grep -q 'models/xfeat.tflite' integrated-apk.txt
+          grep -q 'libstablear_vision_jni.so' integrated-apk.txt
+          sha256sum "$APK" | tee SPATIAL-STABLEAR-SHA256SUMS.txt
       - name: Upload debug APK and reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: spatial-ar-coop-debug-${{ github.sha }}
+          name: spatial-stablear-debug-${{ github.sha }}
           if-no-files-found: warn
           retention-days: 30
           path: |
             android/app/build/outputs/apk/debug/*.apk
             android/app/build/reports/**
             android/app/build/test-results/**
+            integrated-apk.txt
+            SPATIAL-STABLEAR-SHA256SUMS.txt
