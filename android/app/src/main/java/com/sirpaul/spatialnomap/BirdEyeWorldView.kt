@@ -281,7 +281,7 @@ class BirdEyeWorldView(context: Context) : View(context) {
             canvas.drawCircle(s.x, s.y, if (target.dynamic) 18f else 14f, Paint(paint).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = 2f
-                alpha = 120
+                color = (paint.color and 0x00ffffff) or (120 shl 24)
             })
             canvas.drawText(target.label, s.x + 14f, s.y - 12f, labelPaint)
         }
@@ -303,7 +303,7 @@ class BirdEyeWorldView(context: Context) : View(context) {
             canvas.drawCircle(s.x, s.y, 26f, Paint(paint).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = 2.5f
-                alpha = 130
+                color = (paint.color and 0x00ffffff) or (130 shl 24)
             })
             canvas.drawText(if (actor.local) "YOU" else actor.label, s.x + 32f, s.y + 7f, labelPaint)
         }
