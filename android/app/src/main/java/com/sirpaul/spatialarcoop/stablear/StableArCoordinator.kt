@@ -169,7 +169,8 @@ internal class StableArCoordinator(
     }
 
     private fun seedVisibleRemoteMarkers(frame: Frame, sample: CameraSample, worldFromSite: FloatArray) {
-        if (sample.gray == null || pendingRemote.isEmpty()) return
+        val gray = sample.gray ?: return
+        if (pendingRemote.isEmpty()) return
         val now = System.currentTimeMillis()
         val iterator = pendingRemote.iterator()
         while (iterator.hasNext()) {
@@ -201,7 +202,6 @@ internal class StableArCoordinator(
             val id = placement.attachment.id
             states[id] = MarkerState(seed.markerId, seed.expiresAtMs, broadcast = false)
             markerToAttachment[seed.markerId] = id
-            val gray = sample.gray
             worker.execute {
                 runCatching { backend().add(id, gray.timestampNs, gray.bytes, gray.width, gray.height, pixel) }
             }
