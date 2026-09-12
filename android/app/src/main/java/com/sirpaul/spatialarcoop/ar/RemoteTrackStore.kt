@@ -57,21 +57,12 @@ class RemoteTrackStore {
      * Returns a render-time snapshot with bounded motion extrapolation. The extrapolation horizon is
      * deliberately longer than the network publish cadence so a moving object does not visually
      * stop between packets, but an easing term prevents a stale high velocity from running away.
-     *
-     * Cars are retained as last-known shared objects for the presentation/live-ops view. Their
-     * motion prediction still stops after MAX_EXTRAPOLATION_MS; only the last-known spatial track is
-     * kept longer. Other classes keep the short realtime timeout.
      */
     fun snapshot(nowMs: Long = System.currentTimeMillis()): List<SpatialTrack> {
         tracks.entries.removeIf { (key, value) ->
             val markerExpiry = markerExpirations[key]
-            val timeoutMs = if (value.label.equals("car", ignoreCase = true)) {
-                REMOTE_CAR_MEMORY_MS
-            } else {
-                REMOTE_TIMEOUT_MS
-            }
             val expired = markerExpiry?.let { nowMs >= it }
-                ?: (nowMs - value.serverReceivedAtMs > timeoutMs)
+                ?: (nowMs - value.serverReceivedAtMs > REMOTE_TIMEOUT_MS)
             if (expired) markerExpirations.remove(key)
             expired
         }
@@ -96,7 +87,6 @@ class RemoteTrackStore {
 
     companion object {
         private const val REMOTE_TIMEOUT_MS = 4_000L
-        private const val REMOTE_CAR_MEMORY_MS = 120_000L
         private const val MAX_EXTRAPOLATION_MS = 450L
         private const val STATIONARY_SPEED_METERS_PER_SECOND = 0.20f
     }
