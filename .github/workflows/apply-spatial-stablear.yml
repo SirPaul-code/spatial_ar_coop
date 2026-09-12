@@ -7,6 +7,7 @@ on:
       - 'scripts/apply_spatial_stablear_integration.py'
       - 'scripts/patch_stablear_coordinator.py'
       - 'scripts/patch_stablear_benchmark_root.py'
+      - 'scripts/patch_stablear_debug_benchmark.py'
       - '.github/workflows/apply-spatial-stablear.yml'
   workflow_dispatch:
 
@@ -34,6 +35,7 @@ jobs:
           fi
           python3 scripts/patch_stablear_coordinator.py
           python3 scripts/patch_stablear_benchmark_root.py
+          python3 scripts/patch_stablear_debug_benchmark.py
       - name: Commit generated product wiring
         shell: bash
         run: |
