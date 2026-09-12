@@ -26,8 +26,12 @@ jobs:
           ref: integration/spatial-stablear
           fetch-depth: 0
       - name: Apply reviewable integration recipes
+        shell: bash
         run: |
-          python3 scripts/apply_spatial_stablear_integration.py
+          set -euo pipefail
+          if ! grep -q 'val stableCoordinator = ensureStableAr' android/app/src/main/java/com/sirpaul/spatialarcoop/ArActivity.kt; then
+            python3 scripts/apply_spatial_stablear_integration.py
+          fi
           python3 scripts/patch_stablear_coordinator.py
           python3 scripts/patch_stablear_benchmark_root.py
       - name: Commit generated product wiring
