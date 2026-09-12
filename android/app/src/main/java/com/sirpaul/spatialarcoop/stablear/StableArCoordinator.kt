@@ -371,6 +371,9 @@ internal class StableArCoordinator(
         pendingRemote.entries.removeAll { it.value.expiresAtMs <= now }
     }
 
+    /** Clear pending geometric transactions when host ARCore tracking pauses. GL owner thread only. */
+    fun trackingLost() { adapter.trackingLost() }
+
     fun status(): StableArRuntimeStatus = StableArRuntimeStatus(
         attachments = states.size,
         learnedBackendActive = learnedActive,

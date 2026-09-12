@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -55,6 +56,9 @@ import com.sirpaul.spatialarcoop.net.RealtimeClient
 import com.sirpaul.spatialarcoop.net.RealtimeListener
 import com.sirpaul.spatialarcoop.net.RemoteClientPose
 import com.sirpaul.spatialarcoop.net.UploadScheduler
+import com.sirpaul.spatialarcoop.stablear.StableArCoordinator
+import com.sirpaul.spatialarcoop.stablear.StableArRefinedMarker
+import com.sirpaul.spatialarcoop.stablear.StableArTapPlacement
 import com.sirpaul.spatialarcoop.ui.FieldTheme
 import com.sirpaul.spatialarcoop.ui.OffscreenIndicatorMath
 import com.sirpaul.spatialarcoop.ui.ProjectedBox
@@ -79,6 +83,7 @@ import com.sirpaul.spatialarcoop.vision.SpatialObservation
 import com.sirpaul.spatialarcoop.vision.YuvFrame
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -87,6 +92,7 @@ import javax.microedition.khronos.opengles.GL10
 
 class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener {
     private data class PendingDetection(val detections: List<Detection2D>, val inferenceMs: Long)
+    private data class PendingStableMarker(val id: String, val label: String, val position: FloatArray, val expiresAtMs: Long)
     private enum class ArSessionProfile { STANDARD, COMPATIBILITY }
 
     private lateinit var mapId: String
@@ -162,6 +168,13 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private var realtime: RealtimeClient? = null
     private var cloudAnchors: CloudAnchorCoordinator? = null
     private var pointRecorder: PointCloudRecorder? = null
+    @Volatile private var stableAr: StableArCoordinator? = null
+    private val pendingStableMarkers = ConcurrentLinkedQueue<PendingStableMarker>()
+    private val stableArBroadcastAt = linkedMapOf<String, Long>()
+    private val stableArTapArmed = AtomicBoolean(false)
+    private val pendingStableArTap = AtomicReference<FloatArray?>(null)
+    private val stableArBenchmarkEnabled by lazy { intent.getBooleanExtra(EXTRA_STABLEAR_BENCHMARK, false) }
+    private val stableArBenchmarkPhase by lazy { intent.getStringExtra(EXTRA_STABLEAR_BENCHMARK_PHASE) ?: "field" }
 
     private val requestHost = AtomicBoolean(false)
     private val requestRetryAnchor = AtomicBoolean(false)
@@ -254,6 +267,21 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         }
         root.addView(glSurface, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         overlay = SpatialOverlayView(this)
+        overlay.setOnTouchListener { _, event ->
+            if (!stableArTapArmed.get()) return@setOnTouchListener false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> true
+                MotionEvent.ACTION_UP -> {
+                    pendingStableArTap.set(floatArrayOf(event.x, event.y))
+                    stableArTapArmed.set(false)
+                    requestMarker.set(true)
+                    showDetail("StableAR target selected · resolving metric surface…")
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> { stableArTapArmed.set(false); true }
+                else -> true
+            }
+        }
         root.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         val top = LinearLayout(this).apply {
@@ -517,6 +545,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             )
         )
         runOnUiThread {
+            releaseStableArOnGlThread()
             pauseGlIfNeeded()
             failedCoordinator?.close()
             runCatching { failedSession?.pause() }
@@ -612,6 +641,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         activityResumed = false
         if (!closing.get()) {
             arState.beginPause()
+            releaseStableArOnGlThread()
             pauseGlIfNeeded()
             displayRotation.onPause()
             pointRecorder?.flush()
@@ -635,6 +665,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         arState.beginClosing()
         retryArButton?.isEnabled = false
         spatialApp.logger.info("AR teardown begin", mapOf("mapId" to mapId, "mode" to mode.name))
+        releaseStableArOnGlThread()
         pauseGlIfNeeded()
         runCatching { displayRotation.onPause() }
         pointRecorder?.flush()
@@ -709,9 +740,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         camera.getProjectionMatrix(projectionMatrix, 0, 0.05f, 150f)
         viewProjectionMatrix = PoseMath.multiply(projectionMatrix, viewMatrix)
         if (camera.trackingState != TrackingState.TRACKING) {
+            stableAr?.trackingLost()
             updateHud(frame, null, "Tracking ${camera.trackingState}: ${camera.trackingFailureReason}")
             return
         }
+        val stableCoordinator = ensureStableAr(session ?: return)
 
         if ((mode == ArMode.LIVE || mode == ArMode.SENSOR) && reporting) {
             captureDetectorFrame(frame)
@@ -795,6 +828,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val cameraSite = PoseMath.transformPoint(siteFromWorld, camera.pose.translation)
         map = currentMap() ?: map
 
+        stableCoordinator.onFrame(frame, worldFromSite)
         handleRequests(frame, cameraSite, worldFromSite, map)
         when (mode) {
             ArMode.MAP -> updateMapping(frame, worldFromSite, map)
@@ -1060,6 +1094,12 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         )
     }
 
+    private fun armStableArMarkerPlacement() {
+        pendingStableArTap.set(null)
+        stableArTapArmed.set(true)
+        showDetail("Tap the exact static material point to share with StableAR")
+    }
+
     private fun showMapSetupMenu() {
         val labels = arrayOf(
             "Re-establish shared origin",
@@ -1090,10 +1130,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         showDetail("Look at the floor near the center of the camera while it is detected…")
                         requestGround.set(true)
                     }
-                    4 -> {
-                        showDetail("Placing a temporary shared test marker…")
-                        requestMarker.set(true)
-                    }
+                    4 -> armStableArMarkerPlacement()
                     5 -> Diagnostics.shareLogs(this, spatialApp.logger)
                 }
             }
@@ -1121,7 +1158,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                         showDetail("Fallback alignment: stand at the saved physical origin and face the saved heading")
                         requestManualAlign.set(true)
                     }
-                    selected.startsWith("Place") -> requestMarker.set(true)
+                    selected.startsWith("Place") -> armStableArMarkerPlacement()
                     selected.startsWith("Share diagnostics") -> Diagnostics.shareLogs(this, spatialApp.logger)
                 }
             }
@@ -1189,12 +1226,26 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
             }
         }
         if (requestMarker.getAndSet(false)) {
-            val point = SpatialEstimator.centerGroundPoint(frame, worldFromSite, map.groundY)
-                ?: floatArrayOf(cameraSite[0], cameraSite[1], cameraSite[2] - 3f)
-            val id = "m-${System.currentTimeMillis()}-${UUID.randomUUID().toString().take(4)}"
-            realtime?.sendManualMarker(id, "marker", point)
-            remoteTracks.addMarker(id, "marker", point, System.currentTimeMillis() + 60_000L)
-            showDetail("Shared test marker placed for 60 seconds")
+            val tap = pendingStableArTap.getAndSet(null)
+            val point = tap?.let { StableArTapPlacement.resolveSitePoint(frame, worldFromSite, it[0], it[1]) }
+            val now = System.currentTimeMillis()
+            val expiresAt = now + 60_000L
+            val id = "m-$now-${UUID.randomUUID().toString().take(4)}"
+            val attachment = point?.let { stableAr?.placeFromSitePoint(frame, worldFromSite, it, id, expiresAt) }
+            if (point == null) {
+                showDetail("No ARCore depth/plane/point at that tap · move sideways and tap the material again")
+            } else if (attachment == null) {
+                // Keep the host product usable if CPU-image acquisition or StableAR creation is temporarily unavailable.
+                realtime?.sendManualMarker(id, "marker", point)
+                remoteTracks.addMarker(id, "marker", point, expiresAt)
+                showDetail("Shared marker placed with stock ARCore fallback · StableAR visual root was unavailable")
+            } else {
+                val benchmark = stableAr?.status()?.benchmarkPath
+                showDetail(buildString {
+                    append("StableAR shared marker active for 60 seconds · move around it to verify material lock")
+                    if (stableArBenchmarkEnabled && benchmark != null) append(" · benchmark recording: $benchmark")
+                })
+            }
         }
         if (requestFinish.getAndSet(false) && mode == ArMode.MAP) {
             val latest = currentMap(forceRefresh = true) ?: map
@@ -1415,6 +1466,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
         val bufferedRemoteTracks = remoteTracks.snapshot(now).count { track ->
             track.sourceId != spatialApp.preferences.deviceId && track.sourceId != "marker"
         }
+        val stableStatus = stableAr?.status()
+        val stableText = stableStatus?.let { status ->
+            val backend = if (status.learnedBackendActive) "xfeat" else status.lastMethod.lowercase()
+            " · StableAR ${status.attachments}/$backend · corr ${status.acceptedCorrections}"
+        }.orEmpty()
         val locationState = when {
             worldFromSite != null -> cloudAnchors?.currentReferenceId
                 ?.let { "Localized · anchor ${it.takeLast(8)}" }
@@ -1455,9 +1511,9 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
                             "${it.profile.model.name.lowercase()}/${it.profile.delegate.name.lowercase()} · drop ${it.droppedFrames}"
                         } ?: "detector starting"
                         val terrainText = terrainModel.get()?.let { "terrain ${it.cellCount}" } ?: "terrain fallback"
-                        "$latestDetectionCount detected · $latestPoseCount pose · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack · $bufferedRemoteTracks remote · ${latestInferenceMs} ms · $detectorText · $terrainText"
+                        "$latestDetectionCount detected · $latestPoseCount pose · $latestSpatializedCount spatialized · $latestLocalTrackCount active · $ack · $bufferedRemoteTracks remote · ${latestInferenceMs} ms · $detectorText · $terrainText$stableText"
                     }
-                    ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks"
+                    ArMode.VIEWER -> if (worldFromSite == null) "Resolving shared location…" else "Observing shared tracks$stableText"
                 }
             }
         }
@@ -1524,6 +1580,11 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
 
     override fun onManualMarker(id: String, label: String, position: FloatArray, expiresAtMs: Long) {
         remoteTracks.addMarker(id, label, position, expiresAtMs)
+        if (label.equals("stablear", ignoreCase = true)) {
+            val value = stableAr
+            if (value != null) value.queueRemoteMarker(id, position, expiresAtMs)
+            else pendingStableMarkers.add(PendingStableMarker(id, label, position.copyOf(), expiresAtMs))
+        }
     }
 
     override fun onClientPose(pose: RemoteClientPose) {
@@ -1534,6 +1595,48 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     override fun onPresence(clientId: String, action: String, role: String) {
         if (action == "left") remoteClientPoses.remove(clientId)
         spatialApp.logger.debug("Realtime presence", mapOf("clientId" to clientId, "action" to action, "role" to role))
+    }
+
+    private fun ensureStableAr(active: Session): StableArCoordinator {
+        stableAr?.let { return it }
+        return StableArCoordinator(
+            context = applicationContext,
+            session = active,
+            benchmarkEnabled = stableArBenchmarkEnabled,
+            benchmarkPhase = stableArBenchmarkPhase,
+            onRefinedMarker = ::onStableArRefinedMarker
+        ).also { coordinator ->
+            stableAr = coordinator
+            while (true) {
+                val pending = pendingStableMarkers.poll() ?: break
+                coordinator.queueRemoteMarker(pending.id, pending.position, pending.expiresAtMs)
+            }
+            spatialApp.logger.info(
+                "StableAR coordinator attached to host ARCore session",
+                mapOf("benchmark" to stableArBenchmarkEnabled, "benchmarkPath" to coordinator.status().benchmarkPath)
+            )
+        }
+    }
+
+    private fun onStableArRefinedMarker(marker: StableArRefinedMarker) {
+        remoteTracks.addMarker(marker.markerId, "stablear", marker.sitePosition, marker.expiresAtMs)
+        if (!marker.broadcast) return
+        val now = System.currentTimeMillis()
+        val previous = stableArBroadcastAt[marker.markerId] ?: 0L
+        if (previous == 0L || marker.acceptedCorrection || now - previous >= 2_000L) {
+            val ttl = (marker.expiresAtMs - now).coerceIn(1_000L, 24L * 60L * 60L * 1000L)
+            realtime?.sendManualMarker(marker.markerId, "stablear", marker.sitePosition, ttl)
+            stableArBroadcastAt[marker.markerId] = now
+        }
+    }
+
+    private fun releaseStableArOnGlThread() {
+        if (!::glSurface.isInitialized) return
+        glSurface.queueEvent {
+            val value = stableAr
+            stableAr = null
+            runCatching { value?.close() }
+        }
     }
 
     private fun action(label: String, block: () -> Unit): Button = Button(this).apply {
@@ -1550,6 +1653,8 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     companion object {
         const val EXTRA_MAP_ID = "map_id"
         const val EXTRA_MODE = "mode"
+        const val EXTRA_STABLEAR_BENCHMARK = "stablear_benchmark"
+        const val EXTRA_STABLEAR_BENCHMARK_PHASE = "stablear_benchmark_phase"
         private const val DETECTION_INTERVAL_MS = 80L
         private const val TRACK_PUBLISH_INTERVAL_MS = 100L
         private const val POSE_INTERVAL_MS = 500L
