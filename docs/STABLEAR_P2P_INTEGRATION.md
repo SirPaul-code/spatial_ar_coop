@@ -19,6 +19,13 @@ That means this product branch is not carrying an older hand-copied XFeat/core s
 Latest integration runtime code checkpoint before this documentation refresh:
 
 ```text
+49d195be2bbe36fd0f930ad3132a50f6dcefb952
+fix(p2p): guard async StableAR root admission
+```
+
+Preceded by:
+
+```text
 1e25835f86fb8ed72ebfee5ebc8b7e453b3a837b
 fix(p2p): keep dormant StableAR seeds fail-closed
 ```
@@ -59,6 +66,8 @@ The existing placement policy is deliberately retained because it was physically
 A depth-prior-only StableAR seed is **not** allowed to become product authority before immutable visual root evidence is actually captured. Until XFeat or LK/ORB successfully arms that exact root exposure, rendering and product behavior continue to use the existing ARCore anchor. This prevents an asynchronous root-capture failure from leaving a stale StableAR point in control.
 
 If the legacy/product surface bootstrap refines a point before StableAR visual root evidence becomes active, the dormant StableAR seed is replaced from that newer trusted point instead of silently returning success with obsolete geometry.
+
+Asynchronous root admission is attachment-generation safe at the bridge level: the owner thread maintains an `activeAttachments` set. If a dormant attachment is replaced, removed, cleared or invalidated while its worker-side root capture is still queued, that old worker result cannot later resurrect the stale attachment into `visualRoots`. This also prevents a stale root id from keeping camera/LiteRT work alive after the corresponding product target is gone.
 
 ## Remote POI flow
 
