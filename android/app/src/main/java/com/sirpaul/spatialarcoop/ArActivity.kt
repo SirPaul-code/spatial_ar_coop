@@ -173,7 +173,7 @@ class ArActivity : AppCompatActivity(), GLSurfaceView.Renderer, RealtimeListener
     private val stableArBroadcastAt = linkedMapOf<String, Long>()
     private val stableArTapArmed = AtomicBoolean(false)
     private val pendingStableArTap = AtomicReference<FloatArray?>(null)
-    private val stableArBenchmarkEnabled by lazy { intent.getBooleanExtra(EXTRA_STABLEAR_BENCHMARK, false) }
+    private val stableArBenchmarkEnabled by lazy { BuildConfig.STABLEAR_BENCHMARK_DEFAULT || intent.getBooleanExtra(EXTRA_STABLEAR_BENCHMARK, false) }
     private val stableArBenchmarkPhase by lazy { intent.getStringExtra(EXTRA_STABLEAR_BENCHMARK_PHASE) ?: "field" }
 
     private val requestHost = AtomicBoolean(false)
