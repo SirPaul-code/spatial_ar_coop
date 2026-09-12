@@ -1,6 +1,8 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { parseClientMessage, ProtocolError, validateClientIdentity, PROTOCOL_VERSION } from './protocol.mjs';
 
+const RETAINED_CAR_TTL_MS = 120_000;
+
 export class RealtimeHub {
   constructor({
     server,
@@ -13,6 +15,7 @@ export class RealtimeHub {
   }) {
     this.logger = logger;
     this.trackTtlMs = trackTtlMs;
+    this.retainedCarTtlMs = Math.max(trackTtlMs, RETAINED_CAR_TTL_MS);
     this.authorize = authorize;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.heartbeatTimeoutMs = Math.max(heartbeatTimeoutMs, heartbeatIntervalMs * 2);
@@ -38,6 +41,10 @@ export class RealtimeHub {
       rooms: this.rooms.size,
       clients: [...this.rooms.values()].reduce((sum, room) => sum + room.size, 0),
       tracks: [...this.tracks.values()].reduce((sum, tracks) => sum + tracks.size, 0),
+      retainedCars: [...this.tracks.values()].reduce(
+        (sum, tracks) => sum + [...tracks.values()].filter((track) => isRetainedCar(track)).length,
+        0
+      ),
       poses: this.poses.size
     };
   }
@@ -169,10 +176,13 @@ export class RealtimeHub {
         if (message.replaceSource) {
           const incomingKeys = new Set(normalized.map((track) => track.key));
           for (const [key, track] of roomTracks) {
-            if (track.sourceId === identity.clientId && !incomingKeys.has(key)) {
-              roomTracks.delete(key);
-              expired.push(key);
-            }
+            if (track.sourceId !== identity.clientId || incomingKeys.has(key)) continue;
+            // Cars are presentation/live-ops objects rather than one-frame detector overlays. Keep
+            // their last known shared-site state when the originating detector loses them, then
+            // expire them after a bounded memory window. Other classes keep realtime semantics.
+            if (isRetainedCar(track) && receivedAt - track.serverReceivedAtMs <= this.retainedCarTtlMs) continue;
+            roomTracks.delete(key);
+            expired.push(key);
           }
         }
 
@@ -231,7 +241,8 @@ export class RealtimeHub {
     for (const [mapId, roomTracks] of this.tracks) {
       const expired = [];
       for (const [key, track] of roomTracks) {
-        if (now - track.serverReceivedAtMs > this.trackTtlMs) {
+        const ttlMs = isRetainedCar(track) ? this.retainedCarTtlMs : this.trackTtlMs;
+        if (now - track.serverReceivedAtMs > ttlMs) {
           roomTracks.delete(key);
           expired.push(key);
         }
@@ -288,4 +299,8 @@ export class RealtimeHub {
   }
 
   #error(socket, code, message) { this.#send(socket, { type: 'error', code, message }); }
+}
+
+function isRetainedCar(track) {
+  return String(track?.label ?? '').toLowerCase() === 'car';
 }

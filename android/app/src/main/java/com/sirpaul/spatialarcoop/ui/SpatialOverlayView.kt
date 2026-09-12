@@ -221,7 +221,12 @@ class SpatialOverlayView @JvmOverloads constructor(
         } else {
             "${track.label} · $stableId"
         }
-        val detail = "%.1f m   %.0f%%   %d ms".format(track.distanceMeters, track.confidence * 100f, track.ageMs)
+        val ageText = if (track.label.equals("car", true) && track.ageMs >= 1_000L) {
+            "last %.1fs".format(track.ageMs / 1000f)
+        } else {
+            "${track.ageMs} ms"
+        }
+        val detail = "%.1f m   %.0f%%   %s".format(track.distanceMeters, track.confidence * 100f, ageText)
         val panelWidth = maxOf(text.measureText(title), subText.measureText(detail)) + 18f * density
         val left = (track.x - panelWidth / 2f).coerceIn(6f * density, width - panelWidth - 6f * density)
         val top = (markerTop - 47f * density).coerceAtLeast(6f * density)
@@ -365,6 +370,11 @@ class SpatialOverlayView @JvmOverloads constructor(
             return
         }
 
+        val deviceBounds = participantDeviceBounds(participant)
+        canvas.drawRoundRect(deviceBounds, 8f * density, 8f * density, participantFill)
+        canvas.drawRoundRect(deviceBounds, 8f * density, 8f * density, participantStroke)
+        drawParticipantCornerTicks(canvas, deviceBounds)
+
         participant.gizmo?.let { gizmo ->
             drawParticipantAxis(canvas, participant.x, participant.y, gizmo.right, participantAxisRight)
             drawParticipantAxis(canvas, participant.x, participant.y, gizmo.up, participantAxisUp)
@@ -373,15 +383,41 @@ class SpatialOverlayView @JvmOverloads constructor(
         drawPhoneGlyph(canvas, participant.x, participant.y)
 
         val shortId = participant.clientId.substringAfterLast('-').takeLast(8).ifBlank { participant.clientId.takeLast(8) }
-        val title = "phone · $shortId"
-        val detail = "%.1f m · %s".format(participant.distanceMeters, participant.tracking.lowercase())
+        val role = participant.role.ifBlank { "client" }.lowercase()
+        val title = "$role phone · $shortId"
+        val detail = "%.1f m · %s · %d ms".format(participant.distanceMeters, participant.tracking.lowercase(), participant.ageMs)
         val panelWidth = maxOf(text.measureText(title), subText.measureText(detail)) + 18f * density
         val left = (participant.x - panelWidth / 2f).coerceIn(6f * density, width - panelWidth - 6f * density)
-        val top = (participant.y - 66f * density).coerceAtLeast(6f * density)
+        val top = (deviceBounds.top - 45f * density).coerceAtLeast(6f * density)
         val rect = RectF(left, top, left + panelWidth, top + 38f * density)
         canvas.drawRoundRect(rect, 7f * density, 7f * density, panel)
         canvas.drawText(title, rect.left + 9f * density, rect.top + 15f * density, text)
         canvas.drawText(detail, rect.left + 9f * density, rect.top + 31f * density, subText)
+    }
+
+    private fun participantDeviceBounds(participant: ProjectedParticipant): RectF {
+        val distance = participant.distanceMeters.coerceIn(0.35f, 25f)
+        val apparentScale = (1.6f / distance).coerceIn(0.68f, 2.35f)
+        val halfWidth = 25f * density * apparentScale
+        val halfHeight = 41f * density * apparentScale
+        return RectF(
+            participant.x - halfWidth,
+            participant.y - halfHeight,
+            participant.x + halfWidth,
+            participant.y + halfHeight
+        )
+    }
+
+    private fun drawParticipantCornerTicks(canvas: Canvas, bounds: RectF) {
+        val tick = min(bounds.width(), bounds.height()).coerceAtMost(28f * density) * 0.38f
+        canvas.drawLine(bounds.left, bounds.top, bounds.left + tick, bounds.top, participantStroke)
+        canvas.drawLine(bounds.left, bounds.top, bounds.left, bounds.top + tick, participantStroke)
+        canvas.drawLine(bounds.right, bounds.top, bounds.right - tick, bounds.top, participantStroke)
+        canvas.drawLine(bounds.right, bounds.top, bounds.right, bounds.top + tick, participantStroke)
+        canvas.drawLine(bounds.left, bounds.bottom, bounds.left + tick, bounds.bottom, participantStroke)
+        canvas.drawLine(bounds.left, bounds.bottom, bounds.left, bounds.bottom - tick, participantStroke)
+        canvas.drawLine(bounds.right, bounds.bottom, bounds.right - tick, bounds.bottom, participantStroke)
+        canvas.drawLine(bounds.right, bounds.bottom, bounds.right, bounds.bottom - tick, participantStroke)
     }
 
     private fun drawParticipantAxis(
@@ -415,7 +451,7 @@ class SpatialOverlayView @JvmOverloads constructor(
         drawPhoneGlyph(canvas, phoneX, phoneY, 0.72f)
 
         val shortId = participant.clientId.substringAfterLast('-').takeLast(6).ifBlank { participant.clientId.takeLast(6) }
-        val label = "phone $shortId · %.1fm".format(participant.distanceMeters)
+        val label = "${participant.role.ifBlank { "client" }.lowercase()} $shortId · %.1fm".format(participant.distanceMeters)
         val labelWidth = subText.measureText(label)
         val labelX = (point.x - labelWidth / 2f).coerceIn(8f * density, width - labelWidth - 8f * density)
         val labelY = (point.y - 22f * density).coerceIn(16f * density, height - 12f * density)

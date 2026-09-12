@@ -113,3 +113,65 @@ test('REST map API and WebSocket multi-track snapshots relay end to end', async 
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test('cars remain in shared live state as last-known objects after detector loss', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spatial-car-memory-'));
+  const app = createSpatialServer({ host: '127.0.0.1', port: 0, dataDir, apiToken: 'test-token', adminToken: 'test-token', stdout: false, trackTtlMs: 120 });
+  let sensor;
+  let viewer;
+  let lateViewer;
+  try {
+    const address = await app.start();
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' };
+    const create = await fetch(`${base}/api/v1/maps`, { method: 'POST', headers, body: JSON.stringify({ id: 'cars', name: 'Cars', createdBy: 'test' }) });
+    assert.equal(create.status, 201);
+
+    const wsBase = `ws://127.0.0.1:${address.port}/ws?token=test-token&mapId=cars`;
+    ({ socket: sensor } = await openWebSocket(`${wsBase}&clientId=sensor&role=sensor`));
+    ({ socket: viewer } = await openWebSocket(`${wsBase}&clientId=viewer&role=viewer`));
+
+    const carAckPromise = nextMessage(sensor, (value) => value.type === 'track_ack' && value.sequence === 10);
+    const carBatchPromise = nextMessage(viewer, (value) => value.type === 'track_batch' && value.sequence === 10);
+    sensor.send(JSON.stringify({
+      type: 'track_batch',
+      sequence: 10,
+      replaceSource: true,
+      tracks: [{
+        id: 'car-1', label: 'car', confidence: .94,
+        position: [4, 0, 8], velocity: [0, 0, 0],
+        extentMeters: [1.85, 1.5, 4.4], yawRadians: .35,
+        observedAtMs: Date.now()
+      }]
+    }));
+    const [carAck, carBatch] = await Promise.all([carAckPromise, carBatchPromise]);
+    assert.equal(carAck.accepted, 1);
+    assert.equal(carBatch.tracks[0].key, 'sensor:car-1');
+
+    const emptyAckPromise = nextMessage(sensor, (value) => value.type === 'track_ack' && value.sequence === 11);
+    sensor.send(JSON.stringify({ type: 'track_batch', sequence: 11, replaceSource: true, tracks: [] }));
+    const emptyAck = await emptyAckPromise;
+    assert.equal(emptyAck.accepted, 0);
+    assert.equal(emptyAck.expired, 0, 'car must not be deleted when the detector temporarily loses it');
+
+    // Wait beyond the ordinary realtime TTL. A bird/person would be gone now, but a car is retained
+    // as a bounded last-known shared object for the presentation/live-ops view.
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const live = await fetch(`${base}/api/v1/maps/cars/live-state`, { headers });
+    const state = await live.json();
+    assert.equal(state.tracks.length, 1);
+    assert.equal(state.tracks[0].key, 'sensor:car-1');
+    assert.equal(state.tracks[0].label, 'car');
+
+    const opened = await openWebSocket(`${wsBase}&clientId=late-viewer&role=viewer`);
+    lateViewer = opened.socket;
+    assert.equal(opened.welcome.tracks.length, 1, 'late joiner should receive the retained car snapshot');
+    assert.equal(opened.welcome.tracks[0].key, 'sensor:car-1');
+  } finally {
+    sensor?.close();
+    viewer?.close();
+    lateViewer?.close();
+    await app.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
