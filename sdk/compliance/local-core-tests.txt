@@ -1,0 +1,8 @@
+PASS: rigid rebase invariance
+PASS: bounded frame history and freeze ownership
+PASS: ray-consistent surface fitting
+PASS: correction transactions and held-out validation
+PASS: no-parallax and systematic uncertainty
+PASS: presented crop mapping
+PASS: input validation
+PASS: 7 contract suites, 2068 assertions. Synthetic tests, not physical accuracy.

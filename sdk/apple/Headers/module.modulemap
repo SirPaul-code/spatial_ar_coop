@@ -1,0 +1,4 @@
+module StableARNative {
+  header "stablear_c.h"
+  export *
+}

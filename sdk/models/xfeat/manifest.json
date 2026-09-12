@@ -1,0 +1,26 @@
+{
+  "name": "XFeat LiteRT",
+  "purpose": "Dense learned local descriptors for StableAR visual correspondence",
+  "upstream_repository": "litert-community/xfeat-litert",
+  "upstream_revision": "bd421aad1ce6d25dc172cd9579cc13b9da21356f",
+  "file": "xfeat.tflite",
+  "size_bytes": 1414480,
+  "sha256": "6f0756d70218681a317f3630c5946f47812e2531f1fa5aba6cfa2a80115fc0df",
+  "license": "Apache-2.0",
+  "input": {
+    "shape": [1, 480, 640, 1],
+    "dtype": "float32",
+    "layout": "NHWC",
+    "preprocess": "grayscale resize to 640x480 followed by per-image InstanceNorm: (x-mean)/sqrt(var+1e-5)"
+  },
+  "outputs": [
+    {"index": 0, "name": "feats", "shape": [1, 64, 60, 80], "dtype": "float32"},
+    {"index": 1, "name": "keypoints", "shape": [1, 65, 60, 80], "dtype": "float32"},
+    {"index": 2, "name": "heatmap", "shape": [1, 1, 60, 80], "dtype": "float32"}
+  ],
+  "stablear_policy": {
+    "authority": "visual evidence only; never moves a world anchor directly",
+    "search": "bounded around host-projected material point",
+    "template_learning": "explicit admission only after independent geometric acceptance"
+  }
+}

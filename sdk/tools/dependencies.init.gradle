@@ -1,0 +1,45 @@
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+
+// Resolve the full dependency graph, but request external artifacts separately.
+// AGP project variants expose many secondary artifacts; an untyped legacy
+// resolvedConfiguration access is ambiguous. This does not discard transitive
+// external modules reached through a project dependency.
+gradle.projectsEvaluated {
+    gradle.rootProject.tasks.register('exportResolvedArtifacts') {
+        doLast {
+            def rows=[]
+            gradle.rootProject.allprojects.each { p ->
+                ['runtimeClasspath','testRuntimeClasspath',
+                 'releaseRuntimeClasspath','releaseCompileClasspath',
+                 'debugRuntimeClasspath','debugCompileClasspath'].each { name ->
+                    def c=p.configurations.findByName(name)
+                    if(c!=null && c.canBeResolved) {
+                        def view=c.incoming.artifactView {
+                            componentFilter { it instanceof ModuleComponentIdentifier }
+                        }
+                        // Strict resolution: missing artifacts are not silently omitted.
+                        view.artifacts.artifacts.each { a ->
+                            def id=a.id.componentIdentifier
+                            rows << [scope:p.path+':'+name,group:id.group,name:id.module,version:id.version,
+                                artifact:a.file.absolutePath,classifier:'',type:a.file.name.tokenize('.').last()]
+                        }
+                    }
+                }
+            }
+            // Add our own already-built deliverables with explicit paths, rather
+            // than asking Gradle to choose between secondary project variants.
+            ['core':'core/build/libs/core-0.1.0-research.jar',
+             'arcore':'arcore/build/outputs/aar/arcore-release.aar',
+             'vision':'vision/build/outputs/aar/vision-release.aar'].each { name,path ->
+                def file=new File(gradle.rootProject.projectDir,path)
+                if(!file.isFile()) throw new GradleException('Build before auditing: '+file)
+                rows << [scope:':'+name+':deliverable',group:'com.sirpaul.stablear',name:name,
+                    version:'0.1.0-research',artifact:file.absolutePath,classifier:'',type:file.name.tokenize('.').last()]
+            }
+            def out=new File(gradle.rootProject.buildDir,'compliance/resolved.json')
+            out.parentFile.mkdirs(); out.text=JsonOutput.prettyPrint(JsonOutput.toJson(rows))+'\n'
+            println('Recorded '+rows.size()+' scoped resolved artifacts')
+        }
+    }
+}
