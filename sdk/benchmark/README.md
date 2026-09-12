@@ -13,15 +13,17 @@ For every run, both candidates start from the **same exposure, pixel and metric 
 
 Both candidates are projected into the same CPU-camera image raster for each frame.
 
-Ground truth is intentionally independent from StableAR. The recommended field target is a printed OpenCV ArUco marker (`DICT_4X4_50`, id 23). The scorer detects the marker center directly from the recorded camera frame. XFeat/LK/ORB output is **not** used as ground truth.
+Ground truth is intentionally independent from StableAR. The recommended field target is a printed OpenCV ArUco marker (`DICT_4X4_50`, id 23). The strongest normal field mode records the exact tapped root exposure and pixel in `root.json`. Offline scoring detects the four ArUco corners in that root exposure, maps the exact clicked material point into the marker's planar coordinate system, and reprojects that same physical point from independently detected marker corners in every later frame. Human tap offset therefore does not become the ground truth. XFeat/LK/ORB output is **never** used to define truth.
+
+If `root.json` is absent, the scorer can fall back to the marker center. Explicit externally labelled `gt_x,gt_y` values take precedence over both modes.
 
 This benchmark supports a defensible statement such as "lower p95 image attachment error than an unrefined ARCore anchor under these tested conditions." It does **not** by itself prove absolute centimetre/mm world accuracy, SLAM accuracy, or performance on every device.
 
 ## Capture contract
 
-One benchmark session is a directory containing `frames.csv` plus optional frame images. Coordinates in the CSV and evaluator output must all be in the same source CPU-image raster.
+One benchmark session is a directory containing `frames.csv`, frame images, and preferably `root.json` plus the exact root exposure.
 
-Required columns:
+Required CSV columns:
 
 ```text
 timestamp_ns,phase,fx,fy,stock_x,stock_y,stock_valid,stable_x,stable_y,stable_valid
@@ -33,9 +35,17 @@ Recommended columns:
 image_path,stable_method,stable_latency_ms,accepted_corrections,tracking_state
 ```
 
-For automated tests or externally labelled datasets, `gt_x,gt_y` may be supplied directly. If they are absent, `score_aruco.py` detects the configured ArUco marker from `image_path`.
+Preferred root metadata:
 
-`stock_valid`/`stable_valid` use `1/0`, `true/false`, or equivalent boolean text. Invalid predictions are not silently converted into zero error; availability is reported separately.
+```json
+{
+  "image_path": "root.pgm",
+  "pixel_x": 319.2,
+  "pixel_y": 241.8
+}
+```
+
+Coordinates in the CSV, root metadata and images must all be in the same image raster. `stock_valid`/`stable_valid` use `1/0`, `true/false`, or equivalent boolean text. Invalid predictions are not silently converted into zero error; availability is reported separately.
 
 ## Field protocol
 
@@ -79,14 +89,15 @@ python sdk/benchmark/score_aruco.py path/to/session --json-out summary.json
 Important reported values:
 
 - p50 / p95 / RMSE pixel error for each candidate;
-- prediction availability while the marker is independently visible;
+- prediction availability while the independent target is visible;
 - false-lock rate above the configured pixel threshold;
 - paired StableAR improvement (`stock_error - stable_error`);
 - paired win rate;
 - bootstrap 95% confidence interval for mean paired improvement;
+- the ground-truth mode actually used;
 - the same metrics per named phase.
 
-A positive paired improvement means StableAR was closer to the physical marker on that frame.
+A positive paired improvement means StableAR was closer to the physical marker point on that frame.
 
 ## Commercial claim gate
 
@@ -94,11 +105,12 @@ Do not publish "better than ARCore" from CI or synthetic data. A release claim s
 
 - physical sessions captured on real supported devices;
 - an evaluator independent of the StableAR correspondence frontend;
-- enough paired marker-visible frames to make p95 meaningful;
+- `aruco_root_homography` or stronger external ground truth for the primary claim;
+- enough paired target-visible frames to make p95 meaningful;
 - StableAR p95 error lower than stock ARCore in the named scenario;
 - bootstrap 95% CI for mean paired improvement entirely above zero;
 - false-lock rate no worse than the agreed product threshold;
 - availability and latency reported alongside accuracy, not hidden;
 - raw sessions retained so the result can be reproduced.
 
-The strongest future absolute-3D benchmark is a calibrated external tracker/robot/Vicon-style reference. ArUco image error is the practical first benchmark because it directly measures what the user sees: whether the annotation stays on the material point.
+The strongest future absolute-3D benchmark is a calibrated external tracker/robot/Vicon-style reference. ArUco material-point image error is the practical first benchmark because it directly measures what the user sees: whether the annotation stays on the same physical point.
