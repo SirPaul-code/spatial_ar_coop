@@ -9,6 +9,10 @@ on:
       - 'android/app/build.gradle.kts'
       - 'android/app/src/main/java/com/sirpaul/spatialnomap/AlignmentEngine.kt'
       - 'android/app/src/main/java/com/sirpaul/spatialnomap/StableArAlignmentFrontend.kt'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/StableArSurfaceFrontend.kt'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/StableArSpatialRuntime.kt'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt'
       - 'android/app/src/main/java/com/sirpaul/spatialnomap/SpatialSyncApplication.kt'
       - '.github/workflows/stablear-multiplatform.yml'
   workflow_dispatch:
@@ -33,7 +37,7 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/stablear/multiplatform-sdk
           git diff --name-only "$BASE_SHA" HEAD | tee changed.txt
-          ALLOWED='^(sdk/|\.github/workflows/stablear-multiplatform\.yml$|android/build\.gradle\.kts$|android/settings\.gradle\.kts$|android/app/build\.gradle\.kts$|android/app/src/main/java/com/sirpaul/spatialnomap/(AlignmentEngine|StableArAlignmentFrontend|SpatialSyncApplication)\.kt$)'
+          ALLOWED='^(sdk/|\.github/workflows/stablear-multiplatform\.yml$|android/build\.gradle\.kts$|android/settings\.gradle\.kts$|android/app/build\.gradle\.kts$|android/app/src/main/java/com/sirpaul/spatialnomap/(AlignmentEngine|StableArAlignmentFrontend|StableArSurfaceFrontend|StableArSpatialRuntime|ArRenderer|MainActivity|SpatialSyncApplication)\.kt$)'
           if grep -Ev "$ALLOWED" changed.txt; then
             echo 'Multiplatform SDK branch modified a path outside the explicit StableAR host-integration allowlist' >&2
             exit 1
@@ -128,7 +132,15 @@ jobs:
         run: |
           set -o pipefail
           gradle -p sdk --no-daemon --stacktrace :core:check :arcore:assembleRelease :vision:assembleRelease :demo:assembleDebug 2>&1 | tee android-reference-build.log
-      - name: Build SpatialNoMap StableAR alignment integration
+      - name: SpatialNoMap StableAR host wiring contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'StableArSpatialRuntime' android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt
+          grep -q 'stablear:arcore:0.2.0-research' android/app/build.gradle.kts
+          grep -q 'stablear:vision:0.2.0-research' android/app/build.gradle.kts
+          grep -q 'stablear:native-vision-android:0.2.0-research' android/app/build.gradle.kts
+      - name: Build SpatialNoMap full StableAR integration
         shell: bash
         run: |
           set -o pipefail
@@ -185,6 +197,14 @@ jobs:
             sdk/native-vision-android/.cxx/
           if-no-files-found: warn
           retention-days: 7
+      - name: Publish Spatial Sync StableAR APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spatial-sync-stablear-apk-${{ github.sha }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: success()
         with:

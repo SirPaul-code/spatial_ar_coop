@@ -1,5 +1,0 @@
-olicy: XFeat/LiteRT first, LK/ORB fallback, staged template admission, held-out geometric acceptance, immutable root identity and bounded correction;
-+- remote manual POIs cannot reuse the peer's ARCore frame as a local StableAR root. The existing visual+metric resolver is therefore retained only as a one-time local bootstrap proof. The next exact local ARCore exposure becomes the StableAR root, after which the legacy resolver is bypassed for that target;
-+- moving vehicle tracks remain outside StableAR because the SDK contract is static material attachment only.
-+
-+This integration is a software wiring change, not a physical accuracy claim. Real two-phone validation (`ALIGNING -> LOCKED -> local/remote POI -> viewpoint/occlusion/reacquisition`) is still required before upgrading any accuracy, stability, latency, thermal or battery claim.

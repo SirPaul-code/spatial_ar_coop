@@ -683,6 +683,7 @@ class MainActivity : Activity(),
         coordinator.close()
         transport.close()
         renderer.detachSession()
+        renderer.close()
         runCatching { session?.close() }
         session = null
         super.onDestroy()

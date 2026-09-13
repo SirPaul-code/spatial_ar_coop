@@ -105,9 +105,11 @@ dependencies {
     implementation("org.opencv:opencv:4.12.0")
     implementation("com.google.mediapipe:tasks-vision:0.10.35")
 
-    // Composite-build dependency on the real StableAR Android learned-vision module.
-    // This keeps SDK and product toolchains isolated while ALIGNING consumes the
-    // exact pinned XFeat/LiteRT implementation from sdk/native-vision-android.
+    // Full StableAR Android host integration from the included SDK build. ARCore remains
+    // the product VIO/world owner; StableAR owns static material attachment geometry,
+    // XFeat/LiteRT correspondence and LK/ORB fallback.
+    implementation("com.sirpaul.stablear:arcore:0.2.0-research")
+    implementation("com.sirpaul.stablear:vision:0.2.0-research")
     implementation("com.sirpaul.stablear:native-vision-android:0.2.0-research")
 
     testImplementation("junit:junit:4.13.2")

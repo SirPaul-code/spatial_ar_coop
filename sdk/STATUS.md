@@ -151,3 +151,16 @@ Spatial phone-camera baseline is most useful close up; temporal device motion ca
 8. Add capability-aware physical multi-camera/temporal observations and repeat device validation before upgrading claims.
 
 No synthetic test, CI run or upstream benchmark alone justifies physical accuracy, FPS or commercial-performance claims.
+
+## Spatial Sync Android host integration — 2026-09-13
+
+The `android/app` product now consumes the full Android StableAR stack from the included `sdk` build: `arcore`, `vision`, and `native-vision-android`. The product Kotlin plugin is aligned with the SDK toolchain so composite-build Kotlin metadata is compatible.
+
+The ownership boundary is deliberate:
+- shared-world `ALIGNING` still uses StableAR's pinned XFeat correspondence frontend while `AlignmentCoordinator` owns networking, host/peer readiness and the cross-device SE(3) solve;
+- local manual POIs create an exact-frame `ArCoreAdapter`/`AttachmentEngine` material attachment, prefer SDK depth/surface bootstrap, and fall back to the already-vetted host ARCore hit only as an initial camera-Z depth prior;
+- ongoing local material evidence uses the SDK reference policy: XFeat/LiteRT first, LK/ORB fallback, staged template admission, held-out geometric acceptance, immutable root identity and bounded correction;
+- remote manual POIs cannot reuse the peer's ARCore frame as a local StableAR root. The existing visual+metric resolver is therefore retained only as a one-time local bootstrap proof. The next exact local ARCore exposure becomes the StableAR root, after which the legacy resolver is bypassed for that target;
+- moving vehicle tracks remain outside StableAR because the SDK contract is static material attachment only.
+
+This integration is a software wiring change, not a physical accuracy claim. Real two-phone validation (`ALIGNING -> LOCKED -> local/remote POI -> viewpoint/occlusion/reacquisition`) is still required before upgrading any accuracy, stability, latency, thermal or battery claim.
