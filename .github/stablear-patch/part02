@@ -1,0 +1,111 @@
+ val target = synchronized(targetLock) { remoteTargets[correction.id] } ?: return
+         val oldPoint = target.anchor.pose.translation
+         val coarse = correction.result
+@@ -618,6 +641,7 @@ class ArRenderer(
+             target.surfaceVerified = true
+             target.pendingCorrection = null
+             target.correctionVotes = 0
++            stableArRuntime.promoteRemote(correction.id, oldPoint, target.owner)
+             return
+         }
+         if (!voteForCorrection(target, result.pointWorld, result.confidence, result.visualInliers, delta)) return
+@@ -630,6 +654,7 @@ class ArRenderer(
+         target.correctionVotes = 0
+         target.surface = SurfaceTargetReference(correction.currentFrame, result.matchedPixel.copyOf())
+         runCatching { old.detach() }
++        stableArRuntime.promoteRemote(correction.id, result.pointWorld, target.owner)
+     }
+ 
+     private fun voteForCorrection(
+@@ -886,6 +911,9 @@ class ArRenderer(
+         view: FloatArray,
+         projection: FloatArray,
+     ): TargetOverlayView.Target? {
++        stableArRuntime.worldPoint(id)?.let { stablePoint ->
++            return projectPoint(camera, stablePoint, id, label, confidence, isLocal, view, projection, null)
++        }
+         if (anchor.trackingState != TrackingState.TRACKING) return null
+         return projectPoint(camera, anchor.pose.translation, id, label, confidence, isLocal, view, projection, null)
+     }
+diff --git a/android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt b/android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt
+index e33096b34d6c5dce3684883270eb32cbf8ea8379..08ccbf646728bfcf2fb2b18782c396d939eeff56 100644
+--- a/android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt
++++ b/android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt
+@@ -683,6 +683,7 @@ class MainActivity : Activity(),
+         coordinator.close()
+         transport.close()
+         renderer.detachSession()
++        renderer.close()
+         runCatching { session?.close() }
+         session = null
+         super.onDestroy()
+diff --git a/android/app/src/main/java/com/sirpaul/spatialnomap/StableArSpatialRuntime.kt b/android/app/src/main/java/com/sirpaul/spatialnomap/StableArSpatialRuntime.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f96a37a3e84e88f76f2fb1236fc5fe87c83aa6a9
+--- /dev/null
++++ b/android/app/src/main/java/com/sirpaul/spatialnomap/StableArSpatialRuntime.kt
+@@ -0,0 +1,473 @@
++package com.sirpaul.spatialnomap
++
++import android.content.Context
++import com.google.ar.core.Camera
++import com.google.ar.core.Frame
++import com.google.ar.core.Session
++import com.sirpaul.stablear.arcore.ArCoreAdapter
++import com.sirpaul.stablear.arcore.CameraSample
++import com.sirpaul.stablear.arcore.ObservationContext
++import com.sirpaul.stablear.arcore.worldFromCv
++import com.sirpaul.stablear.core.V2
++import com.sirpaul.stablear.core.V3
++import com.sirpaul.stablear.core.VisualObservation
++import com.sirpaul.stablear.nativevision.XFeatView
++import java.util.LinkedHashMap
++import java.util.concurrent.ConcurrentLinkedQueue
++import java.util.concurrent.Executors
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicLong
++import kotlin.math.sqrt
++
++/**
++ * Full StableAR material-attachment host integration for Spatial Sync.
++ *
++ * ARCore remains the global VIO/world owner. StableAR owns only static material
++ * attachment evidence and bounded local correction. Cross-device SE(3), transport,
++ * peer confirmation and dynamic vehicles deliberately stay in product code.
++ *
++ * All ArCoreAdapter calls stay on the GL/render owner thread. LiteRT/OpenCV work is
++ * confined to one bounded worker. Remote targets use the legacy visual+metric
++ * resolver only once to establish a trustworthy local material point; after that
++ * StableAR owns ongoing attachment verification on this phone.
++ */
++internal class StableArSpatialRuntime(
++    context: Context,
++    private val coordinator: AlignmentCoordinator,
++) {
++    private data class Binding(
++        val targetId: Long,
++        val attachmentId: Long,
++        val local: Boolean,
++        var owner: String,
++        var visionReady: Boolean = false,
++        var lastSharedPoint: FloatArray? = null,
++        var lastSharedMs: Long = 0L,
++    )
++
++    private data class PendingPromotion(
++        val targetId: Long,
++        val worldPoint: FloatArray,
++        val owner: String,
++    )
++
++    private data class RootResult(
++        val lifecycle: Long,
++        val targetId: Long,
++        val attachmentId: Long,
++        val added: Boolean,
++    )
++
++    private data class VisionResult(
++        val lifecycle: Long,
++        val context: ObservationContext,
++        val match: StableArVisionMatch?
