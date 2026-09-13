@@ -1,0 +1,108 @@
+              if (ml.beginFrame(frameId, gray, width, height)) {
++                    learnedAdded = ml.addRoot(id, pixel.x, pixel.y)
++                }
++                currentGray?.let { live ->
++                    if (currentFrameId != Long.MIN_VALUE && currentFrameId != frameId) {
++                        ml.beginFrame(currentFrameId, live, currentWidth, currentHeight)
++                    }
++                }
++            } catch (_: Throwable) {
++                disableLearned(ml)
++            }
++        }
++        if (learnedAdded || classical) ids += id
++        return learnedAdded || classical
++    }
++
++    fun track(id: Long, predicted: V2?, view: XFeatView = XFeatView()): StableArVisionMatch? {
++        if (predicted != null) {
++            val ml = xfeat
++            if (ml != null) {
++                try {
++                    ml.track(id, predicted.x, predicted.y, view)?.let { m ->
++                        val candidateView = view.copy(quality = m.meanReliability.coerceIn(0.0, 1.0))
++                        val token = ml.stageTemplate(id, m.x, m.y, candidateView)
++                        return StableArVisionMatch(
++                            ImageMatch(
++                                V2(m.x, m.y),
++                                m.inliers,
++                                // XFeat matcher quality remains in its fixed model raster.
++                                // sigmaPx below is the source-image uncertainty used by geometry.
++                                m.consensusPxAtModelScale,
++                                m.consensusPxAtModelScale,
++                                "XFEAT_LITERT",
++                                m.sigmaPx,
++                            ),
++                            token,
++                        )
++                    }
++                } catch (_: Throwable) {
++                    disableLearned(ml)
++                }
++            }
++        }
++        return fallback.track(id, predicted)?.let { StableArVisionMatch(it) }
++    }
++
++    /** Must execute on the same single vision worker that owns XFeatLiteRtTracker. */
++    fun resolveTemplate(id: Long, token: Long, accepted: Boolean) {
++        if (token <= 0) return
++        val ml = xfeat ?: return
++        try {
++            if (accepted) ml.commitStagedTemplate(id, token)
++            else ml.discardStagedTemplate(id, token)
++        } catch (_: Throwable) {
++            disableLearned(ml)
++        }
++    }
++
++    fun remove(id: Long) {
++        ids -= id
++        fallback.remove(id)
++        runCatching { xfeat?.remove(id) }
++    }
++
++    fun clear() {
++        ids.toList().forEach(::remove)
++        runCatching { xfeat?.clear() }
++    }
++
++    override fun close() {
++        clear()
++        runCatching { xfeat?.close() }
++        xfeat = null
++        fallback.close()
++    }
++
++    private fun disableLearned(ml: XFeatLiteRtTracker) {
++        runCatching { ml.close() }
++        if (xfeat === ml) xfeat = null
++    }
++}
+diff --git a/android/build.gradle.kts b/android/build.gradle.kts
+index 3e7d6f329963b2cbba9436d69c9025ee84b24952..ecef9ce1372cbb6b3781b56fe6673bb86cb8c637 100644
+--- a/android/build.gradle.kts
++++ b/android/build.gradle.kts
+@@ -1,4 +1,4 @@
+ plugins {
+     id("com.android.application") version "8.10.1" apply false
+-    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
++    id("org.jetbrains.kotlin.android") version "2.3.20" apply false
+ }
+diff --git a/sdk/STATUS.md b/sdk/STATUS.md
+index 9888431460752594edf8fb08c1ec571a7aad8759..5d961dc1711e2f316be983ed28afaf5c72b00543 100644
+--- a/sdk/STATUS.md
++++ b/sdk/STATUS.md
+@@ -151,3 +151,16 @@ Spatial phone-camera baseline is most useful close up; temporal device motion ca
+ 8. Add capability-aware physical multi-camera/temporal observations and repeat device validation before upgrading claims.
+ 
+ No synthetic test, CI run or upstream benchmark alone justifies physical accuracy, FPS or commercial-performance claims.
++
++## Spatial Sync Android host integration — 2026-09-13
++
++The `android/app` product now consumes the full Android StableAR stack from the included `sdk` build: `arcore`, `vision`, and `native-vision-android`. The product Kotlin plugin is aligned with the SDK toolchain so composite-build Kotlin metadata is compatible.
++
++The ownership boundary is deliberate:
++- shared-world `ALIGNING` still uses StableAR's pinned XFeat correspondence frontend while `AlignmentCoordinator` owns networking, host/peer readiness and the cross-device SE(3) solve;
++- local manual POIs create an exact-frame `ArCoreAdapter`/`AttachmentEngine` material attachment, prefer SDK depth/surface bootstrap, and fall back to the already-vetted host ARCore hit only as an initial camera-Z depth prior;
++- ongoing local material evidence uses the SDK reference p

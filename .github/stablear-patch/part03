@@ -1,0 +1,131 @@
+,
++    )
++
++    private data class VisionHint(
++        val predicted: V2?,
++        val view: XFeatView,
++    )
++
++    private val appContext = context.applicationContext
++    private val worker = Executors.newSingleThreadExecutor { runnable ->
++        Thread(runnable, "stablear-material-vision").apply { isDaemon = true }
++    }
++    private val frontend = StableArSurfaceFrontend(appContext)
++    private val busy = AtomicBoolean(false)
++    private val detachRequested = AtomicBoolean(false)
++    private val lifecycle = AtomicLong(1L)
++    private val rootResults = ConcurrentLinkedQueue<RootResult>()
++    private val visionResults = ConcurrentLinkedQueue<VisionResult>()
++
++    // GL-thread-owned state below.
++    private var ownerThreadId = Long.MIN_VALUE
++    private var boundSession: Session? = null
++    private var adapter: ArCoreAdapter? = null
++    private val bindings = LinkedHashMap<Long, Binding>()
++    private val attachmentToTarget = LinkedHashMap<Long, Long>()
++    private val pendingPromotions = LinkedHashMap<Long, PendingPromotion>()
++    private var lastVisionFrameNs = 0L
++    private var closed = false
++
++    fun bind(session: Session) {
++        owner()
++        if (closed) return
++        if (detachRequested.getAndSet(false) || boundSession !== session) {
++            releaseAdapterOnOwnerThread()
++            boundSession = session
++            adapter = ArCoreAdapter(session)
++        }
++    }
++
++    fun requestDetach() {
++        detachRequested.set(true)
++        lifecycle.incrementAndGet()
++    }
++
++    fun clearOnOwnerThread() {
++        owner()
++        if (closed) return
++        lifecycle.incrementAndGet()
++        bindings.clear()
++        attachmentToTarget.clear()
++        pendingPromotions.clear()
++        rootResults.clear()
++        visionResults.clear()
++        runCatching { adapter?.reset() }
++        worker.execute { runCatching { frontend.clear() } }
++    }
++
++    fun trackingLost() {
++        owner()
++        runCatching { adapter?.trackingLost() }
++    }
++
++    fun hasAttachment(targetId: Long): Boolean {
++        owner()
++        return bindings[targetId]?.visionReady == true
++    }
++
++    fun removeTarget(targetId: Long) {
++        owner()
++        pendingPromotions.remove(targetId)
++        val binding = bindings.remove(targetId) ?: return
++        attachmentToTarget.remove(binding.attachmentId)
++        runCatching { adapter?.remove(binding.attachmentId) }
++        worker.execute { runCatching { frontend.remove(binding.attachmentId) } }
++    }
++
++    /**
++     * Create the local manual target from the exact tap exposure. StableAR's own
++     * depth/surface fitter is preferred. If it cannot bootstrap, the already-vetted
++     * ARCore/metric world hit supplies only the initial camera-Z depth prior.
++     */
++    fun attachLocal(
++        targetId: Long,
++        frame: Frame,
++        camera: Camera,
++        imagePixel: FloatArray,
++        worldPoint: FloatArray,
++        ownerName: String,
++    ): Boolean {
++        owner()
++        if (closed || imagePixel.size < 2 || worldPoint.size < 3) return false
++        val sdk = adapter ?: return false
++        removeTarget(targetId)
++        val sample = sdk.capture(frame, copyGray = true) ?: return false
++        val pixel = V2(imagePixel[0].toDouble(), imagePixel[1].toDouble())
++        val placement = sdk.place(sample, pixel)
++            ?: placeWithWorldPrior(sdk, sample, camera, pixel, worldPoint)
++            ?: return false
++        val gray = sample.gray
++        if (gray == null) {
++            sdk.remove(placement.attachment.id)
++            return false
++        }
++        val binding = Binding(
++            targetId = targetId,
++            attachmentId = placement.attachment.id,
++            local = true,
++            owner = ownerName,
++            lastSharedPoint = worldPoint.copyOf(3),
++        )
++        bindings[targetId] = binding
++        attachmentToTarget[binding.attachmentId] = targetId
++        enqueueRoot(binding, gray.timestampNs, gray.bytes, gray.width, gray.height, pixel)
++        return true
++    }
++
++    /**
++     * A remote phone's image cannot become a local StableAR root because its ARCore
++     * pose belongs to another world. The old resolver is therefore retained only as
++     * a bootstrap proof. Once it verifies a local world point, queue promotion from
++     * the next exact local ARCore exposure.
++     */
++    fun promoteRemote(targetId: Long, worldPoint: FloatArray, ownerName: String) {
++        owner()
++        if (closed || worldPoint.size < 3 || bindings[targetId]?.visionReady == true) return
++        pendingPromotions[targetId] = PendingPromotion(targetId, worldPoint.copyOf(3), ownerName)
++    }
++
++    fun onFrame(frame: Frame, camera: Camera) {
++        owner()
++        if (c

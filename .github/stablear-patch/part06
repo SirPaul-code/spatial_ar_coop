@@ -1,0 +1,122 @@
+      sdk: ArCoreAdapter,
++        sample: CameraSample,
++        camera: Camera,
++        pixel: V2,
++        worldPoint: FloatArray,
++    ) = camera.worldFromCv().inverse().point(worldPoint.v3()).let { cameraPoint ->
++        if (cameraPoint.z !in MIN_STABLE_DEPTH_M..MAX_STABLE_DEPTH_M) null
++        else sdk.placeWithDepthPrior(sample, pixel, cameraPoint.z, HOST_DEPTH_PRIOR_SIGMA_M)
++    }
++
++    private fun releaseAdapterOnOwnerThread() {
++        owner()
++        lifecycle.incrementAndGet()
++        bindings.clear()
++        attachmentToTarget.clear()
++        pendingPromotions.clear()
++        rootResults.clear()
++        visionResults.clear()
++        runCatching { adapter?.close() }
++        adapter = null
++        boundSession = null
++        lastVisionFrameNs = 0L
++        worker.execute { runCatching { frontend.clear() } }
++    }
++
++    private fun owner() {
++        val current = Thread.currentThread().id
++        if (ownerThreadId == Long.MIN_VALUE) ownerThreadId = current
++        check(ownerThreadId == current) { "StableArSpatialRuntime must stay on the AR render thread" }
++    }
++
++    private fun FloatArray.v3() = V3(
++        getOrElse(0) { 0f }.toDouble(),
++        getOrElse(1) { 0f }.toDouble(),
++        getOrElse(2) { 0f }.toDouble(),
++    )
++
++    private fun distance(a: FloatArray, b: FloatArray): Float {
++        val dx = a.getOrElse(0) { 0f } - b.getOrElse(0) { 0f }
++        val dy = a.getOrElse(1) { 0f } - b.getOrElse(1) { 0f }
++        val dz = a.getOrElse(2) { 0f } - b.getOrElse(2) { 0f }
++        return sqrt(dx * dx + dy * dy + dz * dz)
++    }
++
++    companion object {
++        // Core currently supports material depth only in this bounded interval.
++        private const val MIN_STABLE_DEPTH_M = 0.15
++        private const val MAX_STABLE_DEPTH_M = 8.0
++        // Conditional host seed model, not a calibrated ARCore covariance claim.
++        private const val HOST_DEPTH_PRIOR_SIGMA_M = 0.03
++        private const val VISION_INTERVAL_NS = 120_000_000L
++        private const val RESHARE_MIN_M = 0.010f
++        private const val RESHARE_INTERVAL_MS = 500L
++    }
++}
+diff --git a/android/app/src/main/java/com/sirpaul/spatialnomap/StableArSurfaceFrontend.kt b/android/app/src/main/java/com/sirpaul/spatialnomap/StableArSurfaceFrontend.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..12acccd2894935ecf838f8cf90b6597d9eb8a97a
+--- /dev/null
++++ b/android/app/src/main/java/com/sirpaul/spatialnomap/StableArSurfaceFrontend.kt
+@@ -0,0 +1,141 @@
++package com.sirpaul.spatialnomap
++
++import android.content.Context
++import com.sirpaul.stablear.core.V2
++import com.sirpaul.stablear.nativevision.XFeatLiteRtTracker
++import com.sirpaul.stablear.nativevision.XFeatView
++import com.sirpaul.stablear.vision.ImageMatch
++import com.sirpaul.stablear.vision.LocalSurfaceTracker
++
++internal data class StableArVisionMatch(
++    val image: ImageMatch,
++    val templateCandidateToken: Long = 0L,
++)
++
++/**
++ * Product-facing material correspondence frontend. This intentionally mirrors the
++ * StableAR lab reference integration: pinned XFeat/LiteRT first, LK/ORB fallback,
++ * exact-frame root evidence, and staged descriptor admission only after the core
++ * geometry accepts held-out evidence.
++ */
++internal class StableArSurfaceFrontend(private val context: Context) : AutoCloseable {
++    private val fallback = LocalSurfaceTracker()
++    private val ids = linkedSetOf<Long>()
++    private var xfeatAttempted = false
++    private var xfeat: XFeatLiteRtTracker? = null
++    private var currentFrameId = Long.MIN_VALUE
++    private var currentGray: ByteArray? = null
++    private var currentWidth = 0
++    private var currentHeight = 0
++
++    private fun learned(): XFeatLiteRtTracker? {
++        if (!xfeatAttempted) {
++            xfeatAttempted = true
++            xfeat = XFeatLiteRtTracker.tryCreate(context, preferGpu = true)
++        }
++        return xfeat
++    }
++
++    fun beginFrame(id: Long, gray: ByteArray, width: Int, height: Int) {
++        fallback.beginFrame(id, gray, width, height)
++        currentFrameId = id
++        currentGray = gray
++        currentWidth = width
++        currentHeight = height
++        val ml = learned() ?: return
++        try {
++            if (!ml.beginFrame(id, gray, width, height)) disableLearned(ml)
++        } catch (_: Throwable) {
++            disableLearned(ml)
++        }
++    }
++
++    /** Capture immutable root evidence from the exact placement exposure. */
++    fun add(id: Long, frameId: Long, gray: ByteArray, width: Int, height: Int, pixel: V2): Boolean {
++        require(frameId > 0)
++        val classical = fallback.add(id, gray, width, height, pixel)
++        var learnedAdded = false
++        val ml = learned()
++        if (ml != null) {
++            try {
++  
