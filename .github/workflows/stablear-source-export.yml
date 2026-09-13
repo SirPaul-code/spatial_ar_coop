@@ -4,21 +4,31 @@ on:
     branches: [stablear/multiplatform-sdk]
     paths: ['.github/workflows/stablear-source-export.yml']
 permissions:
-  contents: read
+  contents: write
 jobs:
-  export:
+  apply:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/upload-artifact@v4
         with:
-          name: stablear-source-export-${{ github.sha }}
-          path: |
-            android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt
-            android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt
-            android/app/build.gradle.kts
-            android/build.gradle.kts
-            .github/workflows/stablear-multiplatform.yml
-            sdk/STATUS.md
-          if-no-files-found: error
-          retention-days: 1
+          fetch-depth: 0
+      - name: Apply verified StableAR integration patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/stablear-patch/part* > /tmp/stablear-integration.patch
+          echo '9fab94e35dcae4a5a565cd4cd4968afc3123abef3260fa2b519db4dae8897e48  /tmp/stablear-integration.patch' | sha256sum -c -
+          echo 'dd84b59762632f95ca6600a03a77caf78c08217817375b8c2a10f3cc5090e7d1  .github/stablear-product-artifact.patch' | sha256sum -c -
+          git apply --check /tmp/stablear-integration.patch
+          git apply /tmp/stablear-integration.patch
+          git apply --check .github/stablear-product-artifact.patch
+          git apply .github/stablear-product-artifact.patch
+          rm -rf .github/stablear-patch
+          rm -f .github/stablear-product-artifact.patch
+          rm -f .github/workflows/stablear-source-export.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'feat(spatial-sync): integrate full StableAR material tracking'
+          git push origin HEAD:stablear/multiplatform-sdk
