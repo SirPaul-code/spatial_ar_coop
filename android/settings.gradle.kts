@@ -4,5 +4,8 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "SpatialNoMap"
-include(":app", ":showme", ":stablear-native-vision-android")
-project(":stablear-native-vision-android").projectDir = file("../sdk/native-vision-android")
+include(":app", ":showme")
+
+// Consume StableAR as an independent composite build so the SDK keeps its own
+// Kotlin/AGP toolchain and product modules do not duplicate SDK source or plugin state.
+includeBuild("../sdk")

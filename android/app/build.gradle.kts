@@ -105,9 +105,10 @@ dependencies {
     implementation("org.opencv:opencv:4.12.0")
     implementation("com.google.mediapipe:tasks-vision:0.10.35")
 
-    // Shared-world ALIGNING consumes StableAR's pinned XFeat/LiteRT frontend directly.
-    // The host app still owns cross-device geometry, depth validation and peer confirmation.
-    implementation(project(":stablear-native-vision-android"))
+    // Composite-build dependency on the real StableAR Android learned-vision module.
+    // This keeps SDK and product toolchains isolated while ALIGNING consumes the
+    // exact pinned XFeat/LiteRT implementation from sdk/native-vision-android.
+    implementation("com.sirpaul.stablear:native-vision-android:0.2.0-research")
 
     testImplementation("junit:junit:4.13.2")
 }
