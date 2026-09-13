@@ -1,10 +1,12 @@
 package com.sirpaul.spatialnomap
 
 import android.app.Application
+import android.content.Context
 
 class SpatialSyncApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        appContext = applicationContext
         sensorFusion = SpatialSensorFusion(this).also { it.start() }
         performanceGovernor = RuntimePerformanceGovernor(this)
         AlignmentSessionRecorder.init(this)
@@ -14,9 +16,11 @@ class SpatialSyncApplication : Application() {
     }
 
     companion object {
+        @Volatile private var appContext: Context? = null
         @Volatile private var sensorFusion: SpatialSensorFusion? = null
         @Volatile private var performanceGovernor: RuntimePerformanceGovernor? = null
 
+        fun applicationContext(): Context? = appContext
         fun sensorSnapshot(): SensorSnapshot = sensorFusion?.snapshot() ?: SensorSnapshot()
         fun sensorSummary(): String = sensorFusion?.summary() ?: "sensors —"
 

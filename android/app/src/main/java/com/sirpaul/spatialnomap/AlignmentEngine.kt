@@ -55,10 +55,15 @@ object AlignmentEngine {
     )
 
     fun solve(remote: CapturedFrame, local: CapturedFrame): Result? {
-        val matchSet = siftMatches(remote, local) ?: return null
+        // Shared-world registration now consumes the same pinned StableAR XFeat/LiteRT frontend
+        // used by the SDK. XFeat is evidence only: all essential/PnP/3D-3D, metric-depth,
+        // gravity/range and peer-confirmation gates below remain authoritative. If learned
+        // inference is unavailable or ambiguous, the previous SIFT path is retained as a
+        // deterministic fail-open frontend fallback rather than wedging ALIGNING.
+        val matchSet = learnedMatches(remote, local) ?: siftMatches(remote, local) ?: return null
         if (matchSet.matches.size < MIN_MATCHES_FOR_PNP) return null
 
-        // Fast path that does NOT require dense depth at every SIFT feature. The
+        // Fast path that does NOT require dense depth at every visual feature. The
         // essential matrix obtains relative rotation + translation direction from
         // all visual matches; only a couple of metric correspondences are needed to
         // recover translation scale. This is much easier to acquire than PnP when
@@ -284,7 +289,7 @@ object AlignmentEngine {
         val median = if (errors.isNotEmpty()) errors[errors.size / 2] else 999.0
         val coverage = imageCoverage(inImg, local.intrinsics.width, local.intrinsics.height)
 
-        // Crucial symmetric check: PnP can fit a wrong transform when a SIFT feature
+        // Crucial symmetric check: PnP can fit a wrong transform when a visual feature
         // is accidentally associated with depth from another surface. If the local
         // phone also has metric depth at the matched feature, the transformed remote
         // 3D point must land near that independently measured local 3D point.
@@ -500,10 +505,28 @@ object AlignmentEngine {
         return if (best >= 0 && bestD2 <= gate2) best else -1
     }
 
+    /** Convert the SDK's learned correspondences to the legacy MatchSet contract so every existing
+     * geometric and metric safety gate below remains unchanged. */
+    private fun learnedMatches(remote: CapturedFrame, local: CapturedFrame): MatchSet? {
+        val learned = StableArAlignmentFrontend.match(remote, local) ?: return null
+        if (learned.size < MIN_MATCHES_FOR_PNP) return null
+        val remoteKeys = Array(learned.size) { i ->
+            val m = learned[i]
+            KeyPoint(m.remoteX.toFloat(), m.remoteY.toFloat(), 8f)
+        }
+        val localKeys = Array(learned.size) { i ->
+            val m = learned[i]
+            KeyPoint(m.localX.toFloat(), m.localY.toFloat(), 8f)
+        }
+        val matches = learned.mapIndexed { index, m ->
+            DMatch(index, index, (1.0 - m.cosine).coerceAtLeast(0.0).toFloat())
+        }
+        return MatchSet(matches, remoteKeys, localKeys)
+    }
+
     /**
-     * High feature count is intentional. Wi-Fi Aware bandwidth is cheaper than a
-     * false shared-world lock, and RANSAC plus symmetric depth validation reject
-     * the extra outliers.
+     * Conservative classical fallback. StableAR/XFeat is attempted first; this remains because
+     * accelerator/model/runtime failure must not make shared-world registration unavailable.
      */
     private fun siftMatches(remote: CapturedFrame, local: CapturedFrame): MatchSet? {
         val a = decodeGray(remote) ?: return null

@@ -4,6 +4,7 @@ import android.content.Context
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.TensorBuffer
+import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -53,6 +54,22 @@ data class XFeatImageMatch(
 )
 
 /**
+ * Sparse frame feature exported from the same pinned XFeat inference used by the material tracker.
+ * Coordinates are in the source CPU-image raster, descriptors are L2-normalized 64-D vectors.
+ *
+ * This is intentionally only a correspondence frontend. It carries no world pose and cannot move a
+ * StableAR attachment by itself. Host integrations such as two-phone shared-world registration may
+ * consume these features and must still perform their own geometric/metric validation.
+ */
+data class XFeatSparseFeature(
+    val x: Double,
+    val y: Double,
+    val detectorScore: Double,
+    val reliability: Double,
+    val descriptor: FloatArray,
+)
+
+/**
  * Prototype Android learned-correspondence backend.
  *
  * One instance belongs to one bounded vision worker thread. The LiteRT model and tensor buffers are
@@ -64,8 +81,13 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
     companion object {
         const val INPUT_WIDTH = 640
         const val INPUT_HEIGHT = 480
-        private const val DESCRIPTOR_ELEMENTS = 64 * 60 * 80
-        private const val RELIABILITY_ELEMENTS = 60 * 80
+        private const val FEATURE_WIDTH = 80
+        private const val FEATURE_HEIGHT = 60
+        private const val DESCRIPTOR_CHANNELS = 64
+        private const val DETECTOR_CHANNELS = 65
+        private const val DESCRIPTOR_ELEMENTS = DESCRIPTOR_CHANNELS * FEATURE_HEIGHT * FEATURE_WIDTH
+        private const val KEYPOINT_LOGIT_ELEMENTS = DETECTOR_CHANNELS * FEATURE_HEIGHT * FEATURE_WIDTH
+        private const val RELIABILITY_ELEMENTS = FEATURE_HEIGHT * FEATURE_WIDTH
 
         fun tryCreate(context: Context, preferGpu: Boolean = true): XFeatLiteRtTracker? {
             val app = context.applicationContext
@@ -86,6 +108,7 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
     private val input = FloatArray(INPUT_WIDTH * INPUT_HEIGHT)
     private var handle = NativeXFeat.create().also { check(it != 0L) }
     private var descriptors = FloatArray(0)
+    private var keypointLogits = FloatArray(0)
     private var reliability = FloatArray(0)
     private var sourceWidth = 0
     private var sourceHeight = 0
@@ -108,8 +131,10 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         inputs[0].writeFloat(input)
         model.run(inputs, outputs)
         descriptors = outputs[0].readFloat()
+        keypointLogits = outputs[1].readFloat()
         reliability = outputs[2].readFloat()
         check(descriptors.size == DESCRIPTOR_ELEMENTS) { "Unexpected XFeat descriptor count ${descriptors.size}" }
+        check(keypointLogits.size == KEYPOINT_LOGIT_ELEMENTS) { "Unexpected XFeat keypoint-logit count ${keypointLogits.size}" }
         check(reliability.size == RELIABILITY_ELEMENTS) { "Unexpected XFeat reliability count ${reliability.size}" }
         val accepted = NativeXFeat.beginFrame(handle, frameId, descriptors, reliability)
         if (accepted) {
@@ -185,10 +210,146 @@ class XFeatLiteRtTracker private constructor(context: Context, accelerator: Acce
         )
     }
 
+    /**
+     * Export a bounded, detector-backed sparse feature set from the current XFeat frame.
+     *
+     * The 65-channel detector tensor is interpreted as 64 sub-cell logits plus the dustbin channel
+     * per 8x8 feature cell. One best non-dustbin candidate is considered per cell, then candidates
+     * are ranked by detector probability * reliability. Descriptor sampling follows the same
+     * grid-sample coordinate convention as the native StableAR matcher.
+     *
+     * The returned list is detached from mutable LiteRT output buffers and remains valid after the
+     * next beginFrame(). This is deliberately bounded because shared-world registration only needs a
+     * few hundred high-quality correspondences, not the complete dense map.
+     */
+    fun sparseFeatures(
+        maxFeatures: Int = 384,
+        minDetectorProbability: Double = 0.015,
+        minReliability: Double = 0.05,
+        borderPx: Double = 12.0,
+    ): List<XFeatSparseFeature> {
+        require(maxFeatures in 1..2048)
+        requireCurrentMap()
+        check(keypointLogits.size == KEYPOINT_LOGIT_ELEMENTS)
+
+        data class Candidate(
+            val modelX: Double,
+            val modelY: Double,
+            val detectorScore: Double,
+            val reliability: Double,
+            val combined: Double,
+        )
+
+        val candidates = ArrayList<Candidate>(FEATURE_WIDTH * FEATURE_HEIGHT)
+        val modelBorderX = borderPx * INPUT_WIDTH / sourceWidth
+        val modelBorderY = borderPx * INPUT_HEIGHT / sourceHeight
+        for (gy in 0 until FEATURE_HEIGHT) {
+            for (gx in 0 until FEATURE_WIDTH) {
+                var maxLogit = Double.NEGATIVE_INFINITY
+                var bestChannel = -1
+                var bestNonDustbinLogit = Double.NEGATIVE_INFINITY
+                for (channel in 0 until DETECTOR_CHANNELS) {
+                    val value = keypointLogits[((channel * FEATURE_HEIGHT + gy) * FEATURE_WIDTH + gx)].toDouble()
+                    if (!value.isFinite()) continue
+                    if (value > maxLogit) {
+                        maxLogit = value
+                        bestChannel = channel
+                    }
+                    if (channel < 64 && value > bestNonDustbinLogit) bestNonDustbinLogit = value
+                }
+                if (bestChannel !in 0 until 64 || !maxLogit.isFinite() || !bestNonDustbinLogit.isFinite()) continue
+
+                var denominator = 0.0
+                for (channel in 0 until DETECTOR_CHANNELS) {
+                    val value = keypointLogits[((channel * FEATURE_HEIGHT + gy) * FEATURE_WIDTH + gx)].toDouble()
+                    if (value.isFinite()) denominator += exp((value - maxLogit).coerceIn(-80.0, 0.0))
+                }
+                if (denominator <= 0.0 || !denominator.isFinite()) continue
+                val detectorProbability = exp((bestNonDustbinLogit - maxLogit).coerceIn(-80.0, 0.0)) / denominator
+                if (detectorProbability < minDetectorProbability) continue
+
+                val ox = bestChannel and 7
+                val oy = bestChannel ushr 3
+                val modelX = gx * 8.0 + ox + 0.5
+                val modelY = gy * 8.0 + oy + 0.5
+                if (modelX < modelBorderX || modelY < modelBorderY ||
+                    modelX >= INPUT_WIDTH - modelBorderX || modelY >= INPUT_HEIGHT - modelBorderY
+                ) continue
+
+                val rel = sampleReliability(modelX, modelY)
+                if (!rel.isFinite() || rel < minReliability) continue
+                candidates += Candidate(modelX, modelY, detectorProbability, rel, detectorProbability * rel)
+            }
+        }
+
+        candidates.sortByDescending { it.combined }
+        val out = ArrayList<XFeatSparseFeature>(min(maxFeatures, candidates.size))
+        for (candidate in candidates) {
+            if (out.size >= maxFeatures) break
+            val descriptor = sampleDescriptor(candidate.modelX, candidate.modelY) ?: continue
+            val source = modelToSource(candidate.modelX, candidate.modelY)
+            if (!source.first.isFinite() || !source.second.isFinite()) continue
+            out += XFeatSparseFeature(
+                x = source.first,
+                y = source.second,
+                detectorScore = candidate.detectorScore,
+                reliability = candidate.reliability,
+                descriptor = descriptor,
+            )
+        }
+        return out
+    }
+
+    private fun sampleDescriptor(modelX: Double, modelY: Double): FloatArray? {
+        val feature = modelToFeature(modelX, modelY)
+        val x0 = floor(feature.first).toInt().coerceIn(0, FEATURE_WIDTH - 1)
+        val y0 = floor(feature.second).toInt().coerceIn(0, FEATURE_HEIGHT - 1)
+        val x1 = (x0 + 1).coerceAtMost(FEATURE_WIDTH - 1)
+        val y1 = (y0 + 1).coerceAtMost(FEATURE_HEIGHT - 1)
+        val tx = (feature.first - floor(feature.first)).coerceIn(0.0, 1.0)
+        val ty = (feature.second - floor(feature.second)).coerceIn(0.0, 1.0)
+        val out = FloatArray(DESCRIPTOR_CHANNELS)
+        var norm2 = 0.0
+        for (channel in 0 until DESCRIPTOR_CHANNELS) {
+            fun at(x: Int, y: Int): Double =
+                descriptors[((channel * FEATURE_HEIGHT + y) * FEATURE_WIDTH + x)].toDouble()
+            val top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx
+            val bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx
+            val value = top * (1.0 - ty) + bottom * ty
+            if (!value.isFinite()) return null
+            out[channel] = value.toFloat()
+            norm2 += value * value
+        }
+        if (!norm2.isFinite() || norm2 <= 1e-12) return null
+        val inv = 1.0 / sqrt(norm2)
+        for (i in out.indices) out[i] = (out[i] * inv).toFloat()
+        return out
+    }
+
+    private fun sampleReliability(modelX: Double, modelY: Double): Double {
+        val feature = modelToFeature(modelX, modelY)
+        val x0 = floor(feature.first).toInt().coerceIn(0, FEATURE_WIDTH - 1)
+        val y0 = floor(feature.second).toInt().coerceIn(0, FEATURE_HEIGHT - 1)
+        val x1 = (x0 + 1).coerceAtMost(FEATURE_WIDTH - 1)
+        val y1 = (y0 + 1).coerceAtMost(FEATURE_HEIGHT - 1)
+        val tx = (feature.first - floor(feature.first)).coerceIn(0.0, 1.0)
+        val ty = (feature.second - floor(feature.second)).coerceIn(0.0, 1.0)
+        fun at(x: Int, y: Int) = reliability[y * FEATURE_WIDTH + x].toDouble()
+        val top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx
+        val bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx
+        return top * (1.0 - ty) + bottom * ty
+    }
+
+    private fun modelToFeature(modelX: Double, modelY: Double): Pair<Double, Double> = Pair(
+        modelX * FEATURE_WIDTH / (INPUT_WIDTH - 1.0) - 0.5,
+        modelY * FEATURE_HEIGHT / (INPUT_HEIGHT - 1.0) - 0.5,
+    )
+
     fun remove(id: Long) { require(id > 0); NativeXFeat.remove(h(), id) }
     fun clear() {
         NativeXFeat.clear(h())
         descriptors = FloatArray(0)
+        keypointLogits = FloatArray(0)
         reliability = FloatArray(0)
         sourceWidth = 0
         sourceHeight = 0

@@ -2,7 +2,15 @@ name: stablear-multiplatform
 on:
   push:
     branches: [stablear/multiplatform-sdk]
-    paths: ['sdk/**', '.github/workflows/stablear-multiplatform.yml']
+    paths:
+      - 'sdk/**'
+      - 'android/build.gradle.kts'
+      - 'android/settings.gradle.kts'
+      - 'android/app/build.gradle.kts'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/AlignmentEngine.kt'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/StableArAlignmentFrontend.kt'
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/SpatialSyncApplication.kt'
+      - '.github/workflows/stablear-multiplatform.yml'
   workflow_dispatch:
 permissions:
   contents: write
@@ -22,12 +30,15 @@ jobs:
       - name: Branch and product isolation
         shell: bash
         run: |
+          set -euo pipefail
           test "$GITHUB_REF" = refs/heads/stablear/multiplatform-sdk
           git diff --name-only "$BASE_SHA" HEAD | tee changed.txt
-          if grep -Ev '^(sdk/|\.github/workflows/stablear-multiplatform\.yml$)' changed.txt; then
-            echo 'Multiplatform SDK branch modified protected product paths' >&2; exit 1
+          ALLOWED='^(sdk/|\.github/workflows/stablear-multiplatform\.yml$|android/build\.gradle\.kts$|android/settings\.gradle\.kts$|android/app/build\.gradle\.kts$|android/app/src/main/java/com/sirpaul/spatialnomap/(AlignmentEngine|StableArAlignmentFrontend|SpatialSyncApplication)\.kt$)'
+          if grep -Ev "$ALLOWED" changed.txt; then
+            echo 'Multiplatform SDK branch modified a path outside the explicit StableAR host-integration allowlist' >&2
+            exit 1
           fi
-          git diff --exit-code "$BASE_SHA" HEAD -- android showme server README.md AGENTS.md .github/workflows/ci.yml .github/workflows/showme-ci.yml
+          git diff --exit-code "$BASE_SHA" HEAD -- showme server README.md AGENTS.md .github/workflows/ci.yml .github/workflows/showme-ci.yml
 
   native-linux:
     needs: scope
@@ -117,6 +128,14 @@ jobs:
         run: |
           set -o pipefail
           gradle -p sdk --no-daemon --stacktrace :core:check :arcore:assembleRelease :vision:assembleRelease :demo:assembleDebug 2>&1 | tee android-reference-build.log
+      - name: Build SpatialNoMap StableAR alignment integration
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle -p android --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug 2>&1 | tee spatialnomap-stablear-integration-build.log
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | tee spatialnomap-apk.txt
+          grep -q 'assets/models/xfeat.tflite' spatialnomap-apk.txt
       - name: Inspect native AARs
         run: |
           unzip -l sdk/native-android/build/outputs/aar/native-android-release.aar | tee native-android-aar.txt
@@ -158,6 +177,8 @@ jobs:
           name: stablear-android-diagnostics-${{ github.sha }}
           path: |
             *android-build.log
+            spatialnomap-stablear-integration-build.log
+            spatialnomap-apk.txt
             sdk/native-android/build/reports/
             sdk/native-vision-android/build/reports/
             sdk/native-android/.cxx/
