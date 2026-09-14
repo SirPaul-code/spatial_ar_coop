@@ -285,7 +285,7 @@ s = s.replace("      - '.github/workflows/spatial-stablear-release.yml'",
       - 'android/app/src/main/java/com/sirpaul/spatialnomap/BirdEyeWorldView.kt'
       - 'android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt'
       - 'android/app/src/main/java/com/sirpaul/spatialnomap/VehicleTrackPolicy.kt'
-      - 'android/app/src/main/java/com/sirpaul/spatialnomap/TargetOverlayView.kt' ''', 1)
+      - 'android/app/src/main/java/com/sirpaul/spatialnomap/TargetOverlayView.kt''', 1)
 save(p, s)
 
 checkpoint = Path('sdk/checkpoints/SPATIAL_SYNC_CLIENTS_VEHICLES_2026-09-14.md')
