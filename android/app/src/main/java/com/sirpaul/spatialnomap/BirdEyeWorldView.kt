@@ -15,7 +15,9 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import java.util.ArrayDeque
 import java.util.LinkedHashMap
@@ -288,24 +290,45 @@ class BirdEyeWorldView(context: Context) : View(context) {
     }
 
     private fun drawActors(canvas: Canvas, snapshot: WorldVizBus.Snapshot, center: FloatArray) {
-        snapshot.actors.forEach { actor ->
+        snapshot.actors.filter { it.local || ClientTrackingOverlayState.enabled }.forEach { actor ->
             val s = project(actor.position, center)
             val paint = if (actor.local) localPaint else peerPaint
             val heading = yawFromQuaternion(actor.quaternion) - yaw
-            val size = 18f
-            val path = Path().apply {
-                moveTo(s.x + sin(heading) * size, s.y - cos(heading) * size)
-                lineTo(s.x + sin(heading + 2.45f) * size * 0.78f, s.y - cos(heading + 2.45f) * size * 0.78f)
-                lineTo(s.x + sin(heading - 2.45f) * size * 0.78f, s.y - cos(heading - 2.45f) * size * 0.78f)
-                close()
+            if (actor.local) {
+                val size = 18f
+                val path = Path().apply {
+                    moveTo(s.x + sin(heading) * size, s.y - cos(heading) * size)
+                    lineTo(s.x + sin(heading + 2.45f) * size * 0.78f, s.y - cos(heading + 2.45f) * size * 0.78f)
+                    lineTo(s.x + sin(heading - 2.45f) * size * 0.78f, s.y - cos(heading - 2.45f) * size * 0.78f)
+                    close()
+                }
+                canvas.drawPath(path, paint)
+                canvas.drawCircle(s.x, s.y, 26f, Paint(paint).apply {
+                    style = Paint.Style.STROKE
+                    strokeWidth = 2.5f
+                    alpha = 130
+                })
+            } else {
+                val fx = sin(heading)
+                val fy = -cos(heading)
+                val rx = cos(heading)
+                val ry = sin(heading)
+                val halfLength = 27f
+                val halfWidth = 14f
+                val phone = Path().apply {
+                    moveTo(s.x + fx * halfLength + rx * halfWidth, s.y + fy * halfLength + ry * halfWidth)
+                    lineTo(s.x + fx * halfLength - rx * halfWidth, s.y + fy * halfLength - ry * halfWidth)
+                    lineTo(s.x - fx * halfLength - rx * halfWidth, s.y - fy * halfLength - ry * halfWidth)
+                    lineTo(s.x - fx * halfLength + rx * halfWidth, s.y - fy * halfLength + ry * halfWidth)
+                    close()
+                }
+                canvas.drawPath(phone, Paint(paint).apply {
+                    style = Paint.Style.STROKE
+                    strokeWidth = 4f
+                })
+                canvas.drawCircle(s.x + fx * 17f, s.y + fy * 17f, 4f, paint)
             }
-            canvas.drawPath(path, paint)
-            canvas.drawCircle(s.x, s.y, 26f, Paint(paint).apply {
-                style = Paint.Style.STROKE
-                strokeWidth = 2.5f
-                alpha = 130
-            })
-            canvas.drawText(if (actor.local) "YOU" else actor.label, s.x + 32f, s.y + 7f, labelPaint)
+            canvas.drawText(if (actor.local) "YOU" else "CLIENT • ${actor.label}", s.x + 34f, s.y + 7f, labelPaint)
         }
     }
 
@@ -378,6 +401,11 @@ class BirdEyeWorldView(context: Context) : View(context) {
     }
 }
 
+/** Shared toggle consumed by the AR overlay and bird-eye renderer. */
+object ClientTrackingOverlayState {
+    @Volatile var enabled: Boolean = true
+}
+
 /** Installs the WORLD presentation view without coupling it to MainActivity internals. */
 object BirdEyeWorldController {
     private const val TAG_BUTTON = "spatial-world-button"
@@ -448,6 +476,27 @@ object BirdEyeWorldController {
 
         content.addView(shell, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
+        val controls = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            elevation = dp(20).toFloat()
+        }
+        val clients = TextView(activity).apply {
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            textSize = 11.5f
+            setTypeface(typeface, Typeface.BOLD)
+            setBackgroundColor(0xdd16241f.toInt())
+            fun render() {
+                text = if (ClientTrackingOverlayState.enabled) "CLIENTS ON" else "CLIENTS OFF"
+                alpha = if (ClientTrackingOverlayState.enabled) 1f else 0.62f
+            }
+            render()
+            setOnClickListener {
+                ClientTrackingOverlayState.enabled = !ClientTrackingOverlayState.enabled
+                render()
+            }
+        }
         val button = TextView(activity).apply {
             tag = TAG_BUTTON
             text = "WORLD"
@@ -456,15 +505,27 @@ object BirdEyeWorldController {
             textSize = 13f
             setTypeface(typeface, Typeface.BOLD)
             setBackgroundColor(0xdd16241f.toInt())
-            elevation = dp(20).toFloat()
             setOnClickListener {
                 world.setAutoOrbit(true)
                 shell.visibility = View.VISIBLE
                 shell.bringToFront()
             }
         }
-        content.addView(button, FrameLayout.LayoutParams(dp(96), dp(48), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = dp(14)
-        })
+        controls.addView(clients, LinearLayout.LayoutParams(dp(112), dp(48)).apply { rightMargin = dp(8) })
+        controls.addView(button, LinearLayout.LayoutParams(dp(96), dp(48)))
+        val controlsLayout = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            dp(48),
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+        ).apply { bottomMargin = dp(14) }
+        content.addView(controls, controlsLayout)
+        controls.setOnApplyWindowInsetsListener { view, insets ->
+            val safe = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            val lp = view.layoutParams as FrameLayout.LayoutParams
+            lp.bottomMargin = safe.bottom + dp(14)
+            view.layoutParams = lp
+            insets
+        }
+        controls.requestApplyInsets()
     }
 }

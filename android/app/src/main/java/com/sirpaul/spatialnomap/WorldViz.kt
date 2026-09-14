@@ -46,6 +46,8 @@ object WorldVizBus {
 
     private var latestLocalFrame: CapturedFrame? = null
     private var latestRemoteFrame: CapturedFrame? = null
+    private var latestLocalFrameSeenMs = 0L
+    private var latestRemoteFrameSeenMs = 0L
     private var localFromPeer: DoubleArray? = null
     private var localName = "YOU"
     private var peerName = "PEER"
@@ -67,8 +69,13 @@ object WorldVizBus {
                 )
             }
             is WireMessage.Frame -> {
-                if (direction == Direction.OUT) latestLocalFrame = message.frame
-                else latestRemoteFrame = message.frame
+                if (direction == Direction.OUT) {
+                    latestLocalFrame = message.frame
+                    latestLocalFrameSeenMs = now
+                } else {
+                    latestRemoteFrame = message.frame
+                    latestRemoteFrameSeenMs = now
+                }
             }
             is WireMessage.Poi -> {
                 val dynamic = message.owner.startsWith(AUTO_CAR_PREFIX)
@@ -119,6 +126,8 @@ object WorldVizBus {
                 localFromPeer = null
                 latestLocalFrame = null
                 latestRemoteFrame = null
+                latestLocalFrameSeenMs = 0L
+                latestRemoteFrameSeenMs = 0L
                 localTargets.clear()
                 remoteTargets.clear()
                 SpatialMapAccumulator.clear()
@@ -150,18 +159,18 @@ object WorldVizBus {
         }
 
         val actors = ArrayList<VizActor>(2)
-        latestLocalFrame?.let { frame ->
+        latestLocalFrame?.takeIf { now - latestLocalFrameSeenMs <= CLIENT_POSE_TTL_MS }?.let { frame ->
             actors += VizActor(
                 id = "local",
                 label = localName.ifBlank { "YOU" },
                 position = frame.pose.t.copyOf(3),
                 quaternion = frame.pose.q.copyOf(4),
                 local = true,
-                lastSeenMs = now,
+                lastSeenMs = latestLocalFrameSeenMs,
             )
         }
         if (transform != null) {
-            latestRemoteFrame?.let { frame ->
+            latestRemoteFrame?.takeIf { now - latestRemoteFrameSeenMs <= CLIENT_POSE_TTL_MS }?.let { frame ->
                 val mappedPosition = transformPoint(transform, frame.pose.t)
                 val mappedQuaternion = transformQuaternion(transform, frame.pose.q)
                 if (mappedPosition != null && mappedQuaternion != null) {
@@ -171,17 +180,25 @@ object WorldVizBus {
                         position = mappedPosition,
                         quaternion = mappedQuaternion,
                         local = false,
-                        lastSeenMs = now,
+                        lastSeenMs = latestRemoteFrameSeenMs,
                     )
                 }
+            }
+        }
+
+        val mergedTargets = LinkedHashMap<Long, VizTarget>()
+        remoteTargets.values.forEach { target -> mergedTargets[target.id] = target.copy(position = target.position.copyOf()) }
+        localTargets.values.forEach { target ->
+            val previous = mergedTargets[target.id]
+            if (previous == null || target.lastSeenMs >= previous.lastSeenMs) {
+                mergedTargets[target.id] = target.copy(position = target.position.copyOf())
             }
         }
 
         return Snapshot(
             points = points,
             actors = actors,
-            targets = localTargets.values.map { it.copy(position = it.position.copyOf()) } +
-                remoteTargets.values.map { it.copy(position = it.position.copyOf()) },
+            targets = mergedTargets.values.toList(),
             locked = localReady && peerReady && localFromPeer != null,
             burstProgress = AcquisitionBurstController.currentProgress(),
             recorderPath = AlignmentSessionRecorder.latestSessionPath(),
@@ -298,4 +315,5 @@ object WorldVizBus {
     }
 
     private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
+    private const val CLIENT_POSE_TTL_MS = 3_000L
 }

@@ -25,8 +25,10 @@ import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 class ArRenderer(
@@ -742,11 +744,28 @@ class ArRenderer(
                 )
             }
             if (remoteReservation != null) {
+                val sharedId = remoteReservation.first
                 synchronized(targetLock) {
                     detectorTrackToSharedId.remove(vehicle.trackId)?.let { staleId ->
-                        localVehicles.remove(staleId)
+                        if (staleId != sharedId) localVehicles.remove(staleId)
+                    }
+                    remoteVehicles[sharedId]?.let { shared ->
+                        val predicted = VehicleTrackPolicy.predict(
+                            shared.point, shared.velocity, shared.lastSeenMs, now, VEHICLE_COAST_MS,
+                        )
+                        shared.point = smoothPoint(predicted, vehicle.pointWorld, LOCAL_POSITION_ALPHA)
+                        shared.velocity = smoothPoint(shared.velocity, vehicle.velocityWorld, LOCAL_VELOCITY_ALPHA)
+                        limitVelocity(shared.velocity, MAX_VEHICLE_SPEED_MPS)
+                        shared.worldBox = (vehicle.worldBox ?: shared.worldBox
+                            ?: defaultVehicleBox(shared.point, shared.velocity, vehicle.label))
+                            .let { moveBoxCenter(it, shared.point, shared.velocity) }
+                        shared.confidence = max(shared.confidence, vehicle.confidence)
+                        shared.lastSeenMs = now
+                        detectorTrackToSharedId[vehicle.trackId] = sharedId
                     }
                 }
+                matched += sharedId
+                coordinator.sendPoi(sharedId, vehicle.pointWorld, "$AUTO_CAR_PREFIX$owner")
                 continue
             }
 
@@ -835,6 +854,13 @@ class ArRenderer(
         camera.getViewMatrix(view, 0)
         camera.getProjectionMatrix(projection, 0, 0.05f, 500f)
         val now = System.currentTimeMillis()
+        val peerActors = if (ClientTrackingOverlayState.enabled) {
+            WorldVizBus.snapshot().actors.filter { actor ->
+                !actor.local && now - actor.lastSeenMs <= CLIENT_POSE_TTL_MS
+            }
+        } else {
+            emptyList()
+        }
 
         val localSnapshot: List<Pair<Long, LocalTarget>>
         val remoteSnapshot: List<Pair<Long, RemoteTarget>>
@@ -848,8 +874,11 @@ class ArRenderer(
         }
 
         val projected = ArrayList<TargetOverlayView.Target>(
-            localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size,
+            localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size + peerActors.size,
         )
+        peerActors.forEach { actor ->
+            projectClientActor(camera, actor, view, projection)?.let { projected += it }
+        }
         for ((id, target) in localSnapshot) {
             projectAnchor(
                 camera, target.anchor, id, "YOU • ${shortTargetId(id)}",
@@ -880,6 +909,40 @@ class ArRenderer(
             )?.let { projected += it }
         }
         overlay.setTargets(projected)
+    }
+
+    private fun projectClientActor(
+        camera: Camera,
+        actor: WorldVizBus.VizActor,
+        view: FloatArray,
+        projection: FloatArray,
+    ): TargetOverlayView.Target? {
+        if (actor.position.size < 3 || actor.quaternion.size < 4) return null
+        val q = actor.quaternion
+        val yaw = atan2(
+            2f * (q[3] * q[1] + q[0] * q[2]),
+            1f - 2f * (q[1] * q[1] + q[2] * q[2]),
+        )
+        val forward = floatArrayOf(sin(yaw), 0f, -cos(yaw))
+        val phoneBox = VehicleDetector.WorldBox(
+            centerWorld = actor.position.copyOf(3),
+            forwardWorld = forward,
+            halfLengthM = 0.008f,
+            halfWidthM = 0.040f,
+            halfHeightM = 0.085f,
+        )
+        val id = CLIENT_TARGET_ID_BASE xor actor.id.hashCode().toLong()
+        return projectPoint(
+            camera = camera,
+            point = actor.position,
+            id = id,
+            label = "CLIENT • ${actor.label}",
+            confidence = 1f,
+            isLocal = false,
+            view = view,
+            projection = projection,
+            worldBox = phoneBox,
+        )
     }
 
     private fun projectDynamicTarget(
@@ -1164,7 +1227,9 @@ class ArRenderer(
         private const val CROSS_DEVICE_MAX_GATE_M = 5.2f
         private const val VEHICLE_OWNERSHIP_LEASE_MS = 2_800L
         private const val VEHICLE_COAST_MS = 2_600L
-        private const val VEHICLE_MEMORY_TTL_MS = 6_500L
+        private const val VEHICLE_MEMORY_TTL_MS = 4_000L
+        private const val CLIENT_POSE_TTL_MS = 3_000L
+        private const val CLIENT_TARGET_ID_BASE = Long.MIN_VALUE + 0x434C4945L
         private const val LOCAL_POSITION_ALPHA = 0.62f
         private const val LOCAL_VELOCITY_ALPHA = 0.60f
         private const val REMOTE_POSITION_ALPHA = 0.72f
