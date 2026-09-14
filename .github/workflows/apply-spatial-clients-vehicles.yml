@@ -43,8 +43,11 @@ jobs:
           gradle -p android --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
           test -f android/app/build/outputs/apk/debug/app-debug.apk
           unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep -q 'assets/models/xfeat.tflite'
+          cp android/app/build/outputs/apk/debug/app-debug.apk SpatialAR-StableAR-latest.apk
+          sha256sum SpatialAR-StableAR-latest.apk | tee SPATIAL-STABLEAR-SHA256SUMS.txt
 
       - name: Commit verified feature patch
+        id: commit
         shell: bash
         run: |
           set -euo pipefail
@@ -54,12 +57,30 @@ jobs:
             android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt \
             android/app/src/main/java/com/sirpaul/spatialnomap/BirdEyeWorldView.kt \
             android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt \
-            .github/workflows/spatial-stablear-release.yml \
             sdk/checkpoints/SPATIAL_SYNC_CLIENTS_VEHICLES_2026-09-14.md
           git diff --cached --check
-          if git diff --cached --quiet; then
-            echo 'No feature changes to commit.'
-            exit 0
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat(spatial-sync): track peer phones and fuse shared vehicles'
+            git push origin HEAD:stablear/multiplatform-sdk
           fi
-          git commit -m 'feat(spatial-sync): track peer phones and fuse shared vehicles'
-          git push origin HEAD:stablear/multiplatform-sdk
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish verified Spatial Sync APK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: spatial-stablear-latest
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create "$TAG" \
+            SpatialAR-StableAR-latest.apk \
+            SPATIAL-STABLEAR-SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "Spatial AR + StableAR - Android latest" \
+            --prerelease \
+            --notes "Verified Spatial Sync Android build with StableAR, peer-phone tracking/bounding box, navigation-safe WORLD/CLIENTS controls, and canonical cross-device vehicle deduplication/keepalive. Unit tests and assembleDebug passed in the publishing workflow."
