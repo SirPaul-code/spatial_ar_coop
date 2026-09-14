@@ -1,0 +1,587 @@
+name: apply-spatial-clients-vehicles
+
+on:
+  push:
+    branches: [stablear/multiplatform-sdk]
+    paths:
+      - '.github/workflows/apply-spatial-clients-vehicles.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact Spatial Sync patches
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one match, found {count}')
+              p.write_text(text.replace(old, new, 1))
+
+          # 1) Keep real receive timestamps for phone poses so stale/disconnected
+          # peers disappear instead of living forever in the visualization.
+          path = 'android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt'
+          replace_once(path,
+          '''    private var latestLocalFrame: CapturedFrame? = null
+              private var latestRemoteFrame: CapturedFrame? = null
+              private var localFromPeer: DoubleArray? = null
+          ''',
+          '''    private var latestLocalFrame: CapturedFrame? = null
+              private var latestRemoteFrame: CapturedFrame? = null
+              private var latestLocalFrameSeenMs = 0L
+              private var latestRemoteFrameSeenMs = 0L
+              private var localFromPeer: DoubleArray? = null
+          ''')
+          replace_once(path,
+          '''            is WireMessage.Frame -> {
+                          if (direction == Direction.OUT) latestLocalFrame = message.frame
+                          else latestRemoteFrame = message.frame
+                      }
+          ''',
+          '''            is WireMessage.Frame -> {
+                          if (direction == Direction.OUT) {
+                              latestLocalFrame = message.frame
+                              latestLocalFrameSeenMs = now
+                          } else {
+                              latestRemoteFrame = message.frame
+                              latestRemoteFrameSeenMs = now
+                          }
+                      }
+          ''')
+          replace_once(path,
+          '''                latestLocalFrame = null
+                          latestRemoteFrame = null
+                          localTargets.clear()
+          ''',
+          '''                latestLocalFrame = null
+                          latestRemoteFrame = null
+                          latestLocalFrameSeenMs = 0L
+                          latestRemoteFrameSeenMs = 0L
+                          localTargets.clear()
+          ''')
+          replace_once(path,
+          '''        val actors = ArrayList<VizActor>(2)
+                  latestLocalFrame?.let { frame ->
+                      actors += VizActor(
+                          id = "local",
+                          label = localName.ifBlank { "YOU" },
+                          position = frame.pose.t.copyOf(3),
+                          quaternion = frame.pose.q.copyOf(4),
+                          local = true,
+                          lastSeenMs = now,
+                      )
+                  }
+                  if (transform != null) {
+                      latestRemoteFrame?.let { frame ->
+                          val mappedPosition = transformPoint(transform, frame.pose.t)
+                          val mappedQuaternion = transformQuaternion(transform, frame.pose.q)
+                          if (mappedPosition != null && mappedQuaternion != null) {
+                              actors += VizActor(
+                                  id = "peer",
+                                  label = peerName.ifBlank { "PEER" },
+                                  position = mappedPosition,
+                                  quaternion = mappedQuaternion,
+                                  local = false,
+                                  lastSeenMs = now,
+                              )
+                          }
+                      }
+                  }
+
+                  return Snapshot(
+                      points = points,
+                      actors = actors,
+                      targets = localTargets.values.map { it.copy(position = it.position.copyOf()) } +
+                          remoteTargets.values.map { it.copy(position = it.position.copyOf()) },
+          ''',
+          '''        val actors = ArrayList<VizActor>(2)
+                  latestLocalFrame?.takeIf { now - latestLocalFrameSeenMs <= CLIENT_POSE_TTL_MS }?.let { frame ->
+                      actors += VizActor(
+                          id = "local",
+                          label = localName.ifBlank { "YOU" },
+                          position = frame.pose.t.copyOf(3),
+                          quaternion = frame.pose.q.copyOf(4),
+                          local = true,
+                          lastSeenMs = latestLocalFrameSeenMs,
+                      )
+                  }
+                  if (transform != null) {
+                      latestRemoteFrame?.takeIf { now - latestRemoteFrameSeenMs <= CLIENT_POSE_TTL_MS }?.let { frame ->
+                          val mappedPosition = transformPoint(transform, frame.pose.t)
+                          val mappedQuaternion = transformQuaternion(transform, frame.pose.q)
+                          if (mappedPosition != null && mappedQuaternion != null) {
+                              actors += VizActor(
+                                  id = "peer",
+                                  label = peerName.ifBlank { "PEER" },
+                                  position = mappedPosition,
+                                  quaternion = mappedQuaternion,
+                                  local = false,
+                                  lastSeenMs = latestRemoteFrameSeenMs,
+                              )
+                          }
+                      }
+                  }
+
+                  // A shared dynamic object can be observed and re-broadcast by both
+                  // phones under the same canonical id. Render one logical entity.
+                  val mergedTargets = LinkedHashMap<Long, VizTarget>()
+                  remoteTargets.values.forEach { target ->
+                      mergedTargets[target.id] = target.copy(position = target.position.copyOf())
+                  }
+                  localTargets.values.forEach { target ->
+                      val previous = mergedTargets[target.id]
+                      if (previous == null || target.lastSeenMs >= previous.lastSeenMs) {
+                          mergedTargets[target.id] = target.copy(position = target.position.copyOf())
+                      }
+                  }
+
+                  return Snapshot(
+                      points = points,
+                      actors = actors,
+                      targets = mergedTargets.values.toList(),
+          ''')
+          replace_once(path,
+          '''    private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
+          ''',
+          '''    private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
+              private const val CLIENT_POSE_TTL_MS = 3_000L
+          ''')
+
+          # 2) WORLD controls respect Android navigation insets; add CLIENTS toggle;
+          # represent peer phones as an oriented phone footprint in bird-eye view.
+          path = 'android/app/src/main/java/com/sirpaul/spatialnomap/BirdEyeWorldView.kt'
+          replace_once(path,
+          '''import android.view.View
+          import android.view.ViewGroup
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          ''',
+          '''import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowInsets
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          ''')
+          replace_once(path,
+          '''    private fun drawActors(canvas: Canvas, snapshot: WorldVizBus.Snapshot, center: FloatArray) {
+                  snapshot.actors.forEach { actor ->
+                      val s = project(actor.position, center)
+                      val paint = if (actor.local) localPaint else peerPaint
+                      val heading = yawFromQuaternion(actor.quaternion) - yaw
+                      val size = 18f
+                      val path = Path().apply {
+                          moveTo(s.x + sin(heading) * size, s.y - cos(heading) * size)
+                          lineTo(s.x + sin(heading + 2.45f) * size * 0.78f, s.y - cos(heading + 2.45f) * size * 0.78f)
+                          lineTo(s.x + sin(heading - 2.45f) * size * 0.78f, s.y - cos(heading - 2.45f) * size * 0.78f)
+                          close()
+                      }
+                      canvas.drawPath(path, paint)
+                      canvas.drawCircle(s.x, s.y, 26f, Paint(paint).apply {
+                          style = Paint.Style.STROKE
+                          strokeWidth = 2.5f
+                          alpha = 130
+                      })
+                      canvas.drawText(if (actor.local) "YOU" else actor.label, s.x + 32f, s.y + 7f, labelPaint)
+                  }
+              }
+          ''',
+          '''    private fun drawActors(canvas: Canvas, snapshot: WorldVizBus.Snapshot, center: FloatArray) {
+                  snapshot.actors
+                      .filter { it.local || ClientTrackingOverlayState.enabled }
+                      .forEach { actor ->
+                          val s = project(actor.position, center)
+                          val paint = if (actor.local) localPaint else peerPaint
+                          val heading = yawFromQuaternion(actor.quaternion) - yaw
+                          if (actor.local) {
+                              val size = 18f
+                              val path = Path().apply {
+                                  moveTo(s.x + sin(heading) * size, s.y - cos(heading) * size)
+                                  lineTo(s.x + sin(heading + 2.45f) * size * 0.78f, s.y - cos(heading + 2.45f) * size * 0.78f)
+                                  lineTo(s.x + sin(heading - 2.45f) * size * 0.78f, s.y - cos(heading - 2.45f) * size * 0.78f)
+                                  close()
+                              }
+                              canvas.drawPath(path, paint)
+                              canvas.drawCircle(s.x, s.y, 26f, Paint(paint).apply {
+                                  style = Paint.Style.STROKE
+                                  strokeWidth = 2.5f
+                                  alpha = 130
+                              })
+                          } else {
+                              // Phone footprint / bounding box. The actor pose is the
+                              // remote AR camera pose, so this follows the physical client.
+                              val fx = sin(heading)
+                              val fy = -cos(heading)
+                              val rx = cos(heading)
+                              val ry = sin(heading)
+                              val halfLength = 27f
+                              val halfWidth = 14f
+                              val phone = Path().apply {
+                                  moveTo(s.x + fx * halfLength + rx * halfWidth, s.y + fy * halfLength + ry * halfWidth)
+                                  lineTo(s.x + fx * halfLength - rx * halfWidth, s.y + fy * halfLength - ry * halfWidth)
+                                  lineTo(s.x - fx * halfLength - rx * halfWidth, s.y - fy * halfLength - ry * halfWidth)
+                                  lineTo(s.x - fx * halfLength + rx * halfWidth, s.y - fy * halfLength + ry * halfWidth)
+                                  close()
+                              }
+                              canvas.drawPath(phone, Paint(paint).apply {
+                                  style = Paint.Style.STROKE
+                                  strokeWidth = 4f
+                              })
+                              canvas.drawCircle(s.x + fx * 17f, s.y + fy * 17f, 4f, paint)
+                          }
+                          canvas.drawText(if (actor.local) "YOU" else "CLIENT • ${actor.label}", s.x + 34f, s.y + 7f, labelPaint)
+                      }
+              }
+          ''')
+          replace_once(path,
+          '''/** Installs the WORLD presentation view without coupling it to MainActivity internals. */
+          object BirdEyeWorldController {
+          ''',
+          '''/** Shared toggle consumed by the AR overlay and bird-eye renderer. */
+          object ClientTrackingOverlayState {
+              @Volatile var enabled: Boolean = true
+          }
+
+          /** Installs the WORLD presentation view without coupling it to MainActivity internals. */
+          object BirdEyeWorldController {
+          ''')
+          replace_once(path,
+          '''        content.addView(shell, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  val button = TextView(activity).apply {
+                      tag = TAG_BUTTON
+                      text = "WORLD"
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setBackgroundColor(0xdd16241f.toInt())
+                      elevation = dp(20).toFloat()
+                      setOnClickListener {
+                          world.setAutoOrbit(true)
+                          shell.visibility = View.VISIBLE
+                          shell.bringToFront()
+                      }
+                  }
+                  content.addView(button, FrameLayout.LayoutParams(dp(96), dp(48), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                      bottomMargin = dp(14)
+                  })
+          ''',
+          '''        content.addView(shell, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  val controls = LinearLayout(activity).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      elevation = dp(20).toFloat()
+                  }
+                  val clients = TextView(activity).apply {
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.WHITE)
+                      textSize = 11.5f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setBackgroundColor(0xdd16241f.toInt())
+                      fun render() {
+                          text = if (ClientTrackingOverlayState.enabled) "CLIENTS ON" else "CLIENTS OFF"
+                          alpha = if (ClientTrackingOverlayState.enabled) 1f else 0.62f
+                      }
+                      render()
+                      setOnClickListener {
+                          ClientTrackingOverlayState.enabled = !ClientTrackingOverlayState.enabled
+                          render()
+                      }
+                  }
+                  val button = TextView(activity).apply {
+                      tag = TAG_BUTTON
+                      text = "WORLD"
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setBackgroundColor(0xdd16241f.toInt())
+                      setOnClickListener {
+                          world.setAutoOrbit(true)
+                          shell.visibility = View.VISIBLE
+                          shell.bringToFront()
+                      }
+                  }
+                  controls.addView(clients, LinearLayout.LayoutParams(dp(112), dp(48)).apply { rightMargin = dp(8) })
+                  controls.addView(button, LinearLayout.LayoutParams(dp(96), dp(48)))
+                  val controlsLayout = FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      dp(48),
+                      Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+                  ).apply { bottomMargin = dp(14) }
+                  content.addView(controls, controlsLayout)
+                  controls.setOnApplyWindowInsetsListener { view, insets ->
+                      val safe = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                      val lp = view.layoutParams as FrameLayout.LayoutParams
+                      lp.bottomMargin = safe.bottom + dp(14)
+                      view.layoutParams = lp
+                      insets
+                  }
+                  controls.requestApplyInsets()
+          ''')
+
+          # 3) AR camera overlay: show the remote phone pose as a real shared-world
+          # target with a small 3D phone bounding box. Also let a second phone's
+          # observation refresh/rebroadcast the same canonical vehicle id.
+          path = 'android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt'
+          replace_once(path,
+          '''import kotlin.math.atan2
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sqrt
+          ''',
+          '''import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+          ''')
+          replace_once(path,
+          '''            if (remoteReservation != null) {
+                          synchronized(targetLock) {
+                              detectorTrackToSharedId.remove(vehicle.trackId)?.let { staleId ->
+                                  localVehicles.remove(staleId)
+                              }
+                          }
+                          continue
+                      }
+          ''',
+          '''            if (remoteReservation != null) {
+                          val sharedId = remoteReservation.first
+                          synchronized(targetLock) {
+                              detectorTrackToSharedId.remove(vehicle.trackId)?.let { staleId ->
+                                  if (staleId != sharedId) localVehicles.remove(staleId)
+                              }
+                              remoteVehicles[sharedId]?.let { shared ->
+                                  val predicted = VehicleTrackPolicy.predict(
+                                      shared.point, shared.velocity, shared.lastSeenMs, now, VEHICLE_COAST_MS,
+                                  )
+                                  shared.point = smoothPoint(predicted, vehicle.pointWorld, LOCAL_POSITION_ALPHA)
+                                  shared.velocity = smoothPoint(shared.velocity, vehicle.velocityWorld, LOCAL_VELOCITY_ALPHA)
+                                  limitVelocity(shared.velocity, MAX_VEHICLE_SPEED_MPS)
+                                  shared.worldBox = (vehicle.worldBox ?: shared.worldBox
+                                      ?: defaultVehicleBox(shared.point, shared.velocity, vehicle.label))
+                                      .let { moveBoxCenter(it, shared.point, shared.velocity) }
+                                  shared.confidence = max(shared.confidence, vehicle.confidence)
+                                  shared.lastSeenMs = now
+                                  detectorTrackToSharedId[vehicle.trackId] = sharedId
+                              }
+                          }
+                          // Do not invent a second vehicle. Contribute this camera's
+                          // observation under the already-reserved canonical id.
+                          matched += sharedId
+                          coordinator.sendPoi(sharedId, vehicle.pointWorld, "$AUTO_CAR_PREFIX$owner")
+                          continue
+                      }
+          ''')
+          replace_once(path,
+          '''        val now = System.currentTimeMillis()
+
+                  val localSnapshot: List<Pair<Long, LocalTarget>>
+          ''',
+          '''        val now = System.currentTimeMillis()
+                  val peerActors = if (ClientTrackingOverlayState.enabled) {
+                      WorldVizBus.snapshot().actors.filter { actor ->
+                          !actor.local && now - actor.lastSeenMs <= CLIENT_POSE_TTL_MS
+                      }
+                  } else {
+                      emptyList()
+                  }
+
+                  val localSnapshot: List<Pair<Long, LocalTarget>>
+          ''')
+          replace_once(path,
+          '''        val projected = ArrayList<TargetOverlayView.Target>(
+                      localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size,
+                  )
+                  for ((id, target) in localSnapshot) {
+          ''',
+          '''        val projected = ArrayList<TargetOverlayView.Target>(
+                      localSnapshot.size + remoteSnapshot.size + localVehicleSnapshot.size + remoteVehicleSnapshot.size + peerActors.size,
+                  )
+                  peerActors.forEach { actor ->
+                      projectClientActor(camera, actor, view, projection)?.let { projected += it }
+                  }
+                  for ((id, target) in localSnapshot) {
+          ''')
+          replace_once(path,
+          '''    private fun projectDynamicTarget(
+          ''',
+          '''    private fun projectClientActor(
+                  camera: Camera,
+                  actor: WorldVizBus.VizActor,
+                  view: FloatArray,
+                  projection: FloatArray,
+              ): TargetOverlayView.Target? {
+                  if (actor.position.size < 3 || actor.quaternion.size < 4) return null
+                  val q = actor.quaternion
+                  val yaw = atan2(
+                      2f * (q[3] * q[1] + q[0] * q[2]),
+                      1f - 2f * (q[1] * q[1] + q[2] * q[2]),
+                  )
+                  val forward = floatArrayOf(sin(yaw), 0f, -cos(yaw))
+                  val phoneBox = VehicleDetector.WorldBox(
+                      centerWorld = actor.position.copyOf(3),
+                      forwardWorld = forward,
+                      halfLengthM = 0.008f,
+                      halfWidthM = 0.040f,
+                      halfHeightM = 0.085f,
+                  )
+                  val id = CLIENT_TARGET_ID_BASE xor actor.id.hashCode().toLong()
+                  return projectPoint(
+                      camera = camera,
+                      point = actor.position,
+                      id = id,
+                      label = "CLIENT • ${actor.label}",
+                      confidence = 1f,
+                      isLocal = false,
+                      view = view,
+                      projection = projection,
+                      worldBox = phoneBox,
+                  )
+              }
+
+              private fun projectDynamicTarget(
+          ''')
+          replace_once(path,
+          '''        private const val VEHICLE_MEMORY_TTL_MS = 6_500L
+          ''',
+          '''        private const val VEHICLE_MEMORY_TTL_MS = 4_000L
+              private const val CLIENT_POSE_TTL_MS = 3_000L
+              private const val CLIENT_TARGET_ID_BASE = Long.MIN_VALUE + 0x434C4945L
+          ''')
+
+          # Release this feature build automatically whenever the relevant product
+          # files change, not only when the release workflow itself changes.
+          path = '.github/workflows/spatial-stablear-release.yml'
+          replace_once(path,
+          '''    paths:
+                    - '.github/workflows/spatial-stablear-release.yml'
+          ''',
+          '''    paths:
+                    - '.github/workflows/spatial-stablear-release.yml'
+                    - 'android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt'
+                    - 'android/app/src/main/java/com/sirpaul/spatialnomap/BirdEyeWorldView.kt'
+                    - 'android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt'
+                    - 'android/app/src/main/java/com/sirpaul/spatialnomap/VehicleTrackPolicy.kt'
+                    - 'android/app/src/main/java/com/sirpaul/spatialnomap/TargetOverlayView.kt'
+          ''')
+          replace_once(path,
+          '''            --notes "Latest installable Spatial Sync Android build with the full StableAR material-tracking integration from stablear/multiplatform-sdk. Includes StableAR ARCore host integration, XFeat/LiteRT learned correspondence, geometry validation, bounded material correction, and LK/ORB fallback. Development sideload build; physical two-phone acceptance remains the next validation gate."
+          ''',
+          '''            --notes "Latest installable Spatial Sync Android build from stablear/multiplatform-sdk. Includes full StableAR material tracking, shared-world client phone overlay, navigation-inset-safe WORLD/CLIENTS controls, and cross-device canonical vehicle observation fusion/deduplication. Development sideload build; physical two-phone acceptance remains the next validation gate."
+          ''')
+
+          checkpoint = Path('sdk/checkpoints/SPATIAL_SYNC_CLIENTS_VEHICLES_2026-09-14.md')
+          checkpoint.write_text('''# Spatial Sync client + vehicle tracking checkpoint — 2026-09-14
+
+## Intent
+
+This checkpoint adds the missing product-level client visualization and tightens the existing dynamic vehicle sharing semantics on `stablear/multiplatform-sdk`.
+
+## Verified architecture before this change
+
+- `WifiAwarePeerTransport` is still an **exactly-two-phone** direct Wi-Fi Aware transport. `SharedRoomState` contains an N-phone/star model but it is not wired into the active transport yet. Do not claim N-client networking from this checkpoint.
+- Vehicle detection already had detector-local motion tracks, shared room IDs, cross-device spatial association and deterministic duplicate winner selection.
+- The missing behavior was that a local detection matching a remote reservation was discarded instead of contributing an observation to the same canonical vehicle ID.
+- `WorldVizBus` previously stored one local + one remote frame and stamped actor `lastSeenMs` at snapshot time, so a stale peer could look permanently alive.
+- WORLD was installed outside `MainActivity` safe-area handling with a fixed 14 dp bottom margin.
+
+## Changes
+
+1. **Client phone tracking UI**
+   - A `CLIENTS ON/OFF` control is placed beside WORLD.
+   - Both controls use Android system-bar/display-cutout insets.
+   - Remote AR-camera pose is rendered in the normal AR overlay as `CLIENT • <name>` with a small projected 3D phone bounding box.
+   - Bird-eye view renders the remote client as an oriented phone footprint/bounding box instead of only a triangle.
+   - Client pose expires after 3 s without a fresh remote frame.
+
+2. **Shared vehicle lifecycle**
+   - A second phone that sees an already-reserved vehicle now reuses the canonical shared ID and re-broadcasts its observation under that ID.
+   - This means either camera can keep the same logical vehicle alive; no second car is created merely because the other phone starts seeing it.
+   - The dynamic target expires only after observations from both sides stop, with a 4 s grace/memory TTL.
+   - World visualization merges same-ID local/remote dynamic messages into one logical target.
+
+3. **Release path**
+   - `spatial-stablear-release.yml` now rebuilds/publishes the APK when these Spatial Sync feature files change.
+
+## Validation performed by the applying workflow
+
+The applying workflow must pass:
+
+```text
+gradle -p android --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+```
+
+before it commits this patch.
+
+## Physical acceptance still required
+
+- Two phones: `ALIGNING -> LOCKED`.
+- CLIENTS ON: A sees B's phone box follow B's movement; B sees A.
+- CLIENTS OFF: peer box disappears without affecting POIs/vehicles.
+- Android gesture/navigation bar does not overlap WORLD/CLIENTS.
+- Vehicle first seen by A gets one ID; when B also sees it, target count remains one and ID stays canonical.
+- A turns away while B keeps car visible: vehicle remains loaded.
+- B also turns away: vehicle disappears after the bounded grace TTL.
+- Reacquire the same moving car after expiry: it may legitimately receive a new track ID.
+
+## Next architecture step (not implemented here)
+
+To support >2 simultaneous clients, replace the single-socket `WifiAwarePeerTransport` session with host-side per-peer sessions and wire `SharedRoomState` into fan-out/fan-in. The current UI/state code is intentionally compatible with a future list of actors, but this checkpoint does not pretend the transport is already N-peer.
+''')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Android toolchain
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+
+      - name: Test and build patched Spatial Sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p android --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep -q 'assets/models/xfeat.tflite'
+
+      - name: Commit verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/BirdEyeWorldView.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt \
+            .github/workflows/spatial-stablear-release.yml \
+            sdk/checkpoints/SPATIAL_SYNC_CLIENTS_VEHICLES_2026-09-14.md
+          git diff --cached --check
+          git commit -m 'feat(spatial-sync): track peer phones and fuse shared vehicles'
+          git push origin HEAD:stablear/multiplatform-sdk
