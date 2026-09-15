@@ -1028,10 +1028,18 @@ class AlignmentCoordinator(
         val transform = lockedTransform ?: return
         if (!peerTransformVerified) return
         val p = AlignmentEngine.transformPoint(transform, message.pointWorld)
+        val metadata = VehicleWireMetadata.decode(message.owner)
+        val localAxis = metadata.axis?.let { axis ->
+            VehicleGeometryPolicy.horizontalUnit(floatArrayOf(
+                (transform[0] * axis[0] + transform[2] * axis[2]).toFloat(),
+                0f,
+                (transform[8] * axis[0] + transform[10] * axis[2]).toFloat(),
+            ))
+        }
         listener.onRemotePoi(
             message.id,
             floatArrayOf(p[0].toFloat(), p[1].toFloat(), p[2].toFloat()),
-            message.owner,
+            VehicleWireMetadata.encode(metadata.owner, metadata.label, localAxis),
             localConfidence,
         )
     }

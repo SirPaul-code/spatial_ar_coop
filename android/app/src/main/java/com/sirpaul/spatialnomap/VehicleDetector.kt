@@ -20,12 +20,10 @@ import java.io.ByteArrayOutputStream
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
-import kotlin.math.atan2
-import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
@@ -56,11 +54,30 @@ class VehicleDetector(context: Context) {
         val worldBox: WorldBox?,
     )
 
+    data class CameraModel(
+        val translation: FloatArray,
+        val quaternion: FloatArray,
+        val fx: Float,
+        val fy: Float,
+        val cx: Float,
+        val cy: Float,
+    )
+
     private data class RawVehicle(
         val label: String,
         val confidence: Float,
         val pointWorld: FloatArray,
         val worldBox: WorldBox?,
+    )
+
+    private data class DetectionRequest(
+        val image: Image,
+        val displayRotation: Int,
+        val cameraId: String?,
+        val camera: CameraModel,
+        val metricPoints: List<FloatArray>,
+        val onResult: (List<Vehicle>) -> Unit,
+        val onError: (String) -> Unit,
     )
 
     private data class MotionTrack(
@@ -75,6 +92,7 @@ class VehicleDetector(context: Context) {
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
     private val executor = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
+    private val pending = AtomicReference<DetectionRequest?>(null)
     private val motionTracks = LinkedHashMap<Int, MotionTrack>()
     private var nextMotionTrackId = 1
     @Volatile private var detector: ObjectDetector? = null
@@ -86,75 +104,105 @@ class VehicleDetector(context: Context) {
         image: Image,
         displayRotation: Int,
         cameraId: String?,
-        cameraWorld: FloatArray,
+        camera: CameraModel,
         metricPoints: List<FloatArray>,
         onResult: (List<Vehicle>) -> Unit,
         onError: (String) -> Unit,
     ): Boolean {
-        if (closed || !busy.compareAndSet(false, true)) {
+        if (closed) {
             runCatching { image.close() }
             return false
         }
-
-        executor.execute {
-            var rawBitmap: Bitmap? = null
-            var detectorBitmap: Bitmap? = null
-            try {
-                val rawWidth = image.width
-                val rawHeight = image.height
-                rawBitmap = yuv420ToBitmap(image)
-                    ?: throw IllegalStateException("Could not convert AR camera frame")
-                val rotation = cameraRotationDegrees(cameraId, displayRotation)
-                detectorBitmap = rotateBitmap(rawBitmap!!, rotation)
-
-                val task = detector ?: createDetector().also { detector = it }
-                val mpImage = BitmapImageBuilder(detectorBitmap!!).build()
-                val result = try {
-                    task.detect(mpImage)
-                } finally {
-                    runCatching { mpImage.close() }
-                }
-
-                val rawVehicles = ArrayList<RawVehicle>()
-                for (detection in result.detections()) {
-                    val category = detection.categories().maxByOrNull { it.score() } ?: continue
-                    val name = category.categoryName().lowercase()
-                    if (name !in VEHICLE_LABELS || category.score() < SCORE_THRESHOLD) continue
-
-                    val rawBox = mapDetectorRectToRaw(
-                        detection.boundingBox(),
-                        rawWidth,
-                        rawHeight,
-                        rotation,
-                    )
-                    val geometry = estimateWorldGeometry(rawBox, cameraWorld, metricPoints, name) ?: continue
-                    rawVehicles += RawVehicle(
-                        label = name.uppercase(),
-                        confidence = category.score(),
-                        pointWorld = geometry.centerWorld.copyOf(),
-                        worldBox = geometry,
-                    )
-                }
-
-                val filtered = filterVehicleMotion(
-                    rawVehicles.sortedByDescending { it.confidence }.take(MAX_RESULTS),
-                    System.currentTimeMillis(),
-                )
-                onResult(filtered)
-            } catch (t: Throwable) {
-                onError(errorText(t))
-            } finally {
-                runCatching { image.close() }
-                if (detectorBitmap != null && detectorBitmap !== rawBitmap) runCatching { detectorBitmap?.recycle() }
-                runCatching { rawBitmap?.recycle() }
-                busy.set(false)
-            }
-        }
+        val request = DetectionRequest(
+            image = image,
+            displayRotation = displayRotation,
+            cameraId = cameraId,
+            camera = camera,
+            metricPoints = metricPoints,
+            onResult = onResult,
+            onError = onError,
+        )
+        // Latest-frame mailbox: never build inference latency by queueing stale video.
+        pending.getAndSet(request)?.let { stale -> runCatching { stale.image.close() } }
+        if (busy.compareAndSet(false, true)) executor.execute(::drainLatest)
         return true
+    }
+
+    private fun drainLatest() {
+        try {
+            while (!closed) {
+                val request = pending.getAndSet(null) ?: break
+                process(request)
+            }
+        } finally {
+            busy.set(false)
+            // Close the race where a frame arrived between the final getAndSet and busy=false.
+            if (!closed && pending.get() != null && busy.compareAndSet(false, true)) executor.execute(::drainLatest)
+        }
+    }
+
+    private fun process(request: DetectionRequest) {
+        var rawBitmap: Bitmap? = null
+        var detectorBitmap: Bitmap? = null
+        try {
+            val image = request.image
+            val rawWidth = image.width
+            val rawHeight = image.height
+            rawBitmap = yuv420ToBitmap(image)
+                ?: throw IllegalStateException("Could not convert AR camera frame")
+            val rotation = cameraRotationDegrees(request.cameraId, request.displayRotation)
+            detectorBitmap = rotateBitmap(rawBitmap, rotation)
+
+            val task = detector ?: createDetector().also { detector = it }
+            val mpImage = BitmapImageBuilder(detectorBitmap).build()
+            val result = try {
+                task.detect(mpImage)
+            } finally {
+                runCatching { mpImage.close() }
+            }
+
+            data class Candidate(val box: RectF, val label: String, val score: Float)
+            val candidates = ArrayList<Candidate>()
+            for (detection in result.detections()) {
+                val category = detection.categories().maxByOrNull { it.score() } ?: continue
+                val name = category.categoryName().lowercase()
+                if (name !in VEHICLE_LABELS || category.score() < SCORE_THRESHOLD) continue
+                val rawBox = mapDetectorRectToRaw(detection.boundingBox(), rawWidth, rawHeight, rotation)
+                if (rawBox.width() < 4f || rawBox.height() < 4f) continue
+                candidates += Candidate(rawBox, name, category.score())
+            }
+
+            val rawVehicles = ArrayList<RawVehicle>()
+            val acceptedBoxes = ArrayList<RectF>()
+            for (candidate in candidates.sortedByDescending { it.score }) {
+                if (acceptedBoxes.any { intersectionOverUnion(it, candidate.box) >= DETECTION_NMS_IOU }) continue
+                val geometry = estimateWorldGeometry(
+                    candidate.box, request.camera, request.metricPoints, candidate.label,
+                ) ?: estimateWorldGeometryFromImage(candidate.box, request.camera, candidate.label)
+                if (geometry == null) continue
+                acceptedBoxes += candidate.box
+                rawVehicles += RawVehicle(
+                    label = candidate.label.uppercase(),
+                    confidence = candidate.score,
+                    pointWorld = geometry.centerWorld.copyOf(),
+                    worldBox = geometry,
+                )
+                if (rawVehicles.size >= MAX_RESULTS) break
+            }
+
+            request.onResult(filterVehicleMotion(rawVehicles, System.currentTimeMillis()))
+        } catch (t: Throwable) {
+            request.onError(errorText(t))
+        } finally {
+            runCatching { request.image.close() }
+            if (detectorBitmap != null && detectorBitmap !== rawBitmap) runCatching { detectorBitmap?.recycle() }
+            runCatching { rawBitmap?.recycle() }
+        }
     }
 
     fun close() {
         closed = true
+        pending.getAndSet(null)?.let { runCatching { it.image.close() } }
         executor.execute {
             runCatching { detector?.close() }
             detector = null
@@ -187,9 +235,13 @@ class VehicleDetector(context: Context) {
             var bestDistance = Float.POSITIVE_INFINITY
             for (track in motionTracks.values) {
                 if (track.id in used) continue
-                val predicted = track.filter.predict(nowMs)?.position ?: continue
+                val state = track.filter.predict(nowMs) ?: continue
+                val predicted = state.position
                 val distance = pointDistance(predicted, vehicle.pointWorld)
-                if (distance < bestDistance && distance <= FILTER_ASSOCIATION_M) {
+                val ageSeconds = ((nowMs - track.lastSeenMs).coerceAtLeast(0L) / 1000f).coerceAtMost(1.5f)
+                val adaptiveGate = (FILTER_BASE_GATE_M + VehicleTrackPolicy.speedMps(state.velocity) * ageSeconds * 1.35f)
+                    .coerceAtMost(FILTER_MAX_GATE_M)
+                if (distance < bestDistance && distance <= adaptiveGate) {
                     bestDistance = distance
                     best = track
                 }
@@ -230,30 +282,20 @@ class VehicleDetector(context: Context) {
         velocity: FloatArray,
     ): WorldBox? {
         val box = observed ?: previous ?: return null
-        val observedAxis = observed?.forwardWorld ?: box.forwardWorld
-        val velocityAxis = horizontalUnit(velocity)
-        var axis = if (velocityAxis != null && horizontalSpeed(velocity) >= VELOCITY_HEADING_MIN_MPS) {
-            velocityAxis
-        } else {
-            observedAxis.copyOf()
-        }
-        val priorAxis = previous?.forwardWorld
-        if (priorAxis != null && dot3(axis, priorAxis) < 0f) axis = FloatArray(3) { -axis[it] }
-        if (priorAxis != null) {
-            axis = horizontalUnit(
-                FloatArray(3) { i -> priorAxis.getOrElse(i) { 0f } * 0.68f + axis.getOrElse(i) { 0f } * 0.32f },
-            ) ?: axis
-        }
-
-        fun smooth(old: Float?, fresh: Float): Float =
-            if (old == null || !old.isFinite()) fresh else old * 0.68f + fresh * 0.32f
-
+        val axis = VehicleGeometryPolicy.stabilizeAxis(
+            previous = previous?.forwardWorld,
+            observed = observed?.forwardWorld ?: box.forwardWorld,
+            velocity = velocity,
+            velocityHeadingMinMps = VELOCITY_HEADING_MIN_MPS,
+        )
+        val dims = VehicleGeometryPolicy.halfExtents("CAR")
         return WorldBox(
             centerWorld = center.copyOf(3),
             forwardWorld = axis,
-            halfLengthM = smooth(previous?.halfLengthM, box.halfLengthM),
-            halfWidthM = smooth(previous?.halfWidthM, box.halfWidthM),
-            halfHeightM = smooth(previous?.halfHeightM, box.halfHeightM),
+            // Never let a few bad depth samples inflate the physical cuboid.
+            halfLengthM = observed?.halfLengthM ?: previous?.halfLengthM ?: dims.length,
+            halfWidthM = observed?.halfWidthM ?: previous?.halfWidthM ?: dims.width,
+            halfHeightM = observed?.halfHeightM ?: previous?.halfHeightM ?: dims.height,
         )
     }
 
@@ -301,140 +343,105 @@ class VehicleDetector(context: Context) {
         return RectF(left, top, right, bottom)
     }
 
-    /**
-     * Build a robust metric centroid plus an oriented vehicle-sized 3D box. Depth
-     * outliers are rejected by median range first; horizontal PCA then estimates the
-     * dominant world direction. Minimum class dimensions intentionally keep sparse
-     * visible-surface depth from collapsing the box into a tiny flat patch.
-     */
+    /** Robust depth is used for translation only. Vehicle yaw never comes from sparse-depth PCA. */
     private fun estimateWorldGeometry(
         box: RectF,
-        cameraWorld: FloatArray,
+        camera: CameraModel,
         metricPoints: List<FloatArray>,
         category: String,
     ): WorldBox? {
         if (box.width() < 4f || box.height() < 4f) return null
-        val insetX = box.width() * 0.12f
-        val insetY = box.height() * 0.12f
-        val central = RectF(
-            box.left + insetX,
-            box.top + insetY,
-            box.right - insetX,
-            box.bottom - insetY,
-        )
+        val insetX = box.width() * 0.10f
+        val insetY = box.height() * 0.10f
+        val central = RectF(box.left + insetX, box.top + insetY, box.right - insetX, box.bottom - insetY)
 
         data class Support(val p: FloatArray, val distance: Float)
         val supports = ArrayList<Support>()
         for (m in metricPoints) {
-            if (m.size < 5) continue
-            val u = m[0]
-            val v = m[1]
-            if (u !in central.left..central.right || v !in central.top..central.bottom) continue
+            if (m.size < 5 || m[0] !in central.left..central.right || m[1] !in central.top..central.bottom) continue
             val p = floatArrayOf(m[2], m[3], m[4])
             if (!p.all { it.isFinite() }) continue
-            val d = pointDistance(cameraWorld, p)
+            val d = pointDistance(camera.translation, p)
             if (d.isFinite() && d in MIN_VEHICLE_DISTANCE_M..MAX_VEHICLE_DISTANCE_M) supports += Support(p, d)
         }
         if (supports.size < MIN_METRIC_SUPPORTS) return null
 
-        val sortedDistances = supports.map { it.distance }.sorted()
-        val median = sortedDistances[sortedDistances.size / 2]
-        val tolerance = max(0.45f, median * 0.12f)
-        val inliers = supports
-            .filter { abs(it.distance - median) <= tolerance }
+        val median = supports.map { it.distance }.sorted().let { it[it.size / 2] }
+        val tolerance = max(0.35f, median * 0.075f)
+        val inliers = supports.filter { abs(it.distance - median) <= tolerance }
             .sortedBy { abs(it.distance - median) }
-            .take(64)
+            .take(96)
         if (inliers.size < MIN_METRIC_INLIERS) return null
 
-        val mean = FloatArray(3)
-        for (s in inliers) repeat(3) { i -> mean[i] += s.p[i] }
-        repeat(3) { i -> mean[i] /= inliers.size.toFloat() }
-
-        var cxx = 0.0
-        var czz = 0.0
-        var cxz = 0.0
-        for (s in inliers) {
-            val x = (s.p[0] - mean[0]).toDouble()
-            val z = (s.p[2] - mean[2]).toDouble()
-            cxx += x * x
-            czz += z * z
-            cxz += x * z
+        // Median XYZ is much harder for background/ground leakage to drag meters away.
+        fun medianAxis(i: Int): Float {
+            val values = inliers.map { it.p[i] }.sorted()
+            return values[values.size / 2]
         }
-        val theta = if (cxx + czz > 1e-7) 0.5 * atan2(2.0 * cxz, cxx - czz) else 0.0
-        val forward = floatArrayOf(cos(theta).toFloat(), 0f, sin(theta).toFloat())
-        val right = floatArrayOf(-forward[2], 0f, forward[0])
-
-        val along = ArrayList<Float>(inliers.size)
-        val across = ArrayList<Float>(inliers.size)
-        val vertical = ArrayList<Float>(inliers.size)
-        for (s in inliers) {
-            val dx = s.p[0] - mean[0]
-            val dy = s.p[1] - mean[1]
-            val dz = s.p[2] - mean[2]
-            along += dx * forward[0] + dz * forward[2]
-            across += dx * right[0] + dz * right[2]
-            vertical += dy
-        }
-        along.sort()
-        across.sort()
-        vertical.sort()
-
-        val a0 = percentile(along, 0.10f)
-        val a1 = percentile(along, 0.90f)
-        val b0 = percentile(across, 0.10f)
-        val b1 = percentile(across, 0.90f)
-        val y0 = percentile(vertical, 0.10f)
-        val y1 = percentile(vertical, 0.90f)
-        val centerA = (a0 + a1) * 0.5f
-        val centerB = (b0 + b1) * 0.5f
-        val centerY = (y0 + y1) * 0.5f
-        val center = floatArrayOf(
-            mean[0] + forward[0] * centerA + right[0] * centerB,
-            mean[1] + centerY,
-            mean[2] + forward[2] * centerA + right[2] * centerB,
+        val center = floatArrayOf(medianAxis(0), medianAxis(1), medianAxis(2))
+        val dims = VehicleGeometryPolicy.halfExtents(category)
+        val axis = VehicleGeometryPolicy.observedAxis(
+            camera.translation, center, box.width() / box.height().coerceAtLeast(1f),
         )
+        return WorldBox(center, axis, dims.length, dims.width, dims.height)
+    }
 
-        val dims = classDimensionBounds(category)
-        return WorldBox(
-            centerWorld = center,
-            forwardWorld = forward,
-            halfLengthM = (((a1 - a0) * 0.5f).coerceAtLeast(dims[0])).coerceAtMost(dims[3]),
-            halfWidthM = (((b1 - b0) * 0.5f).coerceAtLeast(dims[1])).coerceAtMost(dims[4]),
-            halfHeightM = (((y1 - y0) * 0.5f).coerceAtLeast(dims[2])).coerceAtMost(dims[5]),
+    /**
+     * Detection must not depend on ARCore depth being ready. Estimate metric range from
+     * apparent physical height and camera intrinsics; later depth observations correct it.
+     */
+    private fun estimateWorldGeometryFromImage(
+        box: RectF,
+        camera: CameraModel,
+        category: String,
+    ): WorldBox? {
+        if (box.height() < MIN_FALLBACK_BOX_PX || camera.fy <= 1f || camera.fx <= 1f) return null
+        val dims = VehicleGeometryPolicy.halfExtents(category)
+        val physicalHeight = dims.height * 2f
+        val distance = (camera.fy * physicalHeight / box.height())
+            .coerceIn(MIN_FALLBACK_DISTANCE_M, MAX_FALLBACK_DISTANCE_M)
+        val u = box.centerX()
+        val v = box.centerY()
+        val rayCamera = normalize3(floatArrayOf(
+            (u - camera.cx) / camera.fx,
+            -(v - camera.cy) / camera.fy,
+            -1f,
+        )) ?: return null
+        val rayWorld = rotateByQuaternion(rayCamera, camera.quaternion)
+        val center = FloatArray(3) { i -> camera.translation.getOrElse(i) { 0f } + rayWorld[i] * distance }
+        val axis = VehicleGeometryPolicy.observedAxis(
+            camera.translation, center, box.width() / box.height().coerceAtLeast(1f),
         )
+        return WorldBox(center, axis, dims.length, dims.width, dims.height)
     }
 
-    /** min L/W/H followed by max L/W/H, all half-extents. */
-    private fun classDimensionBounds(category: String): FloatArray = when (category) {
-        "bus" -> floatArrayOf(2.6f, 0.85f, 0.95f, 8.0f, 1.8f, 2.1f)
-        "truck" -> floatArrayOf(1.8f, 0.75f, 0.75f, 6.5f, 1.8f, 2.1f)
-        else -> floatArrayOf(1.25f, 0.62f, 0.52f, 3.2f, 1.45f, 1.35f)
+    private fun rotateByQuaternion(v: FloatArray, q: FloatArray): FloatArray {
+        val qx = q.getOrElse(0) { 0f }; val qy = q.getOrElse(1) { 0f }
+        val qz = q.getOrElse(2) { 0f }; val qw = q.getOrElse(3) { 1f }
+        val tx = 2f * (qy * v[2] - qz * v[1])
+        val ty = 2f * (qz * v[0] - qx * v[2])
+        val tz = 2f * (qx * v[1] - qy * v[0])
+        return normalize3(floatArrayOf(
+            v[0] + qw * tx + (qy * tz - qz * ty),
+            v[1] + qw * ty + (qz * tx - qx * tz),
+            v[2] + qw * tz + (qx * ty - qy * tx),
+        )) ?: v.copyOf(3)
     }
 
-    private fun percentile(sorted: List<Float>, q: Float): Float {
-        if (sorted.isEmpty()) return 0f
-        val index = ((sorted.size - 1) * q.coerceIn(0f, 1f)).toInt().coerceIn(0, sorted.lastIndex)
-        return sorted[index]
+    private fun normalize3(v: FloatArray): FloatArray? {
+        val n = sqrt(v.sumOf { (it * it).toDouble() }).toFloat()
+        if (!n.isFinite() || n < 1e-6f) return null
+        return FloatArray(3) { i -> v.getOrElse(i) { 0f } / n }
     }
 
-    private fun horizontalUnit(v: FloatArray): FloatArray? {
-        val x = v.getOrElse(0) { 0f }
-        val z = v.getOrElse(2) { 0f }
-        val n = sqrt(x * x + z * z)
-        if (!n.isFinite() || n < 1e-4f) return null
-        return floatArrayOf(x / n, 0f, z / n)
+    private fun intersectionOverUnion(a: RectF, b: RectF): Float {
+        val left = max(a.left, b.left); val top = max(a.top, b.top)
+        val right = min(a.right, b.right); val bottom = min(a.bottom, b.bottom)
+        val iw = (right - left).coerceAtLeast(0f); val ih = (bottom - top).coerceAtLeast(0f)
+        val intersection = iw * ih
+        val union = a.width() * a.height() + b.width() * b.height() - intersection
+        return if (union > 1e-4f) intersection / union else 0f
     }
-
-    private fun horizontalSpeed(v: FloatArray): Float {
-        val x = v.getOrElse(0) { 0f }
-        val z = v.getOrElse(2) { 0f }
-        return sqrt(x * x + z * z).takeIf { it.isFinite() } ?: 0f
-    }
-
-    private fun dot3(a: FloatArray, b: FloatArray): Float =
-        a.getOrElse(0) { 0f } * b.getOrElse(0) { 0f } +
-            a.getOrElse(1) { 0f } * b.getOrElse(1) { 0f } +
-            a.getOrElse(2) { 0f } * b.getOrElse(2) { 0f }
 
     private fun yuv420ToBitmap(image: Image): Bitmap? {
         val width = image.width
@@ -488,15 +495,20 @@ class VehicleDetector(context: Context) {
 
     companion object {
         private const val MODEL_ASSET = "efficientdet_lite0_uint8.tflite"
-        private const val SCORE_THRESHOLD = 0.38f
-        private const val MAX_RESULTS = 4
-        private const val MIN_METRIC_SUPPORTS = 5
+        private const val SCORE_THRESHOLD = 0.34f
+        private const val MAX_RESULTS = 6
+        private const val MIN_METRIC_SUPPORTS = 4
         private const val MIN_METRIC_INLIERS = 3
         private const val MIN_VEHICLE_DISTANCE_M = 0.35f
-        private const val MAX_VEHICLE_DISTANCE_M = 45f
-        private const val FILTER_ASSOCIATION_M = 4.0f
-        private const val FILTER_TRACK_TTL_MS = 3_600L
-        private const val VELOCITY_HEADING_MIN_MPS = 0.60f
+        private const val MAX_VEHICLE_DISTANCE_M = 65f
+        private const val FILTER_BASE_GATE_M = 2.4f
+        private const val FILTER_MAX_GATE_M = 12.0f
+        private const val FILTER_TRACK_TTL_MS = 2_800L
+        private const val VELOCITY_HEADING_MIN_MPS = 1.0f
+        private const val DETECTION_NMS_IOU = 0.48f
+        private const val MIN_FALLBACK_BOX_PX = 10f
+        private const val MIN_FALLBACK_DISTANCE_M = 1.0f
+        private const val MAX_FALLBACK_DISTANCE_M = 65f
         private val VEHICLE_LABELS = setOf("car", "truck", "bus")
     }
 }

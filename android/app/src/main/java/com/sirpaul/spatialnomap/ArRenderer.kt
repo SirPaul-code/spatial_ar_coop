@@ -438,7 +438,9 @@ class ArRenderer(
      */
     private fun applyRemoteVehicleRequest(request: RemoteTargetRequest) {
         val now = System.currentTimeMillis()
-        val cleanOwner = request.owner.removePrefix(AUTO_CAR_PREFIX).ifBlank { "Peer" }
+        val metadata = VehicleWireMetadata.decode(request.owner)
+        val cleanOwner = metadata.owner.ifBlank { "Peer" }
+        val observedAxis = metadata.axis
         synchronized(targetLock) {
             val incomingPoint = request.point
             if (incomingPoint == null) {
@@ -448,7 +450,7 @@ class ArRenderer(
 
             val existingSameId = remoteVehicles[request.id]
             if (existingSameId != null) {
-                updateRemoteVehicle(existingSameId, incomingPoint, cleanOwner, request.confidence, now)
+                updateRemoteVehicle(existingSameId, incomingPoint, cleanOwner, metadata.label, observedAxis, request.confidence, now)
                 return
             }
 
@@ -487,9 +489,9 @@ class ArRenderer(
             remoteVehicles[request.id] = DynamicTarget(
                 point = incomingPoint.copyOf(3),
                 velocity = velocity,
-                worldBox = defaultVehicleBox(incomingPoint, velocity, "CAR"),
+                worldBox = defaultVehicleBox(incomingPoint, velocity, metadata.label, preferredAxis = observedAxis),
                 owner = cleanOwner,
-                label = "CAR",
+                label = metadata.label,
                 confidence = request.confidence,
                 lastSeenMs = now,
             )
@@ -500,6 +502,8 @@ class ArRenderer(
         track: DynamicTarget,
         incomingPoint: FloatArray,
         owner: String,
+        label: String,
+        observedAxis: FloatArray?,
         confidence: Float,
         now: Long,
     ) {
@@ -512,9 +516,10 @@ class ArRenderer(
         limitVelocity(track.velocity, MAX_VEHICLE_SPEED_MPS)
         track.point = smoothPoint(track.point, incomingPoint, REMOTE_POSITION_ALPHA)
         track.owner = owner
+        track.label = label
         track.confidence = max(track.confidence * 0.35f, confidence)
         track.lastSeenMs = now
-        track.worldBox = defaultVehicleBox(track.point, track.velocity, track.label, track.worldBox)
+        track.worldBox = defaultVehicleBox(track.point, track.velocity, track.label, track.worldBox, observedAxis)
     }
 
     private fun captureIfDue(frame: Frame, camera: Camera) {
@@ -703,18 +708,26 @@ class ArRenderer(
         FloatArray(3) { i -> (a.getOrElse(i) { 0f } + b.getOrElse(i) { 0f }) * 0.5f }
 
     private fun maybeDetectVehicles(session: Session, frame: Frame, camera: Camera) {
-        if (!coordinator.quality().bothReady || vehicleDetector.isBusy()) return
+        if (!coordinator.quality().bothReady) return
         val now = System.currentTimeMillis()
         if (now - lastVehicleSubmitMs < VEHICLE_DETECT_INTERVAL_MS) return
 
+        // Depth enriches translation but must never gate 2D vehicle recognition.
         val metric = MetricSupportSampler.sample(frame, camera, VEHICLE_METRIC_BUDGET)
-        if (metric.size < 16) return
         val image = runCatching { frame.acquireCameraImage() }.getOrNull() ?: return
+        val intr = camera.imageIntrinsics
         val accepted = vehicleDetector.submit(
             image = image,
             displayRotation = rotationProvider(),
             cameraId = runCatching { session.cameraConfig.cameraId }.getOrNull(),
-            cameraWorld = camera.pose.translation.copyOf(),
+            camera = VehicleDetector.CameraModel(
+                translation = camera.pose.translation.copyOf(),
+                quaternion = camera.pose.rotationQuaternion.copyOf(),
+                fx = intr.focalLength[0],
+                fy = intr.focalLength[1],
+                cx = intr.principalPoint[0],
+                cy = intr.principalPoint[1],
+            ),
             metricPoints = metric,
             onResult = { pendingVehicleDetections.set(it) },
             onError = { pendingVehicleError.set(it) },
@@ -765,7 +778,11 @@ class ArRenderer(
                     }
                 }
                 matched += sharedId
-                coordinator.sendPoi(sharedId, vehicle.pointWorld, "$AUTO_CAR_PREFIX$owner")
+                coordinator.sendPoi(
+                    sharedId,
+                    vehicle.pointWorld,
+                    VehicleWireMetadata.encode(owner, vehicle.label, vehicle.worldBox?.forwardWorld ?: vehicle.velocityWorld),
+                )
                 continue
             }
 
@@ -811,7 +828,11 @@ class ArRenderer(
                 detectorTrackToSharedId[vehicle.trackId] = sharedId
             }
             matched += sharedId
-            coordinator.sendPoi(sharedId, point, "$AUTO_CAR_PREFIX$owner")
+            coordinator.sendPoi(
+                sharedId,
+                point,
+                VehicleWireMetadata.encode(owner, vehicle.label, worldBox?.forwardWorld ?: velocity),
+            )
             if (isNew) status("Vehicle tracked • shared 3D track reserved")
         }
     }
@@ -897,6 +918,14 @@ class ArRenderer(
                 ?.let { projected += it }
         }
         for ((id, target) in remoteVehicleSnapshot) {
+            val duplicateLocal = localVehicleSnapshot.any { (_, local) ->
+                VehicleTrackPolicy.samePhysicalVehicle(
+                    local.point, local.velocity, local.lastSeenMs,
+                    target.point, now, VEHICLE_COAST_MS,
+                    DISPLAY_DEDUPE_BASE_GATE_M, DISPLAY_DEDUPE_MAX_GATE_M,
+                )
+            }
+            if (duplicateLocal) continue
             projectDynamicTarget(
                 camera,
                 target,
@@ -1075,10 +1104,12 @@ class ArRenderer(
         center: FloatArray,
         velocity: FloatArray,
     ): VehicleDetector.WorldBox {
-        val movingAxis = horizontalUnit(velocity)
-        var axis = movingAxis ?: horizontalUnit(box.forwardWorld) ?: floatArrayOf(1f, 0f, 0f)
-        val previous = horizontalUnit(box.forwardWorld)
-        if (previous != null && dot3(axis, previous) < 0f) axis = FloatArray(3) { -axis[it] }
+        val axis = VehicleGeometryPolicy.stabilizeAxis(
+            previous = box.forwardWorld,
+            observed = box.forwardWorld,
+            velocity = velocity,
+            velocityHeadingMinMps = VEHICLE_YAW_FROM_VELOCITY_MPS,
+        )
         return box.copy(centerWorld = center.copyOf(3), forwardWorld = axis)
     }
 
@@ -1087,22 +1118,21 @@ class ArRenderer(
         velocity: FloatArray,
         label: String,
         previous: VehicleDetector.WorldBox? = null,
+        preferredAxis: FloatArray? = null,
     ): VehicleDetector.WorldBox {
-        var axis = horizontalUnit(velocity) ?: previous?.forwardWorld?.let(::horizontalUnit) ?: floatArrayOf(1f, 0f, 0f)
-        previous?.forwardWorld?.let { prior ->
-            if (dot3(axis, prior) < 0f) axis = FloatArray(3) { -axis[it] }
-        }
-        val dims = when (label.uppercase(Locale.US)) {
-            "BUS" -> floatArrayOf(4.8f, 1.15f, 1.45f)
-            "TRUCK" -> floatArrayOf(3.2f, 1.05f, 1.20f)
-            else -> floatArrayOf(2.15f, 0.90f, 0.78f)
-        }
+        val axis = VehicleGeometryPolicy.stabilizeAxis(
+            previous = previous?.forwardWorld,
+            observed = preferredAxis,
+            velocity = velocity,
+            velocityHeadingMinMps = VEHICLE_YAW_FROM_VELOCITY_MPS,
+        )
+        val dims = VehicleGeometryPolicy.halfExtents(label)
         return VehicleDetector.WorldBox(
             centerWorld = center.copyOf(3),
             forwardWorld = axis,
-            halfLengthM = previous?.halfLengthM ?: dims[0],
-            halfWidthM = previous?.halfWidthM ?: dims[1],
-            halfHeightM = previous?.halfHeightM ?: dims[2],
+            halfLengthM = dims.length,
+            halfWidthM = dims.width,
+            halfHeightM = dims.height,
         )
     }
 
@@ -1218,13 +1248,16 @@ class ArRenderer(
         private const val SURFACE_RESHARE_INTERVAL_MS = 800L
 
         private const val AUTO_CAR_PREFIX = "AUTO:CAR:"
-        private const val VEHICLE_DETECT_INTERVAL_MS = 450L
-        private const val VEHICLE_METRIC_BUDGET = 5000
-        private const val LOCAL_DETECTION_MERGE_M = 1.45f
-        private const val LOCAL_VEHICLE_BASE_GATE_M = 1.9f
-        private const val LOCAL_VEHICLE_MAX_GATE_M = 4.8f
-        private const val CROSS_DEVICE_BASE_GATE_M = 2.1f
-        private const val CROSS_DEVICE_MAX_GATE_M = 5.2f
+        private const val VEHICLE_DETECT_INTERVAL_MS = 120L
+        private const val VEHICLE_METRIC_BUDGET = 1800
+        private const val LOCAL_DETECTION_MERGE_M = 1.8f
+        private const val LOCAL_VEHICLE_BASE_GATE_M = 2.4f
+        private const val LOCAL_VEHICLE_MAX_GATE_M = 12.0f
+        private const val CROSS_DEVICE_BASE_GATE_M = 2.8f
+        private const val CROSS_DEVICE_MAX_GATE_M = 14.0f
+        private const val DISPLAY_DEDUPE_BASE_GATE_M = 2.4f
+        private const val DISPLAY_DEDUPE_MAX_GATE_M = 8.0f
+        private const val VEHICLE_YAW_FROM_VELOCITY_MPS = 1.0f
         private const val VEHICLE_OWNERSHIP_LEASE_MS = 2_800L
         private const val VEHICLE_COAST_MS = 2_600L
         private const val VEHICLE_MEMORY_TTL_MS = 4_000L

@@ -80,10 +80,11 @@ object WorldVizBus {
             is WireMessage.Poi -> {
                 val dynamic = message.owner.startsWith(AUTO_CAR_PREFIX)
                 if (direction == Direction.OUT) {
-                    val clean = cleanOwner(message.owner, localName)
+                    val metadata = if (dynamic) VehicleWireMetadata.decode(message.owner) else null
+                    val clean = metadata?.owner ?: cleanOwner(message.owner, localName)
                     localTargets[message.id] = VizTarget(
                         id = message.id,
-                        label = if (dynamic) "CAR • YOU" else "${clean.ifBlank { "YOU" }} • ${shortId(message.id)}",
+                        label = if (dynamic) "${metadata?.label ?: "CAR"} • YOU" else "${clean.ifBlank { "YOU" }} • ${shortId(message.id)}",
                         position = message.pointWorld.copyOf(3),
                         confidence = 1f,
                         local = true,
@@ -92,10 +93,11 @@ object WorldVizBus {
                     )
                 } else {
                     val mapped = transformPoint(localFromPeer, message.pointWorld) ?: return
-                    val clean = cleanOwner(message.owner, peerName)
+                    val metadata = if (dynamic) VehicleWireMetadata.decode(message.owner) else null
+                    val clean = metadata?.owner ?: cleanOwner(message.owner, peerName)
                     remoteTargets[message.id] = VizTarget(
                         id = message.id,
-                        label = if (dynamic) "CAR • $clean" else "$clean • ${shortId(message.id)}",
+                        label = if (dynamic) "${metadata?.label ?: "CAR"} • $clean" else "$clean • ${shortId(message.id)}",
                         position = mapped,
                         confidence = 1f,
                         local = false,

@@ -38,7 +38,9 @@ object VehicleTrackPolicy {
     ): Float {
         val ageSeconds = ((nowMs - lastSeenMs).coerceAtLeast(0L) / 1000f).coerceAtMost(3f)
         val speed = speedMps(velocity)
-        return min(maxM, baseM + speed * ageSeconds + ageSeconds * 0.35f)
+        val motionUncertainty = speed * ageSeconds * 1.25f
+        val clockAndAlignmentUncertainty = 0.45f + ageSeconds * 0.65f
+        return min(maxM, baseM + motionUncertainty + clockAndAlignmentUncertainty)
     }
 
     fun samePhysicalVehicle(

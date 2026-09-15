@@ -31,8 +31,9 @@ class VehicleTrackPolicyTest {
     @Test
     fun movingTrackGetsLargerAssociationGateThanStationaryTrack() {
         val stationary = VehicleTrackPolicy.associationGateM(FloatArray(3), 1_000L, 2_000L)
-        val moving = VehicleTrackPolicy.associationGateM(floatArrayOf(3f, 0f, 0f), 1_000L, 2_000L)
+        val moving = VehicleTrackPolicy.associationGateM(floatArrayOf(12f, 0f, 0f), 1_000L, 2_000L, 2.4f, 20f)
         assertTrue(moving > stationary)
+        assertTrue(moving >= 15f)
     }
 
     @Test

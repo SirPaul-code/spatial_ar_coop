@@ -1075,7 +1075,8 @@ class MainActivity : Activity(),
     override fun onRemotePoi(id: Long, pointLocal: FloatArray?, owner: String, confidence: Float) {
         runOnUiThread {
             renderer.setRemoteTarget(id, pointLocal, owner, confidence)
-            val shouldAnnounce = pointLocal != null && announcedRemotePoiIds.add(id)
+            val dynamicVehicle = owner.startsWith(VehicleWireMetadata.PREFIX)
+            val shouldAnnounce = !dynamicVehicle && pointLocal != null && announcedRemotePoiIds.add(id)
             if (shouldAnnounce) {
                 haptic()
                 showBanner("POI added from $owner", "Follow the edge arrow until the marker enters view")
