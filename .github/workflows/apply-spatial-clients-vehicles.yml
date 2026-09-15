@@ -5,7 +5,7 @@ on:
     branches: [stablear/multiplatform-sdk]
     paths:
       - '.github/workflows/apply-spatial-clients-vehicles.yml'
-      - '.github/scripts/apply_spatial_clients_vehicles.py'
+      - '.github/scripts/apply_vehicle_final.py'
   workflow_dispatch:
 
 permissions:
@@ -19,8 +19,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply Spatial Sync feature patch
-        run: python3 .github/scripts/apply_spatial_clients_vehicles.py
+      - name: Apply final vehicle tracking pass
+        run: python3 .github/scripts/apply_vehicle_final.py
 
       - uses: actions/setup-java@v5
         with:
@@ -36,7 +36,7 @@ jobs:
       - name: Android toolchain
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
 
-      - name: Test and build patched Spatial Sync
+      - name: Test and build final Spatial Sync
         shell: bash
         run: |
           set -euo pipefail
@@ -46,7 +46,7 @@ jobs:
           cp android/app/build/outputs/apk/debug/app-debug.apk SpatialAR-StableAR-latest.apk
           sha256sum SpatialAR-StableAR-latest.apk | tee SPATIAL-STABLEAR-SHA256SUMS.txt
 
-      - name: Commit verified feature patch
+      - name: Commit verified final vehicle pass
         id: commit
         shell: bash
         run: |
@@ -54,13 +54,21 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add \
-            android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt \
-            android/app/src/main/java/com/sirpaul/spatialnomap/BirdEyeWorldView.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/VehicleDetector.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/VehicleGeometryPolicy.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/VehicleWireMetadata.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/VehicleTrackPolicy.kt \
             android/app/src/main/java/com/sirpaul/spatialnomap/ArRenderer.kt \
-            sdk/checkpoints/SPATIAL_SYNC_CLIENTS_VEHICLES_2026-09-14.md
+            android/app/src/main/java/com/sirpaul/spatialnomap/AlignmentCoordinator.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/MainActivity.kt \
+            android/app/src/main/java/com/sirpaul/spatialnomap/WorldViz.kt \
+            android/app/src/test/java/com/sirpaul/spatialnomap/VehicleTrackPolicyTest.kt \
+            android/app/src/test/java/com/sirpaul/spatialnomap/VehicleGeometryPolicyTest.kt \
+            android/app/src/test/java/com/sirpaul/spatialnomap/VehicleWireMetadataTest.kt \
+            sdk/checkpoints/SPATIAL_SYNC_VEHICLE_FINAL_2026-09-15.md
           git diff --cached --check
           if ! git diff --cached --quiet; then
-            git commit -m 'feat(spatial-sync): track peer phones and fuse shared vehicles'
+            git commit -m 'fix(spatial-sync): harden real-time vehicle tracking'
             git push origin HEAD:stablear/multiplatform-sdk
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -83,4 +91,4 @@ jobs:
             --target "$TARGET_SHA" \
             --title "Spatial AR + StableAR - Android latest" \
             --prerelease \
-            --notes "Verified Spatial Sync Android build with StableAR, peer-phone tracking/bounding box, navigation-safe WORLD/CLIENTS controls, and canonical cross-device vehicle deduplication/keepalive. Unit tests and assembleDebug passed in the publishing workflow."
+            --notes "Final vehicle-tracking pass: high-rate latest-frame detection, depth-independent detection fallback, class-prior 3D cuboid fitting, stable yaw estimation without depth PCA, shared orientation metadata, velocity-aware association, canonical cross-device deduplication/keepalive, and peer phone tracking. Unit tests and assembleDebug passed in this publishing workflow."
