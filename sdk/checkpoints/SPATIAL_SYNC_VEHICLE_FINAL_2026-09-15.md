@@ -1,5 +1,18 @@
 # Spatial Sync final vehicle tracking pass — 2026-09-15
 
+## Final verified checkpoint
+
+- Product source commit: `e48c1dc1028a07709adbc7b09d26138329cf30e6` — `fix(spatial-sync): harden real-time vehicle tracking`.
+- Applying/publishing workflow: `apply-spatial-clients-vehicles`, run `34970171473` / run #8.
+- CI result: **GREEN**. `:app:testDebugUnitTest` and `:app:assembleDebug` completed successfully and the packaged XFeat model check passed.
+- GitHub prerelease tag: `spatial-stablear-latest`.
+- Release target: `e48c1dc1028a07709adbc7b09d26138329cf30e6`.
+- APK asset: `SpatialAR-StableAR-latest.apk`, 240205208 bytes.
+- APK SHA-256: `30bfe816847ac9ec887436160668e0a1b9384da4f007ef2b22fdc6148b9e9308`.
+- Stable APK URL: `https://github.com/SirPaul-code/spatial_ar_coop/releases/download/spatial-stablear-latest/SpatialAR-StableAR-latest.apk`.
+
+The software/build gate is complete. Physical road-speed tracking quality remains an empirical acceptance item and must not be inferred from CI alone.
+
 ## Why this pass exists
 
 Physical two-phone testing exposed three real defects in the previous vehicle path:
@@ -20,7 +33,7 @@ Physical two-phone testing exposed three real defects in the previous vehicle pa
 - Duplicate 2D boxes are NMS-filtered before 3D estimation.
 - Dynamic vehicle owner metadata compactly carries class + 180-degree yaw inside the existing V6 owner field, so no protocol-version break is required. AlignmentCoordinator rotates the peer yaw line through the shared-world transform before handing it to ArRenderer.
 - Render-time cross-device duplicate suppression is an additional safety net while canonical IDs converge.
-- Dynamic vehicle packets no longer trigger the user-facing "POI added" banner/haptic.
+- Dynamic vehicle packets no longer trigger the user-facing `POI added` banner/haptic.
 
 ## Scope boundary
 
@@ -28,13 +41,13 @@ Vehicle tracks remain dynamic and are intentionally NOT StableAR material attach
 
 ## Verification gate
 
-The applying CI workflow must pass:
+The applying CI workflow passed:
 
-```
+```text
 gradle -p android --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
 ```
 
-and confirm the packaged XFeat model before committing/publishing the APK.
+and confirmed the packaged XFeat model before committing and publishing the APK.
 
 ## Physical final acceptance
 
